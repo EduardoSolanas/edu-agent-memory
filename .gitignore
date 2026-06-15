@@ -1,0 +1,38 @@
+# Bytecode / Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+ENV/
+env/
+
+# Node / Javascript
+node_modules/
+package-lock.json
+
+# Datasets and Caches
+data/
+*.db
+*.db-journal
+*.db-wal
+*.jsonl
+*.csv
+memories_dump.json
+
+# Credentials / Environments
+.env
+.env.*
+.gitignore_backup
+
+# Logs
+*.log
+*.out
+/tmp/
+
+# OS
+.DS_Store
