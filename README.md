@@ -171,3 +171,22 @@ Traditional pipelines use Python's `transformers` tokenizer which runs on a sing
 ### **C. iGPU Thread Lock & Length-Bucketing**
 *   **GPU Thread Serialization Lock**: The server exposes a single GPU lock (`gpu_lock = threading.Lock()`) across both `/embed` and `/rerank` endpoints. Because the Intel iGPU context is shared, serializing executions prevents multi-stream GPU thrashing and ensures consistent worst-case performance under load.
 *   **Length-Bucketing (Padding Reduction)**: When processing mixed-length batches of memories, the server groups incoming candidate texts into length-buckets (e.g., 32, 64, 128 tokens). This avoids forcing unnecessary padding (which slows down GPU cycles) onto short memory lines, preserving sub-250ms query times.
+
+
+---
+
+## 📦 **5. Unified Docker Stack (Qdrant + OpenVINO)**
+
+To completely isolate your system from legacy configurations, the workspace includes a unified **Docker Compose stack** under `deploy/`. This single-command setup starts both the **Qdrant Vector Database** and your local **OpenVINO Inference Server** with native Intel iGPU/GPU acceleration:
+
+```bash
+# Navigate to deployment directory
+cd /opt/edumem/deploy
+
+# Build and launch both containers in background
+docker compose up --build -d
+```
+
+### **Services & Ports Configured:**
+*   **`openvino-server` (Port `3002`)**: Hosts the high-performance TEI-like `/embed`, `/rerank`, and `/v1/chat/completions` endpoints. Uses `network_mode: host` to eliminate Docker routing overhead, maps `/dev/dri` directly to your Intel iGPU, and mounts your compiled models folder.
+*   **`mnemosyne-qdrant` (Port `6333` & `6334`)**: Standard distributed vector store with persistent storage bound to `qdrant_data`.

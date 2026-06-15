@@ -18,8 +18,22 @@ curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
 apt-get install -y nodejs
 ```
 
-### **2. Qdrant Vector DB**
-Start Qdrant inside a Docker container:
+### **2. Unified Docker Compose Stack (Highly Recommended)**
+To launch both the **Qdrant Vector Database** and the **OpenVINO Inference Server** (hosting the TEI-like `/embed` and `/rerank` endpoints) in a unified, single-command environment with native Intel iGPU acceleration:
+
+```bash
+# Navigate to the deploy folder
+cd /opt/edumem/deploy
+
+# Build and start the services in the background
+docker compose up --build -d
+```
+
+This will cleanly configure and spin up:
+1. **`mnemosyne-qdrant`** (Port `6333` and `6334` for database storage).
+2. **`openvino-server`** (Exposing `/embed`, `/rerank`, and `/v1/chat/completions` on host port `3002` with integrated GPU devices mapped).
+
+*Alternatively, if you prefer to run Qdrant as a standalone container without the inference server:*
 ```bash
 docker run -d -p 6333:6333 -p 6334:6334 \
     -v /opt/qdrant_storage:/qdrant/storage \

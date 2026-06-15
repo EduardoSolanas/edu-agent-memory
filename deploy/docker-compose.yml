@@ -1,0 +1,32 @@
+version: '3.8'
+
+services:
+  openvino-server:
+    build:
+      context: ./openvino-server
+      dockerfile: Dockerfile
+    container_name: openvino-server
+    restart: always
+    network_mode: host
+    devices:
+      - /dev/dri:/dev/dri
+    environment:
+      - EMBED_MODEL_PATH=/app/models/gte-modernbert-ov
+      - RERANK_MODEL_PATH=/app/models/ettin-17m-ov
+      - LLM_MODEL_PATH=/app/models/Phi-4-mini-instruct-fp16-ov
+      - CACHE_DIR=/app/models/model_cache
+    volumes:
+      - ./models:/app/models
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: mnemosyne-qdrant
+    restart: always
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+
+volumes:
+  qdrant_data:
