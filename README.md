@@ -2,7 +2,9 @@
 
 This repository contains the **api-daemon** memory subsystem service and the active evaluation/benchmarks used to measure, test, and profile our custom cognitive memory pipeline.
 
-For installation, configurations, and verification steps, refer to the [Setup & Reproduction Guide](setup.md).
+📖 **Documentation & Visuals:**
+*   [Setup & Reproduction Guide](setup.md) — Standing step-by-step reproduction and environment configurations.
+*   [Interactive Architecture Diagram](docs/architecture.html) — High-resolution, dark-themed SVG visualization of the 3-layer system pipeline, database tables, and iGPU local model server execution path.
 
 ---
 
