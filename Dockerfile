@@ -1,7 +1,7 @@
 # Base image for stable OpenVINO Python bindings
 FROM python:3.11-slim-bookworm
 
-# Install required system packages and Intel iGPU drivers
+# Install required system packages and register official Intel Graphics repository for GPU acceleration
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     gnupg \
@@ -9,8 +9,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     procps \
     git \
     build-essential \
-    ocl-icd-libopencl1 \
-    intel-opencl-icd \
+    && curl -fsSL https://repositories.intel.com/gpu/intel-graphics.key | gpg --dearmor -o /usr/share/keyrings/intel-graphics.gpg \
+    && echo 'deb [arch=amd64 signed-by=/usr/share/keyrings/intel-graphics.gpg] https://repositories.intel.com/gpu/ubuntu noble unified' > /etc/apt/sources.list.d/intel-graphics.list \
+    && apt-get update && apt-get install -y --no-install-recommends \
+        ocl-icd-libopencl1 \
+        intel-opencl-icd \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Node.js v20 (Strictly standard library, no dependencies)
