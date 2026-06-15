@@ -10,7 +10,7 @@ import argparse
 from pathlib import Path
 import subprocess
 
-WORKDIR = Path("/opt/mnemosyne")
+WORKDIR = Path("/opt/edumem")
 
 def load_env(path: Path) -> dict:
     env = {}
@@ -95,10 +95,10 @@ def main():
         "OPENROUTER_API_KEY": api_key,
         "OPENROUTER_BASE_URL": base_url,
         # Enable local_llm.py remote summarization/consolidation workers
-        "MNEMOSYNE_LLM_BASE_URL": base_url,
-        "MNEMOSYNE_LLM_API_KEY": api_key,
-        "MNEMOSYNE_LLM_MODEL": model,
-        "MNEMOSYNE_LLM_ENABLED": "true",
+        "EDUMEM_LLM_BASE_URL": base_url,
+        "EDUMEM_LLM_API_KEY": api_key,
+        "EDUMEM_LLM_MODEL": model,
+        "EDUMEM_LLM_ENABLED": "true",
         "PYTHONPATH": str(WORKDIR / "personamemv2")
     }
 

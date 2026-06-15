@@ -412,21 +412,21 @@ class HindsightClient:
         return data.get("text", "")
 
 
-class HermesMnemosynePluginClient:
+class HermesedumemPluginClient:
     def __init__(self, version="default"):
         self.version = version
-        if "MNEMOSYNE_LENIENT_FACT_MATCH" not in os.environ:
-            os.environ["MNEMOSYNE_LENIENT_FACT_MATCH"] = "1"
+        if "EDUMEM_LENIENT_FACT_MATCH" not in os.environ:
+            os.environ["EDUMEM_LENIENT_FACT_MATCH"] = "1"
         
         venv_path = "/root/.hermes/hermes-agent/venv/lib/python3.11/site-packages"
         if venv_path not in sys.path:
             sys.path.insert(0, venv_path)
 
     def _get_beam(self, user_id):
-        from mnemosyne.core.beam import BeamMemory
+        from edumem.core.beam import BeamMemory
         from pathlib import Path
         db_root = os.getenv("PERSONAMEM_BANK_ROOT", "/root/MemOS/evaluation/results/pm/hermes-plugin-banks")
-        db_path = f"{db_root}/{user_id}/mnemosyne.db"
+        db_path = f"{db_root}/{user_id}/edumem.db"
         os.makedirs(os.path.dirname(db_path), exist_ok=True)
         return BeamMemory(session_id=f"hermes_{user_id}", db_path=Path(db_path))
 

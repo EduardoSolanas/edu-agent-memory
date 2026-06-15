@@ -8,7 +8,7 @@ import ast
 from pathlib import Path
 from openai import OpenAI
 from benchmarks.evidence import best_evidence, build_profile_map_reduce
-from mnemosyne.core.beam import BeamMemory
+from edumem.core.beam import BeamMemory
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures"
@@ -152,7 +152,7 @@ def main():
     # Initialize BeamMemory for each persona_id
     pid = row["persona_id"]
     db_dir = WORKDIR / "results/pm/databases" / f"persona_{pid}"
-    db_path = db_dir / "mnemosyne.db"
+    db_path = db_dir / "edumem.db"
     db_exists = db_path.exists() and db_path.stat().st_size > 0
     if not db_exists:
         db_dir.mkdir(parents=True, exist_ok=True)

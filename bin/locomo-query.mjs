@@ -1,6 +1,6 @@
-import { createMnemosyne } from "mnemosy-ai";
+import { createMnemosyne as createMnemosyne as createEdumem } from "mnemosy-ai";
 
-const m = await createMnemosyne({
+const m = await createEdumem({
   vectorDbUrl: "http://127.0.0.1:6333",
   embeddingUrl: "http://127.0.0.1:6335/api/embed",
   embeddingModel: "gte-modernbert-base",

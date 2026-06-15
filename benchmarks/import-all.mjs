@@ -1,4 +1,4 @@
-import { createMnemosyne } from 'mnemosy-ai'
+import { createMnemosyne as createEdumem } from 'mnemosy-ai'
 import fs from 'fs'
 
 async function run() {
@@ -6,16 +6,16 @@ async function run() {
   const data = JSON.parse(raw)
   console.log(`Loaded ${data.length} memories from dump file.`)
 
-  const m = await createMnemosyne({
+  const m = await createEdumem({
     vectorDbUrl: 'http://127.0.0.1:6333',
     embeddingUrl: 'http://127.0.0.1:6335/api/embed',
     embeddingModel: 'gte-modernbert-base',
     agentId: 'agent-memory-hindsight-import',
     collections: {
-      shared: 'mnemosyne_shared',
-      private: 'mnemosyne_private',
-      profiles: 'mnemosyne_profiles',
-      skills: 'mnemosyne_skills'
+      shared: 'edumem_shared',
+      private: 'edumem_private',
+      profiles: 'edumem_profiles',
+      skills: 'edumem_skills'
     },
     enableGraph: false,
     enableBroadcast: false,
@@ -61,9 +61,9 @@ async function run() {
     }
   }
 
-  console.log(`IMPORT COMPLETE: Successfully imported ${count} memories into Mnemosyne.`)
+  console.log(`IMPORT COMPLETE: Successfully imported ${count} memories into edumem.`)
   const stats = await m.stats()
-  console.log('MNEMOSYNE STATS:', JSON.stringify(stats))
+  console.log('EDUMEM STATS:', JSON.stringify(stats))
 }
 
 run().catch(console.error)

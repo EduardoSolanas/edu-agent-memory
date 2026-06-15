@@ -6,7 +6,7 @@ import requests
 QDRANT='http://127.0.0.1:6333'
 EMBED='http://127.0.0.1:3002/embed'
 COLLECTION='pm_shared'
-DATA=Path('/opt/mnemosyne/data/personamem')
+DATA=Path('/opt/edumem/data/personamem')
 QUESTIONS=DATA/'questions_32k.csv'
 CONTEXTS=DATA/'shared_contexts_32k.jsonl'
 VECTOR_SIZE=768

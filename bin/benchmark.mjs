@@ -1,16 +1,16 @@
-import { createMnemosyne } from "mnemosy-ai";
+import { createMnemosyne as createMnemosyne as createEdumem } from "mnemosy-ai";
 import { performance } from "perf_hooks";
 
-const m = await createMnemosyne({
+const m = await createEdumem({
   vectorDbUrl: "http://127.0.0.1:6333",
   embeddingUrl: "http://127.0.0.1:6335/api/embed",
   embeddingModel: "gte-modernbert-base",
   agentId: "benchmark-agent",
   collections: {
-    shared: "mnemosyne_shared",
-    private: "mnemosyne_private",
-    profiles: "mnemosyne_profiles",
-    skills: "mnemosyne_skills"
+    shared: "edumem_shared",
+    private: "edumem_private",
+    profiles: "edumem_profiles",
+    skills: "edumem_skills"
   },
   enableGraph: false,
   enableBroadcast: false,
@@ -62,7 +62,7 @@ for (const q of queries) {
     hsTopText = "Error: " + e.message;
   }
 
-  // Mnemosyne Recall
+  // edumem Recall
   let mnLatency = 0;
   let mnCount = 0;
   let mnTopText = "No match";
@@ -80,7 +80,7 @@ for (const q of queries) {
   results.push({
     query: q,
     hindsight: { latency: hsLatency, count: hsCount, top: hsTopText },
-    mnemosyne: { latency: mnLatency, count: mnCount, top: mnTopText }
+    edumem: { latency: mnLatency, count: mnCount, top: mnTopText }
   });
 }
 

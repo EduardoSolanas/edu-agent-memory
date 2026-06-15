@@ -9,7 +9,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from mnemosyne.core.beam import BeamMemory, _fts_search_working
+from edumem.core.beam import BeamMemory, _fts_search_working
 
 def run_test():
     print("[*] Creating temporary database for FTS5 sanitisation test...")

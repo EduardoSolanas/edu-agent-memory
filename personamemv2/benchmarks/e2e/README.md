@@ -5,7 +5,7 @@ Purpose: lightweight end-to-end checks for the new compact-profile personalizati
 ## Commands
 
 ```bash
-cd /opt/mnemosyne/personamemv2
+cd /opt/edumem/personamemv2
 .venv/bin/python3 benchmarks/e2e/single_persona.py
 .venv/bin/python3 benchmarks/e2e/three_personas.py
 .venv/bin/python3 benchmarks/e2e/profile_smoke.py

@@ -2,10 +2,10 @@ import sys
 import os
 from pathlib import Path
 
-sys.path.insert(0, "/opt/mnemosyne/personamemv2")
-from run_mnemosyne_v2_profile_smoke import load_env, load_rows, load_history, parse_options, parse_msg
+sys.path.insert(0, "/opt/edumem/personamemv2")
+from run_edumem_v2_profile_smoke import load_env, load_rows, load_history, parse_options, parse_msg
 
-load_env(Path("/opt/mnemosyne/personamemv2/.env"))
+load_env(Path("/opt/edumem/personamemv2/.env"))
 rows = load_rows(10)
 
 for i, row in enumerate(rows):

@@ -1,23 +1,23 @@
-import { createMnemosyne } from 'mnemosy-ai';
+import { createMnemosyne as createEdumem } from 'mnemosy-ai';
 import { createServer } from 'http';
 
 const PORT = 6336;
 const INTERVAL_MS = 12 * 60 * 60 * 1000; // 12 hours
 
 async function main() {
-  console.log('Starting Mnemosyne Cognitive Daemon with RAG/Recall API...');
+  console.log('Starting edumem Cognitive Daemon with RAG/Recall API...');
   
-  // Single master Mnemosyne instance scoped to personal collections
-  const m = await createMnemosyne({
+  // Single master edumem instance scoped to personal collections
+  const m = await createEdumem({
     vectorDbUrl: 'http://127.0.0.1:6333',
     embeddingUrl: 'http://127.0.0.1:3002/embed',
     embeddingModel: 'gte-modernbert-base',
     agentId: 'agent-memory-daemon',
     collections: {
-      shared: 'mnemosyne_shared',
-      private: 'mnemosyne_private',
-      profiles: 'mnemosyne_profiles',
-      skills: 'mnemosyne_skills'
+      shared: 'edumem_shared',
+      private: 'edumem_private',
+      profiles: 'edumem_profiles',
+      skills: 'edumem_skills'
     },
     enableGraph: false,
     enableBroadcast: false,
@@ -37,12 +37,12 @@ async function main() {
     isRunning = true;
     console.log('[' + new Date().toISOString() + '] Starting scheduled dreaming & consolidation on personal data...');
     try {
-      console.log('Running Mnemosyne Dream (deduplication & decay)...');
+      console.log('Running edumem Dream (deduplication & decay)...');
       const dreamRes = await m.dream();
       lastDream = { timestamp: new Date().toISOString(), result: dreamRes };
       console.log('Dream complete:', JSON.stringify(dreamRes));
 
-      console.log('Running Mnemosyne Consolidate...');
+      console.log('Running edumem Consolidate...');
       const consRes = await m.consolidate();
       lastConsolidate = { timestamp: new Date().toISOString(), result: consRes };
       console.log('Consolidate complete:', JSON.stringify(consRes));
@@ -84,7 +84,7 @@ async function main() {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         status: 'healthy',
-        daemon: 'mnemosyne-cognitive-daemon',
+        daemon: 'edumem-cognitive-daemon',
         last_dream: lastDream,
         last_consolidate: lastConsolidate,
         is_running: isRunning,
@@ -188,7 +188,7 @@ async function main() {
   });
 
   server.listen(PORT, '0.0.0.0', () => {
-    console.log('Mnemosyne Cognitive Daemon Server running on http://0.0.0.0:' + PORT);
+    console.log('edumem Cognitive Daemon Server running on http://0.0.0.0:' + PORT);
   });
 }
 

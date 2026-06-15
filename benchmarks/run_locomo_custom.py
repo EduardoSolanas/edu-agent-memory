@@ -12,7 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 import concurrent.futures
 from openai import OpenAI
 
-WORKDIR = Path("/opt/mnemosyne")
+WORKDIR = Path("/opt/edumem")
 
 def load_env(path: Path) -> None:
     if not path.exists():

@@ -12,7 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 from huggingface_hub import hf_hub_download
 from openai import OpenAI
 from benchmarks.evidence import best_evidence, build_profile_map_reduce
-from mnemosyne.core.beam import BeamMemory
+from edumem.core.beam import BeamMemory
 
 REPO = "bowen-upenn/PersonaMem-v2"
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -194,7 +194,7 @@ def main():
 
         # Initialize BeamMemory for each persona_id
         db_dir = WORKDIR / "results/pm/databases" / f"persona_{pid}"
-        db_path = db_dir / "mnemosyne.db"
+        db_path = db_dir / "edumem.db"
         db_exists = db_path.exists() and db_path.stat().st_size > 0
         if not db_exists:
             db_dir.mkdir(parents=True, exist_ok=True)
@@ -216,7 +216,7 @@ def main():
         query = parse_msg(row["user_query"])["content"]
         mapping, gold = parse_options(row, seed=i)
         
-        db_path = WORKDIR / "results/pm/databases" / f"persona_{pid}" / "mnemosyne.db"
+        db_path = WORKDIR / "results/pm/databases" / f"persona_{pid}" / "edumem.db"
         beam = BeamMemory(db_path=db_path)
         recall_results = beam.recall(query, top_k=50)
         evidence = "\n".join(f"- {r.get('content', '').strip()}" for r in recall_results)
