@@ -1,0 +1,6 @@
+node_modules
+.venv
+.git
+.hermes
+data
+deploy/openvino-server/models

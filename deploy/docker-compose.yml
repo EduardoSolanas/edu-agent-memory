@@ -12,6 +12,16 @@ services:
     devices:
       - /dev/dri:/dev/dri
 
+  api-daemon:
+    build:
+      context: ..
+      dockerfile: deploy/api-daemon/Dockerfile
+    container_name: api-daemon
+    restart: always
+    network_mode: host
+    env_file:
+      - ../.env
+
   qdrant:
     image: qdrant/qdrant:latest
     container_name: edumem-qdrant

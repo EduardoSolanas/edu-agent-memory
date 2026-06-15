@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
 OpenVINO Inference Server for Hindsight
-Serves embeddings, reranker, and LLM models on Intel iGPU using native openvino_genai pipelines
+Serves embeddings, reranker, and LLM models on Intel iGPU or CPU using native openvino_genai pipelines
 """
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 import openvino_genai
+import openvino
 import uvicorn
 import time
 import sys
@@ -30,9 +31,9 @@ app = FastAPI(title="OpenVINO Inference Server (Native GenAI)")
 embed_pipeline = None
 rerank_pipeline = None
 llm_pipeline = None
+device = "CPU"
 
-# Single GPU lock prevents embed/rerank overlap on the same Intel iGPU.
-# With NUM_STREAMS=1 this reduces contention and tail-latency spikes.
+# Single GPU/CPU lock prevents embed/rerank overlap
 gpu_lock = threading.Lock()
 embed_lock = gpu_lock
 rerank_lock = gpu_lock
@@ -77,52 +78,78 @@ def inverse_sigmoid(p: float) -> float:
 
 @app.on_event("startup")
 async def load_models():
-    global embed_pipeline, rerank_pipeline, llm_pipeline
+    global embed_pipeline, rerank_pipeline, llm_pipeline, device
     
     try:
-        print(f"Loading embedding model ({EMBED_MODEL_PATH}) on GPU...", flush=True)
+        core = openvino.Core()
+        available_devices = core.available_devices
+        print(f"Detected OpenVINO devices: {available_devices}", flush=True)
+        device = "GPU" if "GPU" in available_devices else "CPU"
+    except Exception as dev_err:
+        print(f"Warning: Failed to query available devices: {dev_err}. Defaulting to CPU.", flush=True)
+        device = "CPU"
+        
+    print(f"Using inference device: {device}", flush=True)
+    
+    try:
+        print(f"Loading embedding model ({EMBED_MODEL_PATH}) on {device}...", flush=True)
         embed_config = openvino_genai.TextEmbeddingPipeline.Config()
         embed_config.pooling_type = openvino_genai.TextEmbeddingPipeline.PoolingType.MEAN
         embed_config.normalize = False
-        embed_pipeline = openvino_genai.TextEmbeddingPipeline(
-            EMBED_MODEL_PATH,
-            "GPU",
-            embed_config,
-            INFERENCE_PRECISION_HINT="f16",
-            PERFORMANCE_HINT="LATENCY",
-            NUM_STREAMS="1", # Lock single-stream execution to optimize burst latency
-            CACHE_DIR=CACHE_DIR
-        )
-        print("✓ Embedding model loaded on GPU with FP16 + LATENCY hints, NUM_STREAMS=1 & caching", flush=True)
+        
+        try:
+            embed_pipeline = openvino_genai.TextEmbeddingPipeline(
+                EMBED_MODEL_PATH,
+                device,
+                embed_config,
+                INFERENCE_PRECISION_HINT="f16" if device == "GPU" else "f32",
+                PERFORMANCE_HINT="LATENCY",
+                NUM_STREAMS="1",
+                CACHE_DIR=CACHE_DIR
+            )
+        except Exception as hints_err:
+            print(f"Note: Standard loading due to hints error: {hints_err}", flush=True)
+            embed_pipeline = openvino_genai.TextEmbeddingPipeline(
+                EMBED_MODEL_PATH,
+                device,
+                embed_config
+            )
+        print(f"✓ Embedding model loaded on {device} successfully", flush=True)
     except Exception as e:
         print(f"✗ Failed to load embedding model: {e}", flush=True)
         raise
     
     try:
-        # Load the fully-functional Ettin-17M model!
-        print(f"Loading reranker model ({RERANK_MODEL_PATH}) on GPU...", flush=True)
-        rerank_pipeline = openvino_genai.TextRerankPipeline(
-            RERANK_MODEL_PATH,
-            "GPU",
-            top_n=RERANK_TOP_N,
-            INFERENCE_PRECISION_HINT="f16",
-            PERFORMANCE_HINT="LATENCY",
-            NUM_STREAMS="1", # Lock single-stream execution to optimize burst latency
-            CACHE_DIR=CACHE_DIR
-        )
-        print(f"✓ Reranker model (Ettin-17M, top_n={RERANK_TOP_N}) loaded on GPU with FP16 + LATENCY hints, NUM_STREAMS=1 & caching", flush=True)
+        print(f"Loading reranker model ({RERANK_MODEL_PATH}) on {device}...", flush=True)
+        try:
+            rerank_pipeline = openvino_genai.TextRerankPipeline(
+                RERANK_MODEL_PATH,
+                device,
+                top_n=RERANK_TOP_N,
+                INFERENCE_PRECISION_HINT="f16" if device == "GPU" else "f32",
+                PERFORMANCE_HINT="LATENCY",
+                NUM_STREAMS="1",
+                CACHE_DIR=CACHE_DIR
+            )
+        except Exception as hints_err:
+            print(f"Note: Standard loading due to hints error: {hints_err}", flush=True)
+            rerank_pipeline = openvino_genai.TextRerankPipeline(
+                RERANK_MODEL_PATH,
+                device,
+                top_n=RERANK_TOP_N
+            )
+        print(f"✓ Reranker model loaded on {device} successfully", flush=True)
     except Exception as e:
         print(f"✗ Failed to load reranker model: {e}", flush=True)
         raise
         
-    if LLM_MODEL_PATH:
+    if LLM_MODEL_PATH and os.path.exists(LLM_MODEL_PATH):
         try:
-            # Load Phi-4-mini-instruct-fp16-ov model with task polling disabled!
-            print(f"Loading LLM model ({LLM_MODEL_PATH}) on GPU with task polling disabled...", flush=True)
+            print(f"Loading LLM model ({LLM_MODEL_PATH}) on {device}...", flush=True)
             try:
                 llm_pipeline = openvino_genai.LLMPipeline(
                     LLM_MODEL_PATH,
-                    "GPU",
+                    device,
                     PERFORMANCE_HINT="LATENCY",
                     NUM_STREAMS="1",
                     CACHE_DIR=CACHE_DIR
@@ -131,17 +158,14 @@ async def load_models():
                 print(f"Note: Standard loading due to hints error: {hints_err}", flush=True)
                 llm_pipeline = openvino_genai.LLMPipeline(
                     LLM_MODEL_PATH,
-                    "GPU",
-                    PERFORMANCE_HINT="LATENCY",
-                    NUM_STREAMS="1",
-                    CACHE_DIR=CACHE_DIR
+                    device
                 )
-            print(f"✓ LLM model ({os.path.basename(LLM_MODEL_PATH)}) loaded on GPU with FP16 + LATENCY hints, NUM_STREAMS=1 & caching", flush=True)
+            print(f"✓ LLM model ({os.path.basename(LLM_MODEL_PATH)}) loaded on {device} successfully", flush=True)
         except Exception as e:
             print(f"✗ Failed to load LLM model: {e}", flush=True)
             raise
     else:
-        print("Skipping local LLM loading (LLM_MODEL_PATH is empty/not set)", flush=True)
+        print("Skipping local LLM loading (LLM_MODEL_PATH is empty/not set or does not exist)", flush=True)
     
     print("All models loaded successfully!", flush=True)
 
@@ -152,7 +176,6 @@ def embed(request: EmbedRequest):
         
         inputs = request.inputs if isinstance(request.inputs, list) else [request.inputs]
         
-        # Protect with thread lock to serialize iGPU executions
         with embed_lock:
             embeddings = embed_pipeline.embed_documents(inputs)
         
@@ -167,22 +190,11 @@ def embed(request: EmbedRequest):
 
 
 def rerank_in_length_buckets(query: str, texts: List[str]):
-    """Score all texts with identical model semantics, grouped by rough length.
-
-    Cross-encoder scores are independent per query/document pair. Grouping by
-    length reduces padding waste for mixed short/long candidate batches while
-    returning the same scores as one large mixed-length batch.
-    """
     if len(texts) < 64:
         return list(rerank_pipeline.rerank(query, texts))
 
-    # Word-count buckets are deliberately coarse: enough to avoid one long
-    # candidate forcing the whole batch to the longest shape, without creating
-    # many tiny GPU calls.
     word_counts = [len(text.split()) for text in texts]
     max_words = max(word_counts, default=0)
-    # Real Hindsight candidates are usually <=64 words. Splitting those creates
-    # extra GPU calls and is slower. Bucket only when a real long-tail exists.
     if max_words <= 96:
         return list(rerank_pipeline.rerank(query, texts))
 
@@ -194,7 +206,6 @@ def rerank_in_length_buckets(query: str, texts: List[str]):
                 buckets[bucket_index].append((original_index, text))
                 break
 
-    # If everything is already same-shape, avoid extra Python work.
     non_empty = [b for b in buckets if b]
     if len(non_empty) == 1:
         return list(rerank_pipeline.rerank(query, texts))
@@ -214,9 +225,6 @@ def rerank(request: RerankRequest):
     try:
         start = time.time()
 
-        # Exact-query cache: same query + same candidate texts produce identical
-        # model scores. This preserves quality and eliminates repeated GPU work
-        # during repeated recalls while the bank is unchanged.
         cache_key = (request.query, tuple(request.texts))
         with rerank_cache_lock:
             cached = rerank_cache.get(cache_key)
@@ -224,7 +232,6 @@ def rerank(request: RerankRequest):
                 rerank_cache.move_to_end(cache_key)
 
         if cached is None:
-            # Protect with thread lock to serialize iGPU executions
             with rerank_lock:
                 raw_results = rerank_in_length_buckets(request.query, request.texts)
             if RERANK_CACHE_SIZE > 0:
@@ -257,7 +264,6 @@ import re
 import json
 
 def parse_text_to_tool_calls(text: str) -> list[dict]:
-    # Match patterns like: tool_name(query='value', max_tokens=123) or tool_name('value') or tool_name(value)
     tool_names = ['search_observations', 'search_world_facts', 'recall', 'search_opinions']
     
     for tool in tool_names:
@@ -304,7 +310,6 @@ def chat_completions(request: ChatCompletionRequest):
     try:
         start = time.time()
         
-        # Build tools instruction if tools are provided
         tools_instruction = ""
         if request.tools:
             tools_instruction = (
@@ -325,7 +330,6 @@ def chat_completions(request: ChatCompletionRequest):
                 "if a tool call could retrieve it."
             )
             
-        # Convert Pydantic message list with injected system instruction if applicable
         messages_to_send = []
         has_system = False
         
@@ -333,12 +337,10 @@ def chat_completions(request: ChatCompletionRequest):
             role = msg.role
             content = msg.content
             
-            # Map tool roles and tool calls to standard user/assistant messages
             if role == "tool":
                 role = "user"
                 content = f"Tool result:\n{content}"
             elif role == "assistant" and not content and msg.tool_calls:
-                # Reconstruct the tool call text that the model originally generated
                 try:
                     tc = msg.tool_calls[0]
                     tc_name = tc.get("function", {}).get("name") if isinstance(tc, dict) else getattr(getattr(tc, "function", None), "name", None)
@@ -367,7 +369,6 @@ def chat_completions(request: ChatCompletionRequest):
         if not has_system and tools_instruction:
             messages_to_send.insert(0, {"role": "system", "content": tools_instruction})
             
-        # Convert messages list to OpenVINO GenAI ChatHistory object
         history = openvino_genai.ChatHistory()
         for msg in messages_to_send:
             if msg["role"] in ("user", "assistant", "system"):
@@ -382,7 +383,6 @@ def chat_completions(request: ChatCompletionRequest):
         else:
             config.do_sample = False  # Greedy decoding
             
-        # Execute in thread-safe block to avoid conflict on Intel GPU context
         with llm_lock:
             res = llm_pipeline.generate(history, generation_config=config)
             
@@ -390,7 +390,6 @@ def chat_completions(request: ChatCompletionRequest):
         latency = (time.time() - start) * 1000
         print(f"LLM (Phi-4-mini): {len(request.messages)} messages, {latency:.1f}ms", flush=True)
         
-        # Check if output contains an agentic tool call
         tool_calls = parse_text_to_tool_calls(output_text)
         
         message_payload = {
@@ -400,7 +399,6 @@ def chat_completions(request: ChatCompletionRequest):
         if tool_calls:
             message_payload["tool_calls"] = tool_calls
             
-        # Format response to match the exact OpenAI spec
         return {
             "id": f"chatcmpl-{int(time.time())}",
             "object": "chat.completion",
@@ -414,9 +412,9 @@ def chat_completions(request: ChatCompletionRequest):
                 }
             ],
             "usage": {
-                "prompt_tokens": 0,  # Mocked
-                "completion_tokens": 0,  # Mocked
-                "total_tokens": 0  # Mocked
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0
             }
         }
         
@@ -426,7 +424,7 @@ def chat_completions(request: ChatCompletionRequest):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "device": "GPU"}
+    return {"status": "ok", "device": device}
 
 @app.get("/info")
 async def info():
@@ -435,9 +433,10 @@ async def info():
         "model_type": "embedding",
         "max_input_length": 8192,
         "dimension": 768,
-        "device": "GPU"
+        "device": device
     }
 
 if __name__ == "__main__":
     print("Server starting on port 3002...", flush=True)
-    uvicorn.run(app, host="0.0.0.0", port=3002)
+    uvicorn_run_placeholder = uvicorn.run
+    uvicorn_run_placeholder(app, host="0.0.0.0", port=3002)
