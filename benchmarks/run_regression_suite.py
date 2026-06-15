@@ -99,7 +99,7 @@ def main():
     beam_env = {
         "OPENROUTER_API_KEY": os.getenv("NAN_APY_KEY") or os.getenv("OPENAI_API_KEY", ""),
         "OPENROUTER_BASE_URL": os.getenv("CHAT_MODEL_BASE_URL", "https://api.nan.builders/v1"),
-        "PYTHONPATH": str(EDUMEM_ROOT / "benchmarks")
+        "PYTHONPATH": str(EDUMEM_ROOT)
     }
     beam_cmd = [
         str(PYTHON_ENV),
@@ -137,7 +137,7 @@ def main():
     print("\n--- STEP 3: Running Official PersonaMem-v2 (128K) ---")
     pm_env = {
         "LIMIT": limit_70,
-        "PYTHONPATH": str(EDUMEM_ROOT / "benchmarks")
+        "PYTHONPATH": str(EDUMEM_ROOT)
     }
     pm_128k_cmd = [str(PYTHON_ENV), "benchmarks/personamem_v2_128k.py"]
     t0 = time.time()
