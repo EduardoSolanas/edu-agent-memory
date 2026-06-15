@@ -3,4 +3,3 @@ node_modules
 .git
 .hermes
 data
-deploy/openvino-server/models
