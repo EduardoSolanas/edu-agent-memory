@@ -5,7 +5,7 @@ const PORT = 6336;
 const INTERVAL_MS = 12 * 60 * 60 * 1000; // 12 hours
 
 async function main() {
-  console.log('Starting edumem Cognitive Daemon with RAG/Recall API...');
+  console.log('Starting api-daemon with RAG/Recall API...');
   
   // Single master edumem instance scoped to personal collections
   const m = await createEdumem({
@@ -75,7 +75,7 @@ async function main() {
     });
   }
 
-  // Start HTTP server supporting Hindsight RAG API protocol
+  // Start HTTP server supporting API Client RAG API protocol
   const server = createServer(async (req, res) => {
     const url = req.url;
     const method = req.method;
@@ -93,7 +93,7 @@ async function main() {
       return;
     }
 
-    // 1. RECALL API (compatible with Hindsight recall spec)
+    // 1. RECALL API (compatible with API Client recall spec)
     if (method === 'POST' && url.match(/^\/v1\/default\/banks\/([^\/]+)\/memories\/recall$/)) {
       try {
         const match = url.match(/^\/v1\/default\/banks\/([^\/]+)\/memories\/recall$/);
@@ -131,7 +131,7 @@ async function main() {
       return;
     }
 
-    // 2. REFLECT API (compatible with Hindsight reflect spec)
+    // 2. REFLECT API (compatible with API Client reflect spec)
     if (method === 'POST' && url.match(/^\/v1\/default\/banks\/([^\/]+)\/reflect$/)) {
       try {
         const match = url.match(/^\/v1\/default\/banks\/([^\/]+)\/reflect$/);
@@ -155,7 +155,7 @@ async function main() {
           };
         }));
 
-        // Format into combined context string matching Hindsight\'s structure
+        // Format into combined context string matching API Client\'s structure
         let formattedContext = '';
         results.forEach(({ uid, memories }) => {
           const speakerName = uid.includes('speaker_a') ? 'Speaker A' : 'Speaker B';
@@ -188,7 +188,7 @@ async function main() {
   });
 
   server.listen(PORT, '0.0.0.0', () => {
-    console.log('edumem Cognitive Daemon Server running on http://0.0.0.0:' + PORT);
+    console.log('api-daemon Server running on http://0.0.0.0:' + PORT);
   });
 }
 

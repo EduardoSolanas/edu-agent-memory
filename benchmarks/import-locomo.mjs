@@ -14,7 +14,7 @@ async function run() {
   // 1. Get total count
   const firstRes = await fetch(`${HINDSIGHT_URL}/v1/default/banks/locomo/memories/list?limit=1`);
   if (!firstRes.ok) {
-    throw new Error(`Failed to contact Hindsight: ${firstRes.statusText}`);
+    throw new Error(`Failed to contact API Client: ${firstRes.statusText}`);
   }
   const firstData = await firstRes.json();
   const total = firstData.total;

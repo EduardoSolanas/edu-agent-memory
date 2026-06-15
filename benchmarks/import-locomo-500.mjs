@@ -14,11 +14,11 @@ async function run() {
   console.log(`Fetching up to ${LIMIT} memories...`);
   const pageRes = await fetch(`${HINDSIGHT_URL}/v1/default/banks/locomo/memories/list?limit=${LIMIT}`);
   if (!pageRes.ok) {
-    throw new Error(`Failed to contact Hindsight: ${pageRes.statusText}`);
+    throw new Error(`Failed to contact API Client: ${pageRes.statusText}`);
   }
   const pageData = await pageRes.json();
   const items = pageData.items || [];
-  console.log(`Fetched ${items.length} memories from Hindsight.`);
+  console.log(`Fetched ${items.length} memories from API Client.`);
 
   if (items.length === 0) {
     console.log('No items found!');

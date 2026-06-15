@@ -42,7 +42,7 @@ for (const q of queries) {
 const results = [];
 
 for (const q of queries) {
-  // Hindsight Recall
+  // API Client Recall
   let hsLatency = 0;
   let hsCount = 0;
   let hsTopText = "No match";
@@ -79,7 +79,7 @@ for (const q of queries) {
 
   results.push({
     query: q,
-    hindsight: { latency: hsLatency, count: hsCount, top: hsTopText },
+    api-daemon: { latency: hsLatency, count: hsCount, top: hsTopText },
     edumem: { latency: mnLatency, count: mnCount, top: mnTopText }
   });
 }

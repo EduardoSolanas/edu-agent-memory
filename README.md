@@ -8,7 +8,7 @@ This repository contains the **api-daemon** service and the active evaluation/be
 
 The `api-daemon` runs on CT 116 (port **`6336`**) and is the single, authoritative entrypoint for calling agents (e.g., Hermes on CT 108) to query and interact with memory.
 
-It hosts two primary production endpoints compatible with the Hindsight API protocol:
+It hosts two primary production endpoints compatible with the Standard Memory API protocol:
 1.  **RAG Recall (`POST /v1/default/banks/:bank/memories/recall`)**: For fast vector-based retrieval.
 2.  **RAG Reflection (`POST /v1/default/banks/:bank/reflect`)**: For generating chronological, formatted participant context blocks.
 
@@ -65,7 +65,7 @@ After=network.target
 Type=simple
 User=root
 WorkingDirectory=/opt/edumem
-EnvironmentFile=-/etc/default/hindsight
+EnvironmentFile=-/etc/default/api-daemon
 EnvironmentFile=-/etc/environment
 ExecStart=/usr/bin/node /opt/edumem/bin/api-daemon.mjs
 Restart=on-failure

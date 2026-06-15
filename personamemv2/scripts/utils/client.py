@@ -354,7 +354,7 @@ class MemuClient:
             time.sleep(2)
 
 
-class HindsightClient:
+class API ClientClient:
     def __init__(self):
         self.url = "http://192.168.1.160:6336"
         self.bank_id = "locomo"
@@ -381,7 +381,7 @@ class HindsightClient:
         }
         url = f"{self.url}/v1/default/banks/{self.bank_id}/memories"
         response = requests.post(url, json=payload, headers={"Content-Type": "application/json"})
-        assert response.status_code == 200, f"Hindsight Ingest Error: {response.text}"
+        assert response.status_code == 200, f"API Client Ingest Error: {response.text}"
 
     def search(self, query, user_id, top_k):
         url = f"{self.url}/v1/default/banks/{self.bank_id}/memories/recall"
@@ -393,7 +393,7 @@ class HindsightClient:
             "tags_match": "any"
         }
         response = requests.post(url, json=payload, headers={"Content-Type": "application/json"})
-        assert response.status_code == 200, f"Hindsight Search Error: {response.text}"
+        assert response.status_code == 200, f"API Client Search Error: {response.text}"
         data = response.json()
         return [item["text"] for item in data.get("results", [])]
 
@@ -407,7 +407,7 @@ class HindsightClient:
             "tags_match": "any_strict"
         }
         response = requests.post(url, json=payload, headers={"Content-Type": "application/json"})
-        assert response.status_code == 200, f"Hindsight Reflect Error: {response.text}"
+        assert response.status_code == 200, f"API Client Reflect Error: {response.text}"
         data = response.json()
         return data.get("text", "")
 

@@ -10,7 +10,7 @@ async function run() {
     vectorDbUrl: 'http://127.0.0.1:6333',
     embeddingUrl: 'http://127.0.0.1:6335/api/embed',
     embeddingModel: 'gte-modernbert-base',
-    agentId: 'agent-memory-hindsight-import',
+    agentId: 'agent-memory-api-daemon-import',
     collections: {
       shared: 'edumem_shared',
       private: 'edumem_private',
@@ -43,7 +43,7 @@ async function run() {
       memoryType: item.fact_type || 'world',
       importance: item.fact_type === 'world' ? 0.8 : 0.6,
       metadata: {
-        hindsight_id: item.id,
+        api-daemon_id: item.id,
         tags: tags,
         document_id: item.document_id,
         created_at: item.created_at

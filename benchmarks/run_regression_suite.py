@@ -199,7 +199,7 @@ Run Configuration: `QUICK_MODE={quick_mode}`
 | Evaluation Suite | Dataset Context | Metric Mode | Target Goal | **Current edumem Score** | Duration |
 | :--- | :---: | :---: | :---: | :---: | :---: |
 | **LongMemEval** | Oracle Sessions | LLM-as-judge | `95.40%` (OMEGA) | **{longmem_accuracy}** | {t_longmem:.1f}s |
-| **BEAM Benchmark** | 100K/500K Scales | LLM-as-judge | `64.10%` (Hindsight)| **{beam_accuracy}** | {t_beam:.1f}s |
+| **BEAM Benchmark** | 100K/500K Scales | LLM-as-judge | `64.10%` (API Client)| **{beam_accuracy}** | {t_beam:.1f}s |
 | **PersonaMem-v2 (128K)** | 128K Histories | Multi-Option QA | `80.00%` (Milestone) | **{pm_128k_accuracy}** | {t_128k:.1f}s |
 | **MemoryAgentBench** | 32K Fact-Consol | Substring Match | `54.00%` (HippoRAG) | **{mab_accuracy}** | {t_mab:.1f}s |
 
