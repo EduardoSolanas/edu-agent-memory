@@ -40,8 +40,8 @@ RUN pip install --no-cache-dir \
 WORKDIR /app
 
 # Pre-bake local model weights
-COPY deploy/openvino-server/models/gte-modernbert-ov /app/models/gte-modernbert-ov
-COPY deploy/openvino-server/models/ettin-17m-ov /app/models/ettin-17m-ov
+COPY models/gte-modernbert-ov /app/models/gte-modernbert-ov
+COPY models/ettin-17m-ov /app/models/ettin-17m-ov
 
 # Copy zero-dependency source files directly
 COPY . .

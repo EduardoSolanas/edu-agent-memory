@@ -14,7 +14,7 @@ export RERANK_MODEL_PATH=/app/models/ettin-17m-ov
 export LLM_MODEL_PATH=""
 
 echo "[Entrypoint] Starting OpenVINO Inference Server in the background on port 3002..."
-python deploy/openvino-server/server.py &
+python server.py &
 
 echo "[Entrypoint] Waiting 5 seconds for background services to boot..."
 sleep 5
