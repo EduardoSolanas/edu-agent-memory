@@ -36,7 +36,7 @@ def main():
     args = parser.parse_args()
 
     # Load local .env
-    dot_env = load_env(WORKDIR / "personamemv2" / ".env")
+    dot_env = load_env(WORKDIR / ".env")
     
     # Resolve provider details
     if args.provider == "gemini":
@@ -99,11 +99,11 @@ def main():
         "EDUMEM_LLM_API_KEY": api_key,
         "EDUMEM_LLM_MODEL": model,
         "EDUMEM_LLM_ENABLED": "true",
-        "PYTHONPATH": str(WORKDIR / "personamemv2")
+        "PYTHONPATH": str(WORKDIR / "benchmarks")
     }
 
-    python_env = WORKDIR / "personamemv2" / ".venv" / "bin" / "python3"
-    script_path = WORKDIR / "personamemv2/.venv/lib/python3.13/site-packages/tools/evaluate_beam_end_to_end.py"
+    python_env = WORKDIR / ".venv" / "bin" / "python3"
+    script_path = WORKDIR / ".venv/lib/python3.13/site-packages/tools/evaluate_beam_end_to_end.py"
 
     cmd = [
         str(python_env),

@@ -118,7 +118,7 @@ def process_item(client, idx, qa_pair):
     return idx, category, gold, pred, ok
 
 def main():
-    load_env(WORKDIR / "personamemv2" / ".env")
+    load_env(WORKDIR / ".env")
     load_env(Path("/root/.hermes/.env"))
     
     api_key = os.getenv("CHAT_MODEL_API_KEY") or os.getenv("NAN_APY_KEY") or os.getenv("OPENAI_API_KEY")

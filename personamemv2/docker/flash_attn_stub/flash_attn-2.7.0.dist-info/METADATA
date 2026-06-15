@@ -1,4 +1,0 @@
-Metadata-Version: 2.1
-Name: flash-attn
-Version: 2.7.0
-Summary: Flash Attention stub for V100 (bert_padding only)

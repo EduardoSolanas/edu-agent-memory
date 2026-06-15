@@ -191,4 +191,4 @@ docker compose up --build -d
 
 ### **Services & Ports Configured:**
 *   **`openvino-server` (Port `3002`)**: Hosts the high-performance TEI-like `/embed`, `/rerank`, and `/v1/chat/completions` endpoints. Uses `network_mode: host` to eliminate Docker routing overhead, maps `/dev/dri` directly to your Intel iGPU, and mounts your compiled models folder.
-*   **`mnemosyne-qdrant` (Port `6333` & `6334`)**: Standard distributed vector store with persistent storage bound to `qdrant_data`.
+*   **`edumem-qdrant` (Port `6333` & `6334`)**: Standard distributed vector store with persistent storage bound to `qdrant_data`.

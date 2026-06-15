@@ -17,7 +17,7 @@ EDUMEM_ROOT = Path("/opt/edumem")
 LONGMEMEVAL_ROOT = Path("/opt/LongMemEval")
 MAB_ROOT = Path("/opt/MemoryAgentBench")
 
-PYTHON_ENV = EDUMEM_ROOT / "personamemv2" / ".venv" / "bin" / "python3"
+PYTHON_ENV = EDUMEM_ROOT / ".venv" / "bin" / "python3"
 
 def load_env(path: Path) -> None:
     if not path.exists():
@@ -59,7 +59,7 @@ def run_command(command, cwd, env_overrides=None):
 
 def main():
     # Load all environment configurations
-    load_env(EDUMEM_ROOT / "personamemv2" / ".env")
+    load_env(EDUMEM_ROOT / ".env")
     load_env(Path("/root/.hermes/.env"))
     
     # Check if Quick Mode is requested (default to False unless QUICK=1 env var is set)
@@ -99,25 +99,25 @@ def main():
     beam_env = {
         "OPENROUTER_API_KEY": os.getenv("NAN_APY_KEY") or os.getenv("OPENAI_API_KEY", ""),
         "OPENROUTER_BASE_URL": os.getenv("CHAT_MODEL_BASE_URL", "https://api.nan.builders/v1"),
-        "PYTHONPATH": str(EDUMEM_ROOT / "personamemv2")
+        "PYTHONPATH": str(EDUMEM_ROOT / "benchmarks")
     }
     beam_cmd = [
         str(PYTHON_ENV),
-        str(EDUMEM_ROOT / "personamemv2/.venv/lib/python3.13/site-packages/tools/evaluate_beam_end_to_end.py"),
+        str(EDUMEM_ROOT / ".venv/lib/python3.13/site-packages/tools/evaluate_beam_end_to_end.py"),
         "--scales", scales_arg,
         "--sample", sample_arg,
         "--model", "qwen3.6",
         "--pure-recall"
     ]
     t0 = time.time()
-    code_beam, out_beam = run_command(beam_cmd, EDUMEM_ROOT / "personamemv2", beam_env)
+    code_beam, out_beam = run_command(beam_cmd, EDUMEM_ROOT, beam_env)
     t_beam = time.time() - t0
     
     # Parse BEAM Accuracy from output JSON
     beam_accuracy = "N/A"
     if code_beam == 0:
         try:
-            summary_path = EDUMEM_ROOT / "personamemv2/results/beam_e2e_summary.json"
+            summary_path = EDUMEM_ROOT / "results/beam_e2e_summary.json"
             summary_data = json.loads(summary_path.read_text())
             ab_summary = summary_data.get("ability_summary", {})
             
@@ -137,17 +137,17 @@ def main():
     print("\n--- STEP 3: Running Official PersonaMem-v2 (128K) ---")
     pm_env = {
         "LIMIT": limit_70,
-        "PYTHONPATH": str(EDUMEM_ROOT / "personamemv2")
+        "PYTHONPATH": str(EDUMEM_ROOT / "benchmarks")
     }
     pm_128k_cmd = [str(PYTHON_ENV), "benchmarks/personamem_v2_128k.py"]
     t0 = time.time()
-    code_128k, out_128k = run_command(pm_128k_cmd, EDUMEM_ROOT / "personamemv2", pm_env)
+    code_128k, out_128k = run_command(pm_128k_cmd, EDUMEM_ROOT, pm_env)
     t_128k = time.time() - t0
     
     # Parse 128K Accuracy from results JSONL
     pm_128k_accuracy = "N/A"
     try:
-        jsonl_path_128k = EDUMEM_ROOT / "personamemv2/results/personamem_v2_128k_results.jsonl"
+        jsonl_path_128k = EDUMEM_ROOT / "results/personamem_v2_128k_results.jsonl"
         lines_128k = jsonl_path_128k.read_text().splitlines()
         correct = 0
         total = 0
@@ -215,7 +215,7 @@ Run Configuration: `QUICK_MODE={quick_mode}`
     print("======================================================================\n")
     
     # Save Report to file
-    report_dir = EDUMEM_ROOT / "personamemv2/results"
+    report_dir = EDUMEM_ROOT / "results"
     report_dir.mkdir(parents=True, exist_ok=True)
     (report_dir / "regression_report.md").write_text(report)
     print(f"[+] Master Performance Report saved successfully to: {report_dir}/regression_report.md")
