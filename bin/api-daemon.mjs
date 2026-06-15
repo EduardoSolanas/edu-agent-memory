@@ -1,16 +1,24 @@
 import { createMnemosyne as createEdumem } from 'mnemosy-ai';
 import { createServer } from 'http';
 
-const PORT = 6336;
+// Production configuration via environment variables
+const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 6336;
+const VECTOR_DB_URL = process.env.VECTOR_DB_URL || 'http://127.0.0.1:6333';
+const EMBEDDING_URL = process.env.EMBEDDING_URL || 'http://127.0.0.1:3002/embed';
+const EXTRACTION_URL = process.env.EXTRACTION_URL || 'http://127.0.0.1:6335';
 const INTERVAL_MS = 12 * 60 * 60 * 1000; // 12 hours
 
 async function main() {
-  console.log('Starting api-daemon with RAG/Recall API...');
+  console.log(`Starting api-daemon with RAG/Recall API on port ${PORT}...`);
+  console.log(`Configured backend URLs:`);
+  console.log(`- Vector DB (Qdrant): ${VECTOR_DB_URL}`);
+  console.log(`- Embeddings (OpenVINO): ${EMBEDDING_URL}`);
+  console.log(`- Extraction (Fallback LLM): ${EXTRACTION_URL}`);
   
   // Single master edumem instance scoped to personal collections
   const m = await createEdumem({
-    vectorDbUrl: 'http://127.0.0.1:6333',
-    embeddingUrl: 'http://127.0.0.1:3002/embed',
+    vectorDbUrl: VECTOR_DB_URL,
+    embeddingUrl: EMBEDDING_URL,
     embeddingModel: 'gte-modernbert-base',
     agentId: 'agent-memory-daemon',
     collections: {
@@ -22,7 +30,7 @@ async function main() {
     enableGraph: false,
     enableBroadcast: false,
     enableExtraction: true,
-    extractionUrl: 'http://127.0.0.1:6335',
+    extractionUrl: EXTRACTION_URL,
     enableBM25: true,
     bm25MaxDocs: 10000,
     bm25PageSize: 100
@@ -106,13 +114,15 @@ async function main() {
         const userTag = tags.find(t => t.startsWith('user:'));
         const userId = userTag ? userTag.replace('user:', '') : null;
         
-        console.log('[RECALL] bank=' + bankId + ' user=' + userId + ' query= + query + ');
+        console.log('[RECALL] bank=' + bankId + ' user=' + userId + ' query=' + query);
         
         // Dynamic collection routing: locomo -> locomo_shared, anything else -> personal shared
         const targetCollection = bankId === 'locomo' ? 'locomo_shared' : (bankId === 'pm' ? 'pm_shared' : m.config.sharedCollection);
-        const filters = userId ? { user_id: userId } : undefined;
         
-        // Generate embeddings and query Qdrant directly via our master client\'s db handler
+        // Align filters with mnemosy-ai: user_id is nested inside metadata in high-level store pipeline
+        const filters = userId ? { "metadata.user_id": userId } : undefined;
+        
+        // Generate embeddings and query Qdrant directly via our master client's db handler
         const vector = await m.embeddings.embed(query);
         const searchResults = await m.db.search(targetCollection, vector, 15, 0.3, filters);
         
@@ -131,7 +141,48 @@ async function main() {
       return;
     }
 
-    // 2. REFLECT API (compatible with API Client reflect spec)
+    // 2. RETAIN API (compatible with API Client retain spec)
+    if (method === 'POST' && url.match(/^\/v1\/default\/banks\/([^\/]+)\/memories\/retain$/)) {
+      try {
+        const match = url.match(/^\/v1\/default\/banks\/([^\/]+)\/memories\/retain$/);
+        const bankId = match[1];
+        const body = await getJsonBody(req);
+        const content = body.content || body.text || '';
+        const tags = body.tags || [];
+        
+        // Strip user: prefix from tags
+        const userTag = tags.find(t => t.startsWith('user:'));
+        const userId = userTag ? userTag.replace('user:', '') : null;
+
+        console.log('[RETAIN] bank=' + bankId + ' user=' + userId + ' content=' + content);
+        
+        // Save the memory to the corresponding collection
+        const payload = {
+          text: content,
+          memoryType: 'fact',
+          importance: 0.7,
+          metadata: userId ? { user_id: userId } : {}
+        };
+        
+        const stored = await m.store(payload);
+        
+        // Handle mnemosy-ai returns: raw string ID or object with id
+        const storedId = typeof stored === 'string' ? stored : (stored?.id || null);
+        
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          result: "Memory stored successfully.",
+          id: storedId
+        }));
+      } catch (err) {
+        console.error('Retain API error:', err);
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+      return;
+    }
+
+    // 3. REFLECT API (compatible with API Client reflect spec)
     if (method === 'POST' && url.match(/^\/v1\/default\/banks\/([^\/]+)\/reflect$/)) {
       try {
         const match = url.match(/^\/v1\/default\/banks\/([^\/]+)\/reflect$/);
@@ -141,21 +192,21 @@ async function main() {
         const tags = body.tags || [];
         
         const userTags = tags.filter(t => t.startsWith('user:')).map(t => t.replace('user:', ''));
-        console.log('[REFLECT] bank=' + bankId + ' users=' + JSON.stringify(userTags) + ' query= + query + ');
+        console.log('[REFLECT] bank=' + bankId + ' users=' + JSON.stringify(userTags) + ' query=' + query);
 
         const targetCollection = bankId === 'locomo' ? 'locomo_shared' : (bankId === 'pm' ? 'pm_shared' : m.config.sharedCollection);
         
         // Retrieve user-scoped memories in parallel
         const results = await Promise.all(userTags.map(async (uid) => {
           const vector = await m.embeddings.embed(query);
-          const userMemories = await m.db.search(targetCollection, vector, 15, 0.3, { user_id: uid });
+          const userMemories = await m.db.search(targetCollection, vector, 15, 0.3, { "metadata.user_id": uid });
           return {
             uid,
             memories: userMemories.map(r => r.entry.text)
           };
         }));
 
-        // Format into combined context string matching API Client\'s structure
+        // Format into combined context string matching API Client's structure
         let formattedContext = '';
         results.forEach(({ uid, memories }) => {
           const speakerName = uid.includes('speaker_a') ? 'Speaker A' : 'Speaker B';
@@ -188,7 +239,7 @@ async function main() {
   });
 
   server.listen(PORT, '0.0.0.0', () => {
-    console.log('api-daemon Server running on http://0.0.0.0:' + PORT);
+    console.log(`api-daemon Server running on http://0.0.0.0:${PORT}`);
   });
 }
 
