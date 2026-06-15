@@ -46,6 +46,10 @@ class EmbedRequest(BaseModel):
     
 class EmbedResponse(BaseModel):
     embeddings: List[List[float]]
+
+class OpenAIEmbeddingRequest(BaseModel):
+    input: str | List[str]
+    model: Optional[str] = "Alibaba-NLP/gte-modernbert-base"
     
 class RerankRequest(BaseModel):
     query: str
@@ -186,6 +190,39 @@ def embed(request: EmbedRequest):
     
     except Exception as e:
         print(f"Embed error: {e}", flush=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/v1/embeddings")
+def openai_embeddings(request: OpenAIEmbeddingRequest):
+    try:
+        start = time.time()
+        inputs = request.input if isinstance(request.input, list) else [request.input]
+        
+        with embed_lock:
+            embeddings = embed_pipeline.embed_documents(inputs)
+            
+        data = []
+        for idx, emb in enumerate(embeddings):
+            data.append({
+                "object": "embedding",
+                "embedding": list(emb),
+                "index": idx
+            })
+            
+        latency = (time.time() - start) * 1000
+        print(f"OpenAI Embed: {len(inputs)} texts, {latency:.1f}ms", flush=True)
+        
+        return {
+            "object": "list",
+            "data": data,
+            "model": request.model,
+            "usage": {
+                "prompt_tokens": 0,
+                "total_tokens": 0
+            }
+        }
+    except Exception as e:
+        print(f"OpenAI Embed error: {e}", flush=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
