@@ -1,107 +1,102 @@
-import { createMnemosyne as createEdumem } from 'mnemosy-ai';
 import { createServer } from 'http';
+import { randomUUID } from 'crypto';
 
 // Production configuration via environment variables
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 6336;
 const VECTOR_DB_URL = process.env.VECTOR_DB_URL || 'http://127.0.0.1:6333';
 const EMBEDDING_URL = process.env.EMBEDDING_URL || 'http://127.0.0.1:3002/embed';
-const EXTRACTION_URL = process.env.EXTRACTION_URL || 'http://127.0.0.1:6335';
-const INTERVAL_MS = 12 * 60 * 60 * 1000; // 12 hours
+const SHARED_COLLECTION = process.env.SHARED_COLLECTION || 'edumem_shared';
+
+// Ensure Qdrant collection is initialized on startup
+async function ensureCollection(collection) {
+  try {
+    const checkRes = await fetch(`${VECTOR_DB_URL}/collections/${collection}`);
+    if (checkRes.status === 200) {
+      console.log(`[Collection] "${collection}" is verified and active.`);
+      return;
+    }
+    
+    console.log(`[Collection] Creating "${collection}" (768-dim, Cosine distance)...`);
+    const createRes = await fetch(`${VECTOR_DB_URL}/collections/${collection}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        vectors: {
+          size: 768,
+          distance: 'Cosine'
+        }
+      })
+    });
+    
+    if (!createRes.ok) {
+      throw new Error(`PUT /collections/${collection} returned status ${createRes.status}`);
+    }
+    console.log(`[Collection] Successfully initialized "${collection}"!`);
+  } catch (err) {
+    console.error(`[Collection Error] Failed to ensure collection "${collection}":`, err.message);
+  }
+}
+
+// Compute embeddings using the local OpenVINO GenAI server
+async function getEmbedding(text) {
+  const res = await fetch(EMBEDDING_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ inputs: text })
+  });
+  if (!res.ok) {
+    throw new Error(`Embedding request failed: ${res.statusText}`);
+  }
+  const data = await res.json();
+  return data[0]; // Extract the first float array
+}
+
+// Helper to parse JSON body
+function getJsonBody(req) {
+  return new Promise((resolve, reject) => {
+    let body = '';
+    req.on('data', chunk => { body += chunk; });
+    req.on('end', () => {
+      try {
+        resolve(body ? JSON.parse(body) : {});
+      } catch (e) {
+        reject(e);
+      }
+    });
+    req.on('error', reject);
+  });
+}
 
 async function main() {
-  console.log(`Starting api-daemon with RAG/Recall API on port ${PORT}...`);
+  console.log(`Starting native edumem api-daemon on port ${PORT}...`);
   console.log(`Configured backend URLs:`);
   console.log(`- Vector DB (Qdrant): ${VECTOR_DB_URL}`);
   console.log(`- Embeddings (OpenVINO): ${EMBEDDING_URL}`);
-  console.log(`- Extraction (Fallback LLM): ${EXTRACTION_URL}`);
-  
-  // Single master edumem instance scoped to personal collections
-  const m = await createEdumem({
-    vectorDbUrl: VECTOR_DB_URL,
-    embeddingUrl: EMBEDDING_URL,
-    embeddingModel: 'gte-modernbert-base',
-    agentId: 'agent-memory-daemon',
-    collections: {
-      shared: 'edumem_shared',
-      private: 'edumem_private',
-      profiles: 'edumem_profiles',
-      skills: 'edumem_skills'
-    },
-    enableGraph: false,
-    enableBroadcast: false,
-    enableExtraction: true,
-    extractionUrl: EXTRACTION_URL,
-    enableBM25: true,
-    bm25MaxDocs: 10000,
-    bm25PageSize: 100
-  });
+  console.log(`- Active Collection: ${SHARED_COLLECTION}`);
 
-  let lastDream = null;
-  let lastConsolidate = null;
-  let isRunning = false;
+  // Bootstrap active collection
+  await ensureCollection(SHARED_COLLECTION);
 
-  async function runCognitiveJobs() {
-    if (isRunning) return;
-    isRunning = true;
-    console.log('[' + new Date().toISOString() + '] Starting scheduled dreaming & consolidation on personal data...');
-    try {
-      console.log('Running edumem Dream (deduplication & decay)...');
-      const dreamRes = await m.dream();
-      lastDream = { timestamp: new Date().toISOString(), result: dreamRes };
-      console.log('Dream complete:', JSON.stringify(dreamRes));
-
-      console.log('Running edumem Consolidate...');
-      const consRes = await m.consolidate();
-      lastConsolidate = { timestamp: new Date().toISOString(), result: consRes };
-      console.log('Consolidate complete:', JSON.stringify(consRes));
-    } catch (err) {
-      console.error('Error running cognitive jobs:', err);
-    } finally {
-      isRunning = false;
-    }
-  }
-
-  // Run cognitive dreaming/decay immediately on startup
-  await runCognitiveJobs().catch(console.error);
-
-  // Set interval
-  setInterval(runCognitiveJobs, INTERVAL_MS);
-
-  // Helper to parse JSON body
-  function getJsonBody(req) {
-    return new Promise((resolve, reject) => {
-      let body = '';
-      req.on('data', chunk => { body += chunk; });
-      req.on('end', () => {
-        try {
-          resolve(body ? JSON.parse(body) : {});
-        } catch (e) {
-          reject(e);
-        }
-      });
-      req.on('error', reject);
-    });
-  }
-
-  // Start HTTP server supporting API Client RAG API protocol
   const server = createServer(async (req, res) => {
     const url = req.url;
     const method = req.method;
 
+    // Health Endpoint
     if (method === 'GET' && (url === '/health' || url === '/')) {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         status: 'healthy',
         daemon: 'edumem-cognitive-daemon',
-        last_dream: lastDream,
-        last_consolidate: lastConsolidate,
-        is_running: isRunning,
-        uptime_seconds: Math.floor(process.uptime())
+        uptime_seconds: Math.floor(process.uptime()),
+        dependencies: {
+          vector_db: VECTOR_DB_URL,
+          embeddings: EMBEDDING_URL
+        }
       }));
       return;
     }
 
-    // 1. RECALL API (compatible with API Client recall spec)
+    // 1. RECALL API
     if (method === 'POST' && url.match(/^\/v1\/default\/banks\/([^\/]+)\/memories\/recall$/)) {
       try {
         const match = url.match(/^\/v1\/default\/banks\/([^\/]+)\/memories\/recall$/);
@@ -114,34 +109,51 @@ async function main() {
         const userTag = tags.find(t => t.startsWith('user:'));
         const userId = userTag ? userTag.replace('user:', '') : null;
         
-        console.log('[RECALL] bank=' + bankId + ' user=' + userId + ' query=' + query);
+        console.log(`[RECALL] bank=${bankId} user=${userId} query="${query}"`);
         
-        // Dynamic collection routing: locomo -> locomo_shared, anything else -> personal shared
-        const targetCollection = bankId === 'locomo' ? 'locomo_shared' : (bankId === 'pm' ? 'pm_shared' : m.config.sharedCollection);
+        const targetCollection = bankId === 'locomo' ? 'locomo_shared' : (bankId === 'pm' ? 'pm_shared' : SHARED_COLLECTION);
         
-        // Align filters with mnemosy-ai: user_id is nested inside metadata in high-level store pipeline
-        const filters = userId ? { "metadata.user_id": userId } : undefined;
+        // Compute embedding using OpenVINO
+        const vector = await getEmbedding(query);
         
-        // Generate embeddings and query Qdrant directly via our master client's db handler
-        const vector = await m.embeddings.embed(query);
-        const searchResults = await m.db.search(targetCollection, vector, 15, 0.3, filters);
-        
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({
-          results: searchResults.map(r => ({
-            text: r.entry.text,
-            score: r.score
-          }))
+        // Formulate Qdrant search request
+        const must = [{ key: "deleted", match: { value: false } }];
+        if (userId) {
+          must.push({ key: "metadata.user_id", match: { value: userId } });
+        }
+
+        const qdrantRes = await fetch(`${VECTOR_DB_URL}/collections/${targetCollection}/points/search`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            vector,
+            limit: 15,
+            filter: { must },
+            with_payload: true
+          })
+        });
+
+        if (!qdrantRes.ok) {
+          throw new Error(`Qdrant search failed with status ${qdrantRes.status}`);
+        }
+
+        const data = await qdrantRes.json();
+        const searchResults = (data.result || []).map(r => ({
+          text: r.payload?.text || '',
+          score: r.score
         }));
+
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ results: searchResults }));
       } catch (err) {
-        console.error('Recall API error:', err);
+        console.error('Recall API error:', err.message);
         res.writeHead(500, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: err.message }));
       }
       return;
     }
 
-    // 2. RETAIN API (compatible with API Client retain spec)
+    // 2. RETAIN API
     if (method === 'POST' && url.match(/^\/v1\/default\/banks\/([^\/]+)\/memories\/retain$/)) {
       try {
         const match = url.match(/^\/v1\/default\/banks\/([^\/]+)\/memories\/retain$/);
@@ -154,35 +166,54 @@ async function main() {
         const userTag = tags.find(t => t.startsWith('user:'));
         const userId = userTag ? userTag.replace('user:', '') : null;
 
-        console.log('[RETAIN] bank=' + bankId + ' user=' + userId + ' content=' + content);
+        console.log(`[RETAIN] bank=${bankId} user=${userId} content="${content.slice(0, 60)}..."`);
         
-        // Save the memory to the corresponding collection
+        const targetCollection = bankId === 'locomo' ? 'locomo_shared' : (bankId === 'pm' ? 'pm_shared' : SHARED_COLLECTION);
+        
+        // Compute embedding using OpenVINO
+        const vector = await getEmbedding(content);
+        
+        // Assemble Qdrant point paylod
+        const id = randomUUID();
+        const now = new Date().toISOString();
         const payload = {
           text: content,
-          memoryType: 'fact',
-          importance: 0.7,
-          metadata: userId ? { user_id: userId } : {}
+          agent_id: "agent-memory-daemon",
+          user_id: null,
+          memory_type: "fact",
+          deleted: false,
+          metadata: userId ? { user_id: userId } : {},
+          created_at: now,
+          updated_at: now
         };
-        
-        const stored = await m.store(payload);
-        
-        // Handle mnemosy-ai returns: raw string ID or object with id
-        const storedId = typeof stored === 'string' ? stored : (stored?.id || null);
-        
+
+        const qdrantRes = await fetch(`${VECTOR_DB_URL}/collections/${targetCollection}/points`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            wait: true,
+            points: [{ id, vector, payload }]
+          })
+        });
+
+        if (!qdrantRes.ok) {
+          throw new Error(`Qdrant PUT points failed with status ${qdrantRes.status}`);
+        }
+
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
           result: "Memory stored successfully.",
-          id: storedId
+          id: id
         }));
       } catch (err) {
-        console.error('Retain API error:', err);
+        console.error('Retain API error:', err.message);
         res.writeHead(500, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: err.message }));
       }
       return;
     }
 
-    // 3. REFLECT API (compatible with API Client reflect spec)
+    // 3. REFLECT API
     if (method === 'POST' && url.match(/^\/v1\/default\/banks\/([^\/]+)\/reflect$/)) {
       try {
         const match = url.match(/^\/v1\/default\/banks\/([^\/]+)\/reflect$/);
@@ -192,41 +223,55 @@ async function main() {
         const tags = body.tags || [];
         
         const userTags = tags.filter(t => t.startsWith('user:')).map(t => t.replace('user:', ''));
-        console.log('[REFLECT] bank=' + bankId + ' users=' + JSON.stringify(userTags) + ' query=' + query);
+        console.log(`[REFLECT] bank=${bankId} users=${JSON.stringify(userTags)} query="${query}"`);
 
-        const targetCollection = bankId === 'locomo' ? 'locomo_shared' : (bankId === 'pm' ? 'pm_shared' : m.config.sharedCollection);
+        const targetCollection = bankId === 'locomo' ? 'locomo_shared' : (bankId === 'pm' ? 'pm_shared' : SHARED_COLLECTION);
+        const vector = await getEmbedding(query);
         
         // Retrieve user-scoped memories in parallel
         const results = await Promise.all(userTags.map(async (uid) => {
-          const vector = await m.embeddings.embed(query);
-          const userMemories = await m.db.search(targetCollection, vector, 15, 0.3, { "metadata.user_id": uid });
-          return {
-            uid,
-            memories: userMemories.map(r => r.entry.text)
-          };
+          const must = [
+            { key: "deleted", match: { value: false } },
+            { key: "metadata.user_id", match: { value: uid } }
+          ];
+          
+          const qdrantRes = await fetch(`${VECTOR_DB_URL}/collections/${targetCollection}/points/search`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              vector,
+              limit: 15,
+              filter: { must },
+              with_payload: true
+            })
+          });
+
+          if (!qdrantRes.ok) return { uid, memories: [] };
+
+          const data = await qdrantRes.json();
+          const memories = (data.result || []).map(r => r.payload?.text || '');
+          return { uid, memories };
         }));
 
-        // Format into combined context string matching API Client's structure
+        // Format into combined context string matching API specification
         let formattedContext = '';
         results.forEach(({ uid, memories }) => {
           const speakerName = uid.includes('speaker_a') ? 'Speaker A' : 'Speaker B';
-          formattedContext += '### Historical memories for ' + speakerName + ' (' + uid + '):\n';
+          formattedContext += `### Historical memories for ${speakerName} (${uid}):\n`;
           if (memories.length === 0) {
             formattedContext += '- No relevant memories found.\n';
           } else {
             memories.forEach(m => {
-              formattedContext += '- ' + m + '\n';
+              formattedContext += `- ${m}\n`;
             });
           }
           formattedContext += '\n';
         });
 
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({
-          text: formattedContext.trim()
-        }));
+        res.end(JSON.stringify({ text: formattedContext.trim() }));
       } catch (err) {
-        console.error('Reflect API error:', err);
+        console.error('Reflect API error:', err.message);
         res.writeHead(500, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: err.message }));
       }

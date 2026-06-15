@@ -1,15 +1,18 @@
 {
   "name": "edumem",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "description": "Unified Cognitive Memory Subsystem & Performance Harness",
+  "main": "bin/api-daemon.mjs",
+  "type": "module",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node --test tests/api-daemon.test.mjs"
   },
-  "keywords": [],
+  "keywords": [
+    "edumem",
+    "cognitive-memory",
+    "qdrant",
+    "openvino"
+  ],
   "author": "",
-  "license": "ISC",
-  "dependencies": {
-    "mnemosy-ai": "^1.0.1"
-  }
+  "license": "ISC"
 }
