@@ -1,6 +1,13 @@
 #!/bin/bash
 set -e
 
+# If a custom command is passed to docker run, execute that instead of starting the default stack
+if [ "$#" -gt 0 ] && [ "$1" != "bash" ] && [ "$1" != "/bin/bash" ]; then
+    echo "[Entrypoint] Running custom command: $@"
+    exec "$@"
+fi
+
+# Default entrypoint behavior:
 echo "[Entrypoint] Creating Qdrant storage directory..."
 mkdir -p /app/qdrant_storage
 
