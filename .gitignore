@@ -39,3 +39,6 @@ memories_dump.json
 
 # Models
 deploy/*/models/
+
+# Results
+results/
