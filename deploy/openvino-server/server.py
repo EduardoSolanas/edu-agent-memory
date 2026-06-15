@@ -173,24 +173,7 @@ async def load_models():
     
     print("All models loaded successfully!", flush=True)
 
-@app.post("/embed")
-def embed(request: EmbedRequest):
-    try:
-        start = time.time()
-        
-        inputs = request.inputs if isinstance(request.inputs, list) else [request.inputs]
-        
-        with embed_lock:
-            embeddings = embed_pipeline.embed_documents(inputs)
-        
-        latency = (time.time() - start) * 1000
-        print(f"Embed: {len(inputs)} texts, {latency:.1f}ms", flush=True)
-        
-        return embeddings
-    
-    except Exception as e:
-        print(f"Embed error: {e}", flush=True)
-        raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.post("/v1/embeddings")
 def openai_embeddings(request: OpenAIEmbeddingRequest):

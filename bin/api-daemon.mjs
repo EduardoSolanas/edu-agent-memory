@@ -4,7 +4,7 @@ import { randomUUID } from 'crypto';
 // Production configuration via environment variables
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 6336;
 const VECTOR_DB_URL = process.env.VECTOR_DB_URL || 'http://127.0.0.1:6333';
-const EMBEDDING_URL = process.env.EMBEDDING_URL || 'http://127.0.0.1:3002/embed';
+const EMBEDDING_URL = process.env.EMBEDDING_URL || 'http://127.0.0.1:3002/v1/embeddings';
 const SHARED_COLLECTION = process.env.SHARED_COLLECTION || 'edumem_shared';
 
 // Ensure Qdrant collection is initialized on startup
@@ -42,13 +42,13 @@ async function getEmbedding(text) {
   const res = await fetch(EMBEDDING_URL, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ inputs: text })
+    body: JSON.stringify({ input: text })
   });
   if (!res.ok) {
     throw new Error(`Embedding request failed: ${res.statusText}`);
   }
   const data = await res.json();
-  return data[0]; // Extract the first float array
+  return data.data[0].embedding; // Extract the first float array
 }
 
 // Helper to parse JSON body

@@ -118,6 +118,10 @@ def main():
     if code_beam == 0:
         try:
             summary_path = EDUMEM_ROOT / "results/beam_e2e_summary.json"
+            if not summary_path.exists():
+                fallback = EDUMEM_ROOT / ".venv/lib/python3.13/site-packages/results/beam_e2e_summary.json"
+                if fallback.exists():
+                    summary_path = fallback
             summary_data = json.loads(summary_path.read_text())
             ab_summary = summary_data.get("ability_summary", {})
             
