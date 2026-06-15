@@ -20,8 +20,18 @@ RUN pip install --no-cache-dir \
     pydantic \
     numpy
 
-# Copy server.py to the container workspace
+# Pre-bake the compiled models directly into the image to eliminate volume mount latencies
+COPY models/gte-modernbert-ov /app/models/gte-modernbert-ov
+COPY models/ettin-17m-ov /app/models/ettin-17m-ov
+
+# Copy the server.py source code
 COPY server.py .
+
+# Configure default environment variables to point directly to baked-in model paths
+ENV EMBED_MODEL_PATH=/app/models/gte-modernbert-ov
+ENV RERANK_MODEL_PATH=/app/models/ettin-17m-ov
+ENV LLM_MODEL_PATH=""
+ENV CACHE_DIR=/app/models/model_cache
 
 EXPOSE 3002
 
