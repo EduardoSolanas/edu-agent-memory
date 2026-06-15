@@ -1,92 +1,173 @@
-# api-daemon Workspace
+# api-daemon Architecture & Performance Harness
 
-This repository contains the **api-daemon** service and the active evaluation/benchmarks used to measure, test, and profile our custom cognitive memory pipeline.
+This repository contains the **api-daemon** memory subsystem service and the active evaluation/benchmarks used to measure, test, and profile our custom cognitive memory pipeline.
 
----
-
-## 🚀 Overview of api-daemon
-
-The `api-daemon` runs on CT 116 (port **`6336`**) and is the single, authoritative entrypoint for calling agents (e.g., Hermes on CT 108) to query and interact with memory.
-
-It hosts two primary production endpoints compatible with the Standard Memory API protocol:
-1.  **RAG Recall (`POST /v1/default/banks/:bank/memories/recall`)**: For fast vector-based retrieval.
-2.  **RAG Reflection (`POST /v1/default/banks/:bank/reflect`)**: For generating chronological, formatted participant context blocks.
-
-In the background, it runs a scheduled 12-hour dreaming and consolidation job using local embedding (`gte-modernbert-base`) and reranking (`Ettin-17M`) servers to optimize, decay, and deduplicate agent memories.
+For installation, configurations, and verification steps, refer to the [Setup & Reproduction Guide](setup.md).
 
 ---
 
-## 🛠️ Step-by-Step Setup & Reproduction
+## 🏛️ **System Architecture**
 
-### 1. System Requirements & Packages
-Configure your target container or machine (e.g. Debian/Ubuntu container):
-```bash
-apt-get update
-apt-get install -y curl git sqlite3 libsqlite3-dev python3 python3-pip python3-venv build-essential
-curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
-apt-get install -y nodejs
+The subsystem divides responsibilities across three decoupled layers on the host (**CT 116**):
+
+```text
+[ Calling Agent ] (e.g. Hermes on CT 108)
+       │
+       ▼ (Port 6336 - REST / JSON)
+┌────────────────────────────────────────────────────────┐
+│                      api-daemon                        │ (Node.js Workspace: /opt/edumem)
+│  - Scheduled Dreaming & Consolidation (Every 12h)      │
+│  - Standard API-compatible Recall & Reflection         │
+└──────┬───────────────────┬─────────────────────────────┘
+       │                   │
+       ▼ (Vector queries)  ▼ (Direct /embed & /rerank HTTP POSTs)
+┌──────────────┐   ┌─────────────────────────────────────┐
+│  Qdrant DB   │   │      OpenVINO Inference Server      │ (Docker / host port 3002)
+│  (Port 6333) │   │  - Intel iGPU execution (/dev/dri)  │
+│              │   │  - Native C++ Tokenizers            │
+└──────────────┘   └─────────────────────────────────────┘
 ```
 
-### 2. Qdrant Vector DB
-Start Qdrant inside a Docker container:
-```bash
-docker run -d -p 6333:6333 -p 6334:6334 \
-    -v /opt/qdrant_storage:/qdrant/storage \
-    --name mnemosyne-qdrant \
-    --restart always \
-    qdrant/qdrant:latest
+---
+
+## 💾 **1. The Storage Engine: SQLite + `sqlite-vec`**
+
+While the production runtime uses Qdrant for distributed vector queries, our evaluation and sandbox engine uses **`sqlite-vec`**:
+
+### **What is `sqlite-vec`?**
+It is a native C-extension for SQLite that adds high-performance vector search capabilities directly into standard relational databases. 
+
+### **Why we migrated to it:**
+1.  **Zero-Network Latency**: By running vector indexing inside the same SQLite file as relational data, we avoid HTTP/gRPC network overhead, keeping memory reads sub-millisecond.
+2.  **Atomic Consistency**: Relational metadata (timestamps, user IDs, sequence numbers) and raw vectors are written/committed together in a single atomic transaction.
+3.  **Instant Caching**: It allows us to dump and restore precompiled databases (`.db` files) in `<0.05` seconds, completely bypassing slow message-by-message vector ingestion.
+
+---
+
+## 🗺️ **2. Storage Database Schema (Relational + Vector)**
+
+Our database schema manages both semantic (vector) search and chronological (timeline) reasoning across four main tables:
+
+```text
+               ┌──────────────────────────────────────────────────┐
+               │              sqlite-vec Database                 │
+               └──────────────────────┬───────────────────────────┘
+                                      │
+         ┌────────────────────────────┼───────────────────────────┐
+         ▼                            ▼                           ▼
+┌──────────────────┐         ┌──────────────────┐        ┌──────────────────┐
+│  memoria_facts   │         │    vec_facts     │        │memoria_timelines │
+├──────────────────┤         ├──────────────────┤        ├──────────────────┤
+│ id (TEXT, PK)    │◄───────>│ rowid (INT, PK)  │        │ id (TEXT, PK)    │
+│ text (TEXT)      │         │ fact_id (TEXT,FK)│        │ fact_id (TEXT,FK)│
+│ user_id (TEXT)   │         │ embedding(F32[768│        │ date (TEXT)      │
+│ created_at (INT) │         └──────────────────┘        │ epoch (INT)      │
+└────────┬─────────┘         (sqlite-vec virtual table)  └──────────────────┘
+         │                                               (Chronological index)
+         ▼ (FK)
+┌──────────────────┐
+│memoria_sequences │
+├──────────────────┤
+│ id (TEXT, PK)    │
+│ order_idx (INT)  │
+│ milestone (TEXT) │
+└──────────────────┘
+(Episodic step ordering)
 ```
 
-### 3. Clone & Initialize Workspace
-Clone the repository to `/opt/edumem` and install standard node requirements:
-```bash
-git clone https://github.com/EduardoSolanas/edu-agent-memory.git /opt/edumem
-cd /opt/edumem
-npm install
+---
+
+## 🔄 **3. The Ingestion Pipeline: How We Store Stuff**
+
+When a new message or memory is written, it flows through a **3-Layer Pipeline**:
+
+```text
+  [ Raw Chat / Memory String ]
+                │
+                ▼
+┌──────────────────────────────────────────────┐
+│  LAYER 1: Ingestion & API Router             │
+│  - Receives payload, validates JSON schemas  │
+└───────────────┬──────────────────────────────┘
+                │
+                ▼
+┌──────────────────────────────────────────────┐
+│  LAYER 2: Synthesis & Extraction (LLM)       │
+│  - Parses semantic constraints               │
+│  - Extracts atomic facts                     │
+│  - Identifies chronological dates            │
+│  - Maps sequential milestones                │
+└───────────────┬──────────────────────────────┘
+                │
+                ├──────────────────────────────┐
+                ▼ (Relational Pipeline)        ▼ (Vector Pipeline)
+┌──────────────────────────────────────────────┐┌──────────────────────────────────────────────┐
+│  LAYER 3A: Relational Write                  ││  LAYER 3B: Vector Write                      │
+│  - Writes to SQL:                            ││  - Request /embed from OpenVINO Server      │
+│    * `memoria_facts`                         ││  - OpenVINO tokenizes in C++ & runs iGPU   │
+│    * `memoria_timelines` (chronology)        ││  - Returns FP16 vector (768 dimensions)     │
+│    * `memoria_sequences` (milestones)        ││  - Writes vector to `vec_facts` virtual tbl │
+└───────────────────────┬──────────────────────┘└──────────────────────┬───────────────────────┘
+                        │                                              │
+                        └──────────────────────┬───────────────────────┘
+                                               ▼
+                                  [ Atomic sqlite-vec COMMIT ]
 ```
 
-### 4. Create Python Virtual Environment
-Initialize the Python environment used by the evaluation harness:
-```bash
-cd /opt/edumem/personamemv2
-python3 -m venv .venv
-source .venv/bin/activate
-pip install datasets requests tqdm numpy scipy pydantic sqlite-vec
+---
+
+## 🔍 **4. Retrieval Execution Flow (RAG)**
+
+When an agent queries the database (e.g. during a recall step), the search combines **semantic vectors** and **structured indexes**:
+
+```text
+                  [ User Query ]
+                         │
+                         ▼
+        ┌──────────────────────────────────┐
+        │ Get Embedding vector from GPU    │
+        └────────────────┬─────────────────┘
+                         │
+         ┌───────────────┴───────────────┐
+         ▼ (Standard Path)               ▼ (Temporal Query Path)
+┌────────────────────────────────┐ ┌────────────────────────────────┐
+│ Semantic KNN Search            │ │ Timeline Query                 │
+│ - Search `vec_facts` virtual   │ │ - Join `memoria_facts` with    │
+│   table using Cosine Distance  │ │   `memoria_timelines`          │
+│ - Joins matching `rowid` to    │ │ - Sort by `epoch` ascending    │
+│   `memoria_facts` metadata     │ │ - Extract evolution history    │
+└────────────────┬───────────────┘ └────────────────┬───────────────┘
+                 │                                  │
+                 └───────────────┬──────────────────┘
+                                 ▼
+                    [ Top-K Candidate Slices ]
+                                 │
+                                 ▼
+                    ┌──────────────────────────┐
+                    │ Ettin-17M GPU Reranker   │
+                    └────────────┬─────────────┘
+                                 │
+                                 ▼
+                     [ Clean, Ranked Context ]
 ```
 
-### 5. Start and Register api-daemon Service
-Register `api-daemon` as a persistent systemd service at `/etc/systemd/system/api-daemon.service`:
-```ini
-[Unit]
-Description=api-daemon
-After=network.target 
+---
 
-[Service]
-Type=simple
-User=root
-WorkingDirectory=/opt/edumem
-EnvironmentFile=-/etc/default/api-daemon
-EnvironmentFile=-/etc/environment
-ExecStart=/usr/bin/node /opt/edumem/bin/api-daemon.mjs
-Restart=on-failure
-RestartSec=10
+## ⚡ **5. OpenVINO C++ Tokenizer & iGPU Pipeline**
 
-[Install]
-WantedBy=multi-user.target
-```
+The embedding and reranking tasks run natively on your **Intel iGPU** rather than CPU to completely eliminate latency spikes and OOM thrashing.
 
-Reload and start:
-```bash
-systemctl daemon-reload
-systemctl enable api-daemon.service
-systemctl start api-daemon.service
-```
+### **A. iGPU Device Mapping**
+The OpenVINO Docker container accesses the Intel integrated GPU through host device mapping:
+*   **LXC Config**: Ensure `/dev/dri` is mapped into your LXC container.
+*   **Docker Volumes**: Bound as `devices: ["/dev/dri:/dev/dri"]` (or using Host network mode with direct path binds as implemented on CT 116).
 
-### 6. Verify with Smoke Tests
-```bash
-# Node.js backend check (recalled count should be 1)
-node /opt/edumem/benchmarks/smoke.mjs
+### **B. Native C++ Tokenization**
+Traditional pipelines use Python's `transformers` tokenizer which runs on a single CPU thread and acts as a major bottleneck. Your OpenVINO server leverages native **C++ tokenizers** (`openvino_tokenizer.xml` and `openvino_detokenizer.xml` compiled into the model directory):
+*   Performs token extraction and formatting in raw C++.
+*   Bypasses Python-to-C++ serialization boundaries entirely.
+*   Moves generated token IDs straight into GPU memory buffers, maintaining low latency.
 
-# Dry-run of Python BEAM evaluation
-python3 /opt/edumem/benchmarks/run_beam_official.py --provider gemini --model gemini-2.5-flash --dry-run
-```
+### **C. iGPU Thread Lock & Length-Bucketing**
+*   **GPU Thread Serialization Lock**: The server exposes a single GPU lock (`gpu_lock = threading.Lock()`) across both `/embed` and `/rerank` endpoints. Because the Intel iGPU context is shared, serializing executions prevents multi-stream GPU thrashing and ensures consistent worst-case performance under load.
+*   **Length-Bucketing (Padding Reduction)**: When processing mixed-length batches of memories, the server groups incoming candidate texts into length-buckets (e.g., 32, 64, 128 tokens). This avoids forcing unnecessary padding (which slows down GPU cycles) onto short memory lines, preserving sub-250ms query times.
