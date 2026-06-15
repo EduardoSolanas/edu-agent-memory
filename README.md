@@ -1,104 +1,60 @@
 # edumem: Unified Cognitive Memory Subsystem & Performance Harness
 
-This repository contains **edumem** (consisting of the `api-daemon` runtime service) and the active evaluation/benchmarks used to measure, test, and profile our custom cognitive memory pipeline on **CT 116**.
+This repository contains **edumem** (our Node.js `api-daemon` runtime service), the OpenVINO inference server, and the performance harness used to measure, test, and profile our custom cognitive memory pipeline on **CT 116**.
 
 ---
 
-## 🐳 **Single-Command Docker Stack (Qdrant + OpenVINO + api-daemon)**
+## 🐳 **Unified Single-Image Docker Stack (Qdrant + OpenVINO + api-daemon)**
 
-To completely isolate your system, standardise execution, and eliminate Proxmox LXC setup overhead, the entire memory subsystem is packaged into a **single, unified Docker Compose stack**. 
+To standardize execution and eliminate virtualized hardware mapping overhead, the entire memory subsystem is packaged into a **single, unified, self-contained Docker image**. 
 
-With a single command, you spin up the entire cognitive memory platform, exposing production-grade endpoints on your host:
+The entire cognitive memory platform runs as a single background container, exposing production-grade endpoints:
 
 ```bash
-# Navigate to deployment directory
-cd /opt/edumem/deploy
-
-# Build and launch all three services in the background
-docker compose up --build -d
+# Spin up the unified container with Intel GPU access
+docker run -d \
+  --name edumem-app \
+  -p 3002:3002 \
+  -p 6333:6333 \
+  -p 6336:6336 \
+  --privileged \
+  -v /dev/dri:/dev/dri \
+  edumem:latest
 ```
 
-### **📦 Configured Services:**
-1.  **`api-daemon` (Port `6336`)**: Our Node.js REST API memory server. Handles standard `recall`/`remember` requests and orchestrates background dreaming and consolidation loops. Uses `network_mode: host` to bypass Docker bridge translation overhead, running at maximum native performance.
-2.  **`openvino-server` (Port `3002`)**: A custom-built, lightweight FastAPI server running OpenVINO GenAI. It hosts TEI-compatible `/embed` (using `gte-modernbert-base`) and `/rerank` (using `ettin-17m-ov`) endpoints, automatically falling back from Intel GPU (`/dev/dri`) to optimized CPU execution.
-3.  **`edumem-qdrant` (Ports `6333` & `6334`)**: Standard distributed vector database for high-fidelity, high-dimensional memory indexing.
+### **📦 Packaged Services (Co-located inside a single container):**
+1.  **`api-daemon` (Port `6336`)**: Our Node.js REST API memory server. Handles standard `recall`, `retain`, and `reflect` requests.
+2.  **`openvino-server` (Port `3002`)**: A custom-built, lightweight FastAPI server running OpenVINO GenAI. Hosts TEI-compatible `/v1/embeddings` (using `gte-modernbert-base`) and `/rerank` (using `ettin-17m-ov`) endpoints, automatically falling back from Intel GPU (`/dev/dri`) to optimized CPU execution.
+3.  **`qdrant` (Port `6333`)**: High-performance vector database for high-dimensional, high-fidelity memory indexing.
 
 ---
 
 ## 🏛️ **System Architecture**
 
-The subsystem divides responsibilities across three decoupled layers:
+The subsystem divides responsibilities across three decoupled layers co-located within a single container boundary:
 
 ```text
-[ Calling Agent ] (e.g. Hermes Core on CT 108)
-       │
-       ▼ (Port 6336 - REST / JSON Recall/Remember API)
+       [ Calling Agent ] (e.g. Hermes Core on CT 108)
+              │
+              ▼ (Port 6336 - REST Recall/Retain API)
 ┌────────────────────────────────────────────────────────┐
-│                      api-daemon                        │ (Docker Container: Port 6336)
-│  - Scheduled Dreaming & Consolidation (Every 12h)      │
-│  - Standard API-compatible Recall & Reflection         │
+│                      api-daemon                        │ (Node.js - Port 6336)
+│  - Endpoint routing (/recall, /retain, /reflect)        │
 └──────┬───────────────────┬─────────────────────────────┘
        │                   │
-       ▼ (Vector queries)  ▼ (Direct /embed & /rerank HTTP POSTs)
+       ▼ (Vector queries)  ▼ (Direct /v1/embeddings POSTs)
 ┌──────────────┐   ┌─────────────────────────────────────┐
-│  Qdrant DB   │   │      OpenVINO Inference Server      │ (Docker Container: Port 3002)
-│  (Port 6333) │   │  - Local CPU / GPU model loading    │
+│  Qdrant DB   │   │      OpenVINO Inference Server      │ (Python - Port 3002)
+│  (Port 6333) │   │  - Intel iGPU accelerated embedding │
 │              │   │  - Native C++ Tokenizers            │
 └──────────────┘   └─────────────────────────────────────┘
 ```
 
 ---
 
-## 💾 **1. Relational + Vector Storage Engine**
+## 🔄 **The Ingest Flow: How We Store Stuff**
 
-While the production runtime uses Qdrant for distributed vector queries, our evaluation and sandbox engine uses **`sqlite-vec`**:
-
-### **What is `sqlite-vec`?**
-It is a native C-extension for SQLite that adds high-performance vector search capabilities directly into standard relational databases. 
-
-### **Why we migrated to it for benchmarks:**
-1.  **Zero-Network Latency**: By running vector indexing inside the same SQLite file as relational data, we avoid HTTP/gRPC network overhead, keeping memory reads sub-millisecond.
-2.  **Atomic Consistency**: Relational metadata (timestamps, user IDs, sequence numbers) and raw vectors are written/committed together in a single atomic transaction.
-3.  **Instant Caching**: It allows us to dump and restore precompiled databases (`.db` files) in `<0.05` seconds, completely bypassing slow message-by-message vector ingestion.
-
----
-
-## 🗺️ **2. Storage Database Schema (Relational + Vector)**
-
-Our database schema manages both semantic (vector) search and chronological (timeline) reasoning across four main tables:
-
-```text
-               ┌──────────────────────────────────────────────────┐
-               │              sqlite-vec Database                 │
-               └──────────────────────┬───────────────────────────┘
-                                      │
-         ┌────────────────────────────┼───────────────────────────┐
-         ▼                            ▼                           ▼
-┌──────────────────┐         ┌──────────────────┐        ┌──────────────────┐
-│  memoria_facts   │         │    vec_facts     │        │memoria_timelines │
-├──────────────────┤         ├──────────────────┤        ├──────────────────┤
-│ id (TEXT, PK)    │◄───────>│ rowid (INT, PK)  │        │ id (TEXT, PK)    │
-│ text (TEXT)      │         │ fact_id (TEXT,FK)│        │ fact_id (TEXT,FK)│
-│ user_id (TEXT)   │         │ embedding(F32[768│        │ date (TEXT)      │
-│ created_at (INT) │         └──────────────────┘        │ epoch (INT)      │
-└────────┬─────────┘         (sqlite-vec virtual table)  └──────────────────┘
-         │                                               (Chronological index)
-         ▼ (FK)
-┌──────────────────┐
-│memoria_sequences │
-├──────────────────┤
-│ id (TEXT, PK)    │
-│ order_idx (INT)  │
-│ milestone (TEXT) │
-└──────────────────┘
-(Episodic step ordering)
-```
-
----
-
-## 🔄 **3. The Ingest Flow: How We Store Stuff**
-
-When a new message or memory is written, it flows through a **3-Layer Pipeline**:
+When a new memory is written (via `/retain`), it flows through our **multi-stage pipeline**:
 
 ```text
   [ Raw Chat / Memory String ]
@@ -111,68 +67,50 @@ When a new message or memory is written, it flows through a **3-Layer Pipeline**
                 │
                 ▼
 ┌──────────────────────────────────────────────┐
-│  LAYER 2: Synthesis & Extraction (LLM)       │
-│  - Parses semantic constraints               │
-│  - Extracts atomic facts                     │
-│  - Identifies chronological dates            │
-│  - Maps sequential milestones                │
+│  LAYER 2: Embedding Generation (OpenVINO)    │
+│  - api-daemon POSTs content to port 3002     │
+│  - OpenVINO runs ModernBert on Intel iGPU    │
+│  - Returns 768-dimensional float array       │
 └───────────────┬──────────────────────────────┘
                 │
-                ├──────────────────────────────┐
-                ▼ (Relational Pipeline)        ▼ (Vector Pipeline)
-┌──────────────────────────────────────────────┐┌──────────────────────────────────────────────┐
-│  LAYER 3A: Relational Write                  ││  LAYER 3B: Vector Write                      │
-│  - Writes to SQL:                            ││  - Request /embed from OpenVINO Server      │
-│    * `memoria_facts`                         ││  - OpenVINO tokenizes in C++ & runs iGPU   │
-│    * `memoria_timelines` (chronology)        ││  - Returns FP16 vector (768 dimensions)     │
-│    * `memoria_sequences` (milestones)        ││  - Writes vector to `vec_facts` virtual tbl │
-└───────────────────────┬──────────────────────┘└──────────────────────┬───────────────────────┘
-                        │                                              │
-                        └──────────────────────┬───────────────────────┘
-                                               ▼
-                                  [ Atomic sqlite-vec COMMIT ]
+                ▼
+┌──────────────────────────────────────────────┐
+│  LAYER 3: Vector & Payload Indexed           │
+│  - Uploads point + payload to Qdrant (:6333) │
+└──────────────────────────────────────────────┘
 ```
 
 ---
 
-## 🔍 **4. Retrieval Execution Flow (RAG)**
+## 🔍 **Retrieval Execution Flow (RAG)**
 
-When an agent queries the database (e.g. during a recall step), the search combines **semantic vectors** and **structured indexes**:
+When an agent queries the database (via `/recall`), the search leverages our GPU acceleration to maintain sub-100ms REST response latencies:
 
 ```text
                   [ User Query ]
                          │
                          ▼
         ┌──────────────────────────────────┐
-        │ Get Embedding vector from GPU    │
+        │ 1. Compute query vector (iGPU)   │
+        │ - POST to OpenVINO on port 3002  │
         └────────────────┬─────────────────┘
                          │
-         ┌───────────────┴───────────────┐
-         ▼ (Standard Path)               ▼ (Temporal Query Path)
-┌────────────────────────────────┐ ┌────────────────────────────────┐
-│ Semantic KNN Search            │ │ Timeline Query                 │
-│ - Search `vec_facts` virtual   │ │ - Join `memoria_facts` with    │
-│   table using Cosine Distance  │ │   `memoria_timelines`          │
-│ - Joins matching `rowid` to    │ │ - Sort by `epoch` ascending    │
-│   `memoria_facts` metadata     │ │ - Extract evolution history    │
-└────────────────┬───────────────┘ └────────────────┬───────────────┘
-                 │                                  │
-                 └───────────────┬──────────────────┘
-                                 ▼
-                    [ Top-K Candidate Slices ]
-                                 │
-                                 ▼
-                    ┌──────────────────────────┐
-                    │ Ettin-17M GPU Reranker   │
-                    └────────────┬─────────────┘
-                                 │
-                                 ▼
-                     [ Clean, Ranked Context ]
+                         ▼
+        ┌──────────────────────────────────┐
+        │ 2. Semantic KNN Search           │
+        │ - POST query vector to Qdrant    │
+        │ - Retrieve user-scoped payloads  │
+        └────────────────┬─────────────────┘
+                         │
+                         ▼
+             [ Sorted Context Results ]
 ```
+
+*Note: The **Ettin-17M GPU Reranker** is fully active and exposed on `/rerank` (port 3002). It is bypassed in the basic `/recall` REST route to maintain maximum throughput under load, but remains fully available for downstream agent reasoning chains, multi-vector fusion, or custom evaluation pipelines.*
 
 ---
 
-## ⚡ **5. OpenVINO C++ Tokenizer & CPU/GPU Pipeline**
+## ⚡ **OpenVINO C++ Tokenizer & CPU/GPU Pipeline**
 
 The embedding and reranking tasks run natively using **OpenVINO** to completely eliminate latency spikes and OOM thrashing.
 
