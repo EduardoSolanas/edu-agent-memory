@@ -5,7 +5,7 @@
   "main": "bin/api-daemon.mjs",
   "type": "module",
   "scripts": {
-    "test": "node --test tests/api-daemon.test.mjs"
+    "test": "node --test tests/test_api_daemon.mjs"
   },
   "keywords": [
     "edumem",

@@ -8,6 +8,28 @@ This repository contains **edumem** (our Node.js `api-daemon` runtime service), 
 
 To standardize execution and eliminate virtualized hardware mapping overhead, the entire memory subsystem is packaged into a **single, unified, self-contained Docker image**. 
 
+### **⚙️ Model Preparation (Crucial First Step)**
+Before you can build the Docker image or run the cognitive memory pipeline on a fresh clone, you **must** download and prepare the required OpenVINO models. 
+
+An automated, non-interactive Python script `bin/prepare_models.py` is provided to handle this cleanly. It will:
+1. Load your Hugging Face credentials (`HF_TOKEN`) from `/opt/edumem/.env` (or standard environment variables).
+2. Install `optimum-intel[openvino]` in the virtual environment if not already available.
+3. Skip exporting if the models are already prepared (unless `--force` is specified).
+4. Download and export the models to FP16 OpenVINO format:
+   - **GTE ModernBERT** (`Alibaba-NLP/gte-modernbert-base`) -> `models/gte-modernbert-ov`
+   - **Ettin Reranker** (`cross-encoder/ettin-reranker-17m-v1`) -> `models/ettin-17m-ov`
+
+To prepare the models, run:
+```bash
+python3 bin/prepare_models.py
+```
+
+To force re-exporting of already prepared models, use:
+```bash
+python3 bin/prepare_models.py --force
+```
+
+### **🚀 Running the Stack**
 The entire cognitive memory platform runs as a single background container, exposing production-grade endpoints:
 
 ```bash
@@ -45,7 +67,7 @@ The subsystem divides responsibilities across three decoupled layers co-located 
        ▼ (Vector queries)  ▼ (Direct /v1/embeddings POSTs)
 ┌──────────────┐   ┌─────────────────────────────────────┐
 │  Qdrant DB   │   │      OpenVINO Inference Server      │ (Python - Port 3002)
-│  (Port 6333) │   │  - Intel iGPU accelerated embedding │
+│  - Intel iGPU accelerated embedding │
 │              │   │  - Native C++ Tokenizers            │
 └──────────────┘   └─────────────────────────────────────┘
 ```

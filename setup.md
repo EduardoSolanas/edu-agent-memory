@@ -62,11 +62,32 @@ pip install --upgrade pip
 pip install datasets requests tqdm numpy scipy pydantic sqlite-vec
 ```
 
-### **5. Start and Register `api-daemon` Service**
+### **5. Prepare & Export OpenVINO Models**
+Before building the Docker image or running the OpenVINO Inference Server, you need to download the raw Hugging Face models and export them to OpenVINO IR (FP16) format.
+
+A convenient, non-interactive script is provided for this purpose:
+```bash
+python3 /opt/edumem/bin/prepare_models.py
+```
+
+This script will:
+1. Parse `/opt/edumem/.env` to read `HF_TOKEN` if present (falling back to standard system environment variables like `HF_TOKEN` or `HUGGING_FACE_HUB_TOKEN`).
+2. Automatically check if `optimum-intel[openvino]` is installed in the active virtual environment `/opt/edumem/.venv`, and install it if missing.
+3. Check if `models/gte-modernbert-ov` and `models/ettin-17m-ov` already exist. If they do, it will skip downloading/exporting to prevent redundant disk and network operations.
+4. Execute `optimum-cli export openvino` under the hood to export:
+   - **GTE ModernBERT** (`Alibaba-NLP/gte-modernbert-base`) with `--task feature-extraction` and `--weight-format fp16` to `models/gte-modernbert-ov`.
+   - **Ettin Reranker** (`cross-encoder/ettin-reranker-17m-v1`) with `--task text-classification` and `--weight-format fp16` to `models/ettin-17m-ov`.
+
+*Note: If you need to force re-exporting of existing models, you can run the script with the `--force` flag:*
+```bash
+python3 /opt/edumem/bin/prepare_models.py --force
+```
+
+### **6. Start and Register `api-daemon` Service**
 1. Generate the service defaults environment file at **`/etc/default/api-daemon`** containing your active API keys:
    ```bash
-   GEMINI_API_KEY=your_gemini_api_key_here
-   OPENAI_API_KEY=your_openai_api_key_here
+   GEMINI_API_KEY=your_g...here
+   OPENAI_API_KEY=your_o...here
    ```
 
 2. Register the daemon as a systemd service file at **`/etc/systemd/system/api-daemon.service`**:

@@ -1,0 +1,16 @@
+# ~/.hermes/config.yaml configuration snippet for edumem integration
+# Copy this block into your active Hermes config file under the 'memory' section.
+
+memory:
+  memory_enabled: true
+  user_profile_enabled: true
+  write_approval: false
+  memory_char_limit: 2200
+  user_char_limit: 8192
+  provider: edumem
+
+# Configure custom environment variables in ~/.hermes/.env or your local environment:
+# 
+# export EDUMEM_API_URL="http://192.168.1.160:6336"
+# export EDUMEM_BANK_ID="locomo"
+# export EDUMEM_MODE="hybrid"

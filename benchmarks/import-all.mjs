@@ -1,4 +1,4 @@
-import { createMnemosyne as createEdumem } from 'mnemosy-ai'
+import { createedumem as createEdumem } from 'mnemosy-ai'
 import fs from 'fs'
 
 async function run() {

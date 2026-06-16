@@ -99,11 +99,15 @@ def main():
         "EDUMEM_LLM_API_KEY": api_key,
         "EDUMEM_LLM_MODEL": model,
         "EDUMEM_LLM_ENABLED": "true",
-        "PYTHONPATH": str(WORKDIR / "benchmarks")
+        "EDUMEM_LLM_BASE_URL": base_url,
+        "EDUMEM_LLM_API_KEY": api_key,
+        "EDUMEM_LLM_MODEL": model,
+        "EDUMEM_LLM_ENABLED": "true",
+        "PYTHONPATH": f"{WORKDIR}:{WORKDIR / 'benchmarks'}"
     }
 
     python_env = WORKDIR / ".venv" / "bin" / "python3"
-    script_path = WORKDIR / ".venv/lib/python3.13/site-packages/tools/evaluate_beam_end_to_end.py"
+    script_path = WORKDIR / "tools/evaluate_beam_end_to_end.py"
 
     cmd = [
         str(python_env),
@@ -125,6 +129,7 @@ def main():
     print("======================================================================\n")
 
     env = os.environ.copy()
+    env.update(dot_env)
     env.update(env_overrides)
 
     try:

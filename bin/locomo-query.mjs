@@ -1,4 +1,4 @@
-import { createMnemosyne as createMnemosyne as createEdumem } from "mnemosy-ai";
+import { createedumem as createedumem as createEdumem } from "mnemosy-ai";
 
 const m = await createEdumem({
   vectorDbUrl: "http://127.0.0.1:6333",

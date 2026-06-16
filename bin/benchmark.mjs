@@ -1,4 +1,4 @@
-import { createMnemosyne as createMnemosyne as createEdumem } from "mnemosy-ai";
+import { createedumem as createedumem as createEdumem } from "mnemosy-ai";
 import { performance } from "perf_hooks";
 
 const m = await createEdumem({
