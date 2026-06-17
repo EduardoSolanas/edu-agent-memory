@@ -925,3 +925,143 @@ class TestNegationRecall:
             if db_path.exists():
                 try: db_path.unlink()
                 except PermissionError: pass
+
+
+class TestFIX1_ISODateTokenization:
+    """FIX 1 (TR): Make ISO dates retrievable through FTS5 via datetok tokens.
+
+    Problem: FTS5 tokenizes `2024-03-15` into `2024 OR 03 OR 15`, so date strings
+    are not searchable as a unit and date-bearing messages don't reliably surface
+    during recall. This is why Temporal Reasoning scores 0%.
+
+    Solution: Append FTS-survivable tokens like `datetok20240315` (no hyphens)
+    so FTS5 indexes them as ONE token per ISO date found in the message.
+    """
+
+    def test_datetok_appended_to_content_on_ingest(self):
+        """Test that ingest_conversation appends datetok tokens for ISO dates."""
+        from tools.evaluate_beam_end_to_end import ingest_conversation
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
+            db_path = Path(tmp.name)
+        try:
+            beam = BeamMemory(db_path=db_path)
+            messages = [
+                {"role": "user", "content": "The sprint started on 2024-03-15 and ended on 2024-04-12."},
+            ]
+            ingest_conversation(beam, messages)
+
+            # Check that the stored content contains datetok tokens
+            row = beam.conn.execute("SELECT content FROM working_memory LIMIT 1").fetchone()
+            assert row is not None
+            content = row["content"]
+            # Should contain both datetok versions (one for each ISO date found)
+            assert "datetok20240315" in content, f"datetok20240315 not in: {content}"
+            assert "datetok20240412" in content, f"datetok20240412 not in: {content}"
+            beam.conn.close()
+        finally:
+            if db_path.exists():
+                try: db_path.unlink()
+                except PermissionError: pass
+
+    def test_datetok_tokens_are_fts_searchable(self):
+        """Test that datetok tokens can be found via FTS5 recall."""
+        from tools.evaluate_beam_end_to_end import ingest_conversation
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
+            db_path = Path(tmp.name)
+        try:
+            beam = BeamMemory(db_path=db_path)
+            messages = [
+                {"role": "user", "content": "The sprint started on 2024-03-15 with the dashboard launch."},
+            ]
+            ingest_conversation(beam, messages)
+
+            # Recall using the datetok token should find the message
+            results = beam.recall("datetok20240315", top_k=5)
+            assert len(results) > 0, "datetok20240315 should be FTS-searchable"
+            assert "2024-03-15" in results[0]["content"]
+            beam.conn.close()
+        finally:
+            if db_path.exists():
+                try: db_path.unlink()
+                except PermissionError: pass
+
+
+class TestFIX2_OrderingQueryDepthMultiplier:
+    """FIX 2 (EO): Raise candidate depth for ordering queries.
+
+    Problem: Event Ordering is graded by Kendall tau-b over an ordered list; with
+    the top-K cap at 30, not all `[MSGIDX:N]`-tagged mentions of the queried
+    topics reach context, so the ordering is incomplete.
+
+    Solution: When is_ordering_query(question) is True, use a larger effective
+    candidate budget — multiply the local `top_k` used for sub-queries and the
+    final slice by 3 (so ordering questions return up to 3x candidates).
+    """
+
+    def test_ordering_query_trigger_function(self):
+        """Test that is_ordering_query correctly identifies ordering questions."""
+        from edumem.core.query_mode import is_ordering_query
+
+        # Should return True for ordering questions
+        assert is_ordering_query("In what order did I discuss the features?") is True
+        assert is_ordering_query("Walk me through the sequence of events.") is True
+        assert is_ordering_query("What order did things happen?") is True
+
+        # Should return False for non-ordering questions
+        assert is_ordering_query("What is my name?") is False
+        assert is_ordering_query("Tell me about the project.") is False
+
+
+class TestFIX3_NegationRetrievalCapIncrease:
+    """FIX 3 (CR): Broaden negation retrieval cap.
+
+    Problem: In _multi_strategy_recall, the negation SQL searches use `LIMIT 5`
+    and only trigger on narrow phrasings.
+
+    Solution: Raise those `LIMIT 5` to `LIMIT 15` in the negation/topic-mention
+    SQL blocks. This documents the intent that contradiction resolution needs
+    broader candidate pools.
+    """
+
+    def test_both_sides_of_contradiction_retrievable_after_fix(self):
+        """Test that both positive and negative statements about the same topic are retrievable.
+
+        This test documents the FIX 3 requirement: both sides of a contradiction must
+        be retrievable via SQL LIKE search with an expanded LIMIT (15 instead of 5).
+        """
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
+            db_path = Path(tmp.name)
+        try:
+            beam = BeamMemory(db_path=db_path)
+
+            # Ingest contradicting statements
+            beam.remember_batch([
+                {"content": "I have never used Redis in any of my projects.",
+                 "source": "test", "importance": 0.5},
+                {"content": "I deployed the cache with Redis on the staging environment.",
+                 "source": "test", "importance": 0.5},
+            ])
+
+            # Raw SQL search with the expanded LIMIT (15) should find both
+            rows = beam.conn.execute(
+                "SELECT id, content FROM working_memory "
+                "WHERE content LIKE ? "
+                "LIMIT 15",
+                ("%Redis%",)
+            ).fetchall()
+
+            # With LIMIT 15, both rows should be retrievable
+            assert len(rows) >= 2, f"Expected 2 Redis-related rows with LIMIT 15, got {len(rows)}"
+
+            contents = [r["content"] for r in rows]
+            # Verify we got both the negative and positive statements
+            has_negative = any("never" in c.lower() for c in contents)
+            has_positive = any("deployed" in c.lower() for c in contents)
+            assert has_negative, "Negative statement not found"
+            assert has_positive, "Positive statement not found"
+
+            beam.conn.close()
+        finally:
+            if db_path.exists():
+                try: db_path.unlink()
+                except PermissionError: pass

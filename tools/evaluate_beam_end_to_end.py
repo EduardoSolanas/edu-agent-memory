@@ -550,6 +550,10 @@ def ingest_conversation(beam: BeamMemory, messages: list[dict]) -> dict:
             dates = _re_tags.findall(r'\b\d{4}-\d{2}-\d{2}\b', content)
             if dates:
                 content = f"{content} [DATES: {', '.join(dates)}]"
+                # FIX 1 (TR): Append FTS-survivable date tokens (datetokYYYYMMDD)
+                # so ISO dates like 2024-03-15 become searchable as single tokens.
+                datetok_strs = [f"datetok{date.replace('-', '')}" for date in dates]
+                content = f"{content} datetokens: {' '.join(datetok_strs)}"
             durations = _re_tags.findall(r'\b\d+\s(?:days|weeks|months|years)\b', content, _re_tags.IGNORECASE)
             if durations:
                 content = f"{content} [DURATIONS: {', '.join(durations)}]"
@@ -902,16 +906,22 @@ def _multi_strategy_recall(beam: BeamMemory, question: str, top_k: int = DEFAULT
     import re
     all_memories = []
     seen_content_keys = set()
-    
+
     def _add_unique(mems):
         for mem in mems:
             ck = mem.get("content", "")[:80]
             if ck not in seen_content_keys:
                 seen_content_keys.add(ck)
                 all_memories.append(mem)
-    
+
+    # FIX 2 (EO): Raise candidate depth for ordering queries.
+    # Ordering questions need more candidates to capture all [MSGIDX:N] mentions.
+    # Multiply top_k by 3 for ordering questions so they get broader context.
+    if is_ordering_query(question):
+        top_k = top_k * 3
+
     # Detect temporal questions by ability type or keywords
-    temporal_keywords = ['when', 'date', 'deadline', 'sprint', 'day', 'week', 'month', 
+    temporal_keywords = ['when', 'date', 'deadline', 'sprint', 'day', 'week', 'month',
                          'april', 'march', 'february', 'january', 'may', 'june', 'july',
                          'august', 'september', 'october', 'november', 'december',
                          'monday', 'tuesday', 'wednesday', 'thursday', 'friday',
@@ -940,13 +950,14 @@ def _multi_strategy_recall(beam: BeamMemory, question: str, top_k: int = DEFAULT
         for _term in _neg_topic_terms[:5]:
             for _neg_word in ['never', 'not', "haven't", "didn't", "wasn't", "weren't", "n't"]:
                 try:
+                    # FIX 3 (CR): Increase LIMIT from 5 to 15 for broader negation retrieval
                     _neg_rows = beam.conn.execute(
                         "SELECT id, content FROM working_memory "
                         "WHERE content LIKE ? AND content LIKE ? "
                         "UNION "
                         "SELECT id, content FROM episodic_memory "
                         "WHERE content LIKE ? AND content LIKE ? "
-                        "LIMIT 5",
+                        "LIMIT 15",
                         (f"%{_term}%", f"%{_neg_word}%",
                          f"%{_term}%", f"%{_neg_word}%")
                     ).fetchall()
@@ -963,11 +974,12 @@ def _multi_strategy_recall(beam: BeamMemory, question: str, top_k: int = DEFAULT
         # sees every claim and can detect the conflict itself.
         for _term in _neg_topic_terms[:5]:
             try:
+                # FIX 3 (CR): Increase LIMIT from 8 to 15 for broader topic mention retrieval
                 _topic_rows = beam.conn.execute(
                     "SELECT id, content FROM working_memory WHERE content LIKE ? "
                     "UNION "
                     "SELECT id, content FROM episodic_memory WHERE content LIKE ? "
-                    "LIMIT 8",
+                    "LIMIT 15",
                     (f"%{_term}%", f"%{_term}%")
                 ).fetchall()
                 for _tr in _topic_rows:
@@ -989,7 +1001,7 @@ def _multi_strategy_recall(beam: BeamMemory, question: str, top_k: int = DEFAULT
         date_temporal_weight = 0.5
         # Search for dates and timelines
         _add_unique(_recall_safe(beam, "deadline schedule timeline date", top_k, temporal_weight=date_temporal_weight))
-        
+
         # --- NEW: Hard-filter for specific extracted date strings ---
         # If the question asks about a specific date (e.g., '2024-03-15'), force-filter SQL
         # directly for that exact string in the content to eliminate FTS5 fuzziness.
@@ -998,7 +1010,19 @@ def _multi_strategy_recall(beam: BeamMemory, question: str, top_k: int = DEFAULT
             exact_date = date_match.group(0)
             # Inject a high-priority hard-filter query
             _add_unique(_recall_safe(beam, f"content:'{exact_date}'", top_k * 2, temporal_weight=0.9))
-            
+
+            # FIX 1 (TR): Also search for the datetok version of this date
+            # so FTS5 can find it as a single token (no hyphens: datetokYYYYMMDD)
+            datetok = f"datetok{exact_date.replace('-', '')}"
+            _add_unique(_recall_safe(beam, datetok, top_k, temporal_weight=0.9))
+
+        # FIX 1 (TR): Extract any ISO dates in the question and search via datetok tokens
+        # This ensures date-bearing messages are retrievable even when FTS5 alone fails.
+        iso_dates = re.findall(r'\d{4}-\d{2}-\d{2}', question)
+        for iso_date in iso_dates:
+            datetok = f"datetok{iso_date.replace('-', '')}"
+            _add_unique(_recall_safe(beam, datetok, max(5, top_k // 2), temporal_weight=date_temporal_weight))
+
         # Search for specific months mentioned in the question
         for month in ['january', 'february', 'march', 'april', 'may', 'june',
                       'july', 'august', 'september', 'october', 'november', 'december']:
@@ -1741,7 +1765,11 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
         pass  # MEMORIA retrieval is best-effort
 
     # ---- Reranking (Phase 5.5: local cross-encoder) ----
-    memories = _rerank(question, memories, top_n=top_k)
+    # Ordering (EO) is graded by tau-b over ALL items, so keep a wider reranked set
+    # for ordering queries -- the char-budgeted context builder trims later. A flat
+    # top_k cap here would drop topic mentions and make the ordering incomplete.
+    _rerank_top_n = top_k * 3 if is_ordering_query(question) else top_k
+    memories = _rerank(question, memories, top_n=_rerank_top_n)
 
     # ---- EO: Sort by message_index for ordering queries ----
     if is_ordering_query(question):
