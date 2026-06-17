@@ -2451,6 +2451,33 @@ def main():
                 all_results.append(conv_result)
                 beam.conn.close()
 
+                # Print Conversation Summary to Console/Log
+                try:
+                    from collections import defaultdict
+                    _scores = defaultdict(list)
+                    for q_res in conv_result.get("results", []):
+                        _ab = q_res.get("ability")
+                        _sc = q_res.get("score")
+                        if _ab and _sc is not None:
+                            _scores[_ab].append(_sc)
+                    
+                    _conv_total_score = sum(sum(scs) for scs in _scores.values())
+                    _conv_total_count = sum(len(scs) for scs in _scores.values())
+                    _avg_overall = (_conv_total_score / _conv_total_count) * 100 if _conv_total_count else 0.0
+                    
+                    print(f"
+====================================================")
+                    print(f"🎉 CONVERSATION {conv_result.get('conversation_id')} EVALUATION COMPLETE")
+                    print(f"Scale: {scale} | Overall Accuracy: {_avg_overall:.2f}%")
+                    print(f"----------------------------------------------------")
+                    for _ab, scs in sorted(_scores.items()):
+                        _ab_avg = (sum(scs) / len(scs)) * 100
+                        print(f"  - {_ab:<5}: {_ab_avg:>6.2f}% ({sum(scs):.1f}/{len(scs)})")
+                    print(f"====================================================
+", flush=True)
+                except Exception as _sum_err:
+                    print(f"    [summary-error] failed to compile summary: {_sum_err}", flush=True)
+
             # Save progress after each conversation. Includes the env-var
             # snapshot + diagnostic snapshots so post-hoc analysis can attribute
             # score deltas to specific configurations without re-running.
