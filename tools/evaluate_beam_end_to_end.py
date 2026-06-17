@@ -2002,18 +2002,20 @@ def judge_with_rubrics(llm: LLMClient, question: str, rubric: list, ai_answer: s
             def __init__(self, client):
                 self.client = client
             
-            def invoke(self, prompt: str):
-                res = self.client.chat([{"role": "user", "content": prompt}], temperature=0.0, max_tokens=1024)
+            def invoke(self, prompt):
+                if isinstance(prompt, list):
+                    messages = prompt
+                else:
+                    messages = [{"role": "user", "content": prompt}]
+                res = self.client.chat(messages, temperature=0.0, max_tokens=1024)
                 if res:
                     try:
                         import json
                         from json_repair import repair_json
                         repaired = repair_json(res)
                         parsed = json.loads(repaired)
-                        if isinstance(parsed, list) and len(parsed) > 0:
-                            first_item = parsed[0]
-                            if isinstance(first_item, dict):
-                                res = json.dumps(first_item)
+                        if isinstance(parsed, list) and len(parsed) == 1 and isinstance(parsed[0], dict) and "score" in parsed[0]:
+                            res = json.dumps(parsed[0])
                     except Exception:
                         pass
                 class Response:
