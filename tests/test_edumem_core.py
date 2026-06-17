@@ -324,6 +324,36 @@ class TestNegationTagging:
                 try: db_path.unlink()
                 except PermissionError: pass
 
+    def test_negation_tag_appended_on_remember_single(self):
+        """Parity: single remember() must tag negations exactly like remember_batch()."""
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
+            db_path = Path(tmp.name)
+        try:
+            beam = BeamMemory(db_path=db_path)
+            beam.remember(content="I have never worked with Kafka streams.", source="test")
+            row = beam.conn.execute("SELECT content FROM working_memory").fetchone()
+            assert "[NEG]" in row["content"]
+            assert "never worked with Kafka" in row["content"]
+            beam.conn.close()
+        finally:
+            if db_path.exists():
+                try: db_path.unlink()
+                except PermissionError: pass
+
+    def test_no_negation_tag_on_positive_remember_single(self):
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
+            db_path = Path(tmp.name)
+        try:
+            beam = BeamMemory(db_path=db_path)
+            beam.remember(content="I love working with Kafka streams.", source="test")
+            row = beam.conn.execute("SELECT content FROM working_memory").fetchone()
+            assert "[NEG]" not in row["content"]
+            beam.conn.close()
+        finally:
+            if db_path.exists():
+                try: db_path.unlink()
+                except PermissionError: pass
+
 
 class TestMessageIndex:
     """Verify message_index is stored during ingestion and returned during recall."""

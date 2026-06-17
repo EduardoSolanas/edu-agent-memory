@@ -2543,6 +2543,16 @@ class BeamMemory:
         timestamp = datetime.now().isoformat()
         cursor = self.conn.cursor()
 
+        # Negation tagging for FTS5 discoverability -- parity with remember_batch().
+        # Appends "[NEG] <sentence>" so FTS5 can surface negation statements whose
+        # negation words ("never"/"not") are otherwise stop-words. Storage-only:
+        # downstream enrichment below keeps using the clean `content`.
+        content_to_store = content
+        _neg_matches = _NEG_RE.findall(content)
+        if _neg_matches:
+            for _neg in _neg_matches[:3]:
+                content_to_store += f" [NEG] {_neg.strip()}"
+
         # Build INSERT with optional message_index
         if message_index is not None:
             cursor.execute("""
@@ -2550,7 +2560,7 @@ class BeamMemory:
                 (id, content, source, timestamp, session_id, importance, metadata_json, valid_until, scope,
                  author_id, author_type, channel_id, veracity, memory_type, trust_tier, occurred_at, recorded_at, message_index)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (memory_id, content, source, recorded_at, self.session_id, importance,
+            """, (memory_id, content_to_store, source, recorded_at, self.session_id, importance,
                   json.dumps(metadata or {}), valid_until, scope,
                   self.author_id, self.author_type, self.channel_id, veracity, memory_type, trust_tier, occurred_at, recorded_at, message_index))
         else:
@@ -2559,7 +2569,7 @@ class BeamMemory:
                 (id, content, source, timestamp, session_id, importance, metadata_json, valid_until, scope,
                  author_id, author_type, channel_id, veracity, memory_type, trust_tier, occurred_at, recorded_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (memory_id, content, source, recorded_at, self.session_id, importance,
+            """, (memory_id, content_to_store, source, recorded_at, self.session_id, importance,
                   json.dumps(metadata or {}), valid_until, scope,
                   self.author_id, self.author_type, self.channel_id, veracity, memory_type, trust_tier, occurred_at, recorded_at))
         self.conn.commit()
