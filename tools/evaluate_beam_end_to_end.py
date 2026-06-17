@@ -1982,8 +1982,8 @@ def judge_with_rubrics(llm: LLMClient, question: str, rubric: list, ai_answer: s
 
     try:
         import sys
-        if "/tmp/BEAM_official" not in sys.path:
-            sys.path.append("/tmp/BEAM_official")
+        if "/opt/BEAM_official" not in sys.path:
+            sys.path.append("/opt/BEAM_official")
         
         import os
         if "OPENAI_API_KEY" not in os.environ:
@@ -1994,8 +1994,7 @@ def judge_with_rubrics(llm: LLMClient, question: str, rubric: list, ai_answer: s
         eval_func = getattr(compute_metrics, func_name, None)
 
         if not eval_func:
-            print(f"      [Grader-Swap] Warning: {func_name} not found in compute_metrics, falling back")
-            return _legacy_judge_with_rubrics(llm, question, rubric, ai_answer)
+            raise RuntimeError(f"[Grader-Swap] Fatal Error: {func_name} not found in compute_metrics")
 
         class LangchainLLMWrapper:
             def __init__(self, client):
@@ -2013,7 +2012,11 @@ def judge_with_rubrics(llm: LLMClient, question: str, rubric: list, ai_answer: s
         print(f"      [Grader-Swap] Running official {func_name}...")
         eval_result = eval_func(rubric=rubric, llm_response=ai_answer, probing_question=question, model=wrapped_model)
 
-        score = eval_result.get("llm_judge_score", 0.0)
+        if ability == "EO":
+            score = eval_result.get("tau_norm", 0.0)
+        else:
+            score = eval_result.get("llm_judge_score", 0.0)
+
         responses = eval_result.get("llm_judge_responses", [])
 
         scores = []
@@ -2037,10 +2040,10 @@ def judge_with_rubrics(llm: LLMClient, question: str, rubric: list, ai_answer: s
         }
 
     except Exception as e:
-        print(f"      [Grader-Swap] Error executing official {func_name}: {e}, falling back")
+        print(f"      [Grader-Swap] Fatal Error executing official {func_name}: {e}")
         import traceback
         traceback.print_exc()
-        return _legacy_judge_with_rubrics(llm, question, rubric, ai_answer)
+        raise RuntimeError(f"Official BEAM evaluation failed for {ability}: {e}") from e
 
 
 def _legacy_judge_with_rubrics(llm: LLMClient, question: str, rubric: list, ai_answer: str) -> dict:
