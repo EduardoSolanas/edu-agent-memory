@@ -1,130 +1,85 @@
-def is_temporal_query(question: str) -> bool:
-    q = question.lower()
-    temporal_keywords = [
-        "how long", "how many days", "how many weeks", "how many months",
-        "how many years", "duration", "interval", "time between", "days between",
-        "weeks between", "months between", "years between", "chronological",
-        "order of events", "which happened first", "what order", "first",
-        "then", "before", "after", "timeline", "schedule", "sprint"
-    ]
-    return any(w in q for w in temporal_keywords)
+"""
+query_mode.py — label-free, overfit-free answer shaping for the BEAM harness.
 
+Design (the only correct one given how BEAM works):
+  * CR / ABS / KU / PF depend on the RETRIEVED MEMORY, not the question wording,
+    so they cannot be reliably detected from the question. They are therefore
+    handled by an ALWAYS-ON base prompt — never routed, never misrouted.
+  * EO and TR DO surface in the question and need a specific output shape
+    (EO = mention-order list scored by Kendall tau-b; TR = a computed number).
+    They get light, question-triggered format modifiers appended to the base.
+
+Rules this file obeys:
+  * Never reads the dataset ability/category label. Routing is question-text only.
+  * No benchmark-specific literals (no nouns lifted from test items).
+  * No hardcoded grader output strings — instructs BEHAVIOR; the LLM judge
+    credits correct paraphrases.
+"""
+
+# --- generic intent detection (question text only) -------------------------
+
+_ORDERING_KEYWORDS = (
+    "order", "sequence", "what order", "in what order", "order in which",
+    "sequence of", "walk me through", "happened first", "came first",
+    "list the steps", "chronolog",  # matches chronological / chronologically
+)
+
+_DURATION_KEYWORDS = (
+    "how long", "how much time", "duration", "time between",
+    "how many days", "how many weeks", "how many months", "how many years",
+    "days between", "weeks between", "months between", "years between",
+    "happened earlier", "came earlier", "came later", "earlier or later",
+    "how old", "between",  # broad, but base prompt safely handles any misroute
+)
+
+
+def is_ordering_query(question: str) -> bool:
+    q = question.lower()
+    return any(k in q for k in _ORDERING_KEYWORDS)
+
+
+def is_duration_query(question: str) -> bool:
+    q = question.lower()
+    return any(k in q for k in _DURATION_KEYWORDS)
+
+
+def is_temporal_query(question: str) -> bool:
+    return is_ordering_query(question) or is_duration_query(question)
 
 def needs_second_pass(question: str) -> bool:
-    q = question.lower()
-    eo_keywords = ["order", "sequence", "happened first", "chronological", "first built", "built first", "timeline"]
-    tr_keywords = ["how long", "how many days", "how many weeks", "how many months", "duration", "time between", "interval", "days between", "weeks between", "gym"]
-    cr_keywords = ["contradict", "contradiction", "conflict", "conflicting", "oppose", "opposed", "never", "but also"]
-    
-    return (
-        any(w in q for w in eo_keywords) or
-        any(w in q for w in tr_keywords) or
-        any(w in q for w in cr_keywords)
-    )
+    """Ordering/duration questions benefit from gap-analysis re-retrieval."""
+    return is_temporal_query(question)
+
+
+# --- always-on base prompt (covers CR / ABS / KU / PF generically) ---------
+
+_BASE_PROMPT = """You are a precise memory assistant. Answer the question using ONLY the provided conversation context.
+
+Reason through these internally, then output only the final answer:
+1. FACTS — gather every relevant fact from the context (dates, numbers, names, events, statements) and note when each was said.
+2. CONFLICTS — if the context contains statements that contradict each other about the same thing, surface BOTH explicitly; do not silently pick one.
+3. CHANGE OVER TIME — if a fact, preference, or instruction was updated, the most recent value is the current answer.
+4. ABSENCE — if the specific topic of the question does not appear anywhere in the context, say clearly that the conversation does not contain that information. Never guess or use outside knowledge.
+5. ANSWER — give a direct, complete answer grounded only in the context.
+
+Output the final answer only: no step labels, no JSON, no preamble, no commentary."""
+
+# --- question-triggered format modifiers (EO, TR only) ---------------------
+
+_ORDERING_MODIFIER = """
+
+ORDERING: This question asks for the order in which topics or events were DISCUSSED in the conversation — the order they were mentioned, NOT when they happened in real life. List them in the order they were first mentioned, earliest first, one item per line as short clauses. No numbering, no bullets, no preamble. Do not reorder by calendar/real-world dates."""
+
+_DURATION_MODIFIER = """
+
+DURATION: This question asks for an amount of elapsed time, or which event came earlier/later. Identify the two absolute dates from the context, compute the difference, and state the result explicitly (e.g. "2024-03-12 to 2024-06-20 = 100 days"). Compute strictly from dates present in the context; do not estimate. End with the exact value the question asks for."""
 
 
 def build_system_prompt(question: str) -> str:
-    q = question.lower()
-    
-    # 1. Event Ordering (EO)
-    eo_keywords = ["order", "sequence", "happened first", "chronological", "first built", "built first", "timeline", "walk me through", "order in which", "sequence of events", "in what order"]
-    if any(w in q for w in eo_keywords):
-        return """You are an Event Ordering specialist.
-This question asks for the order in which topics or events were DISCUSSED in the conversation — the order they were MENTIONED, not when they happened in real life. List them in the order they first came up, earliest mention first, one item per line. No numbering, no bullets, no preamble. Do NOT reorder by calendar/real-world dates."""
-
-    # 2. Temporal Reasoning (TR)
-    tr_keywords = ["how long", "how many days", "how many weeks", "how many months", "duration", "time between", "interval", "days between", "weeks between", "gym"]
-    if any(w in q for w in tr_keywords):
-        return """You are a precise temporal calculator. Your job is to calculate the time duration or interval between events.
-        
-CRITICAL: Think step-by-step to calculate duration between two absolute dates.
-1. IDENTIFIED DATES: Identify the two absolute dates or relative times mentioned in the context for the starting and ending events.
-2. CALCULATION: Compute the exact duration (in days, weeks, or months as requested) between these two absolute dates.
-3. FINAL ANSWER: Provide the final numeric value.
-
-Follow this format strictly:
-1. IDENTIFIED DATES: [date 1] and [date 2]
-2. CALCULATION: [details]
-3. FINAL ANSWER: [value]"""
-
-    # 3. Contradiction Resolution (CR)
-    cr_keywords = ["contradict", "contradiction", "conflict", "conflicting", "oppose", "opposed", "never", "but also"]
-    if any(w in q for w in cr_keywords):
-        return """You are a contradiction detector. Your ONLY job is to find conflicting statements in the retrieved memories.
-
-SCAN FOR:
-- A user statement that directly contradicts another user statement
-- A claim made then later reversed or denied
-- "I have never X" followed by evidence of doing X
-- "I have not Y" followed by "I implemented Y"
-- SPECIAL MARKERS in the context:
-  - `[Negation] user said never/not: ...` — these are EXACT contradiction statements.
-  - `[MEMORIA ...]` blocks — structured fact extractions that include stored negations
-  - `[CR-detect]` blocks
-
-CRITICAL: Carefully compare all user statements in the retrieved memories. If the user explicitly states they have never done something, but another retrieved memory shows evidence of them doing it, you MUST flag it as a contradiction. Base your decision strictly on the semantic meaning of the text.
-
-OUTPUT FORMAT (strictly follow):
-STEP 1 - SCAN: List EVERY statement by the user about the topic in the question. Include BOTH positive claims and negations.
-STEP 2 - CONTRADICTIONS: For each pair of conflicting statements, state: "The user said [A] but also said [B]."
-STEP 3 - RESOLUTION: If contradictions exist, your ENTIRE answer must call them out. Do NOT give a simple yes/no.
-  Format: "I notice you've mentioned contradictory information about this. You said [negation], but you also mentioned [positive claim]. Could you clarify which is correct?"
-Step 3 - ANSWER: Only if NO contradictions found, give a direct answer.
-
-CRITICAL: Your final answer must lead with the contradiction if one exists. Never resolve ambiguity by picking the majority evidence."""
-
-    # 4. Preference Following (PF)
-    pf_keywords = ["prefer", "like", "dislike", "favorite", "choice", "option", "wording", "taste"]
-    if any(w in q for w in pf_keywords):
-        return """You are a Preference Following specialist. Identify the user's preferences, likes, dislikes, and how they evolved over time.
-
-SCAN THE CONTEXT FOR:
-- "I like/love/prefer X" statements
-- "I hate/don't like/dislike X" statements
-- "Switched to" / "moved to" / "changed to" evolution markers
-- Tool/taste preferences that changed over time
-
-OUTPUT:
-Think step by step. If you find relevant preferences:
-1. List each preference with the user's exact wording and which message
-2. Show the evolution if available ("was: X -> now: Y")
-3. Identify the current (latest) preference
-4. Answer the question directly
-
-If NO preferences about the topic exist: say you have no preference information about this topic."""
-
-    # 5. Abstractive Recall & Association (ABS / Abstention)
-    abs_keywords = ["feedback", "influence", "not in the conversation", "not present", "abstain", "exist"]
-    if any(w in q for w in abs_keywords):
-        return """You are a precise memory assistant answering questions about past conversations.
-
-CRITICAL: Your FIRST job is to determine if the question asks about something that IS in the conversation.
-- If the question asks about a topic, event, or detail that does NOT appear in the provided context, your answer MUST be: "This information is not present in the conversation."
-- If the question asks for background information about a person that was never discussed, your answer MUST be: "This information is not present in the conversation."
-- Only provide a detailed answer if the EXACT topic of the question is found in the conversation context.
-
-Think step-by-step:
-STEP 1 - RELEVANCE CHECK: Is the EXACT topic of the question present in the context?
-STEP 2 - If NOT present: answer "This information is not present in the conversation."
-STEP 3 - If present: list relevant facts and answer the question directly."""
-
-    # 6. Knowledge Updating (KU)
-    ku_keywords = ["current", "latest", "update", "now", "recent", "what is my", "change", "changed"]
-    if any(w in q for w in ku_keywords):
-        return """You are a Knowledge Understanding specialist. Synthesize the user's knowledge, background, and facts. Respond accurately based on the provided context."""
-
-    # Default
-    return """You are a precise memory assistant answering questions about past conversations. You receive conversation context that may contain the answer.
-
-CRITICAL: Think step-by-step before answering. Follow this structure:
-
-STEP 1 - RELEVANT FACTS: List all specific facts from the context that relate to the question (dates, numbers, names, events, statements).
-STEP 2 - CONTRADICTIONS: If the context contains conflicting statements about the same topic, identify BOTH sides explicitly. For factual values that have changed over time, the LATEST value is the correct one.
-STEP 3 - TEMPORAL/CALCULATIONS: For date/time questions, extract all relevant dates and compute the answer.
-STEP 4 - ANSWER: Provide a thorough final answer with all relevant details from the context.
-
-RULES:
-- For EVENT ORDERING: list items in chronological order as they appear.
-- For CONTRADICTION: explicitly state "The conversation contains contradictory information: [A] vs [B]"
-- For FACTS THAT CHANGED OVER TIME: the LATEST value is the answer.
-- NEVER say "I don't have enough information" unless absolutely nothing in the context mentions the topic."""
+    """Base behavior always; append format guidance only when the question asks for it."""
+    prompt = _BASE_PROMPT
+    if is_ordering_query(question):
+        prompt += _ORDERING_MODIFIER
+    if is_duration_query(question):
+        prompt += _DURATION_MODIFIER
+    return prompt
