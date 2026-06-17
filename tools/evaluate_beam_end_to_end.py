@@ -2465,16 +2465,14 @@ def main():
                     _conv_total_count = sum(len(scs) for scs in _scores.values())
                     _avg_overall = (_conv_total_score / _conv_total_count) * 100 if _conv_total_count else 0.0
                     
-                    print(f"
-====================================================")
+                    print("\n====================================================")
                     print(f"🎉 CONVERSATION {conv_result.get('conversation_id')} EVALUATION COMPLETE")
                     print(f"Scale: {scale} | Overall Accuracy: {_avg_overall:.2f}%")
-                    print(f"----------------------------------------------------")
+                    print("----------------------------------------------------")
                     for _ab, scs in sorted(_scores.items()):
                         _ab_avg = (sum(scs) / len(scs)) * 100
                         print(f"  - {_ab:<5}: {_ab_avg:>6.2f}% ({sum(scs):.1f}/{len(scs)})")
-                    print(f"====================================================
-", flush=True)
+                    print("====================================================\n", flush=True)
                 except Exception as _sum_err:
                     print(f"    [summary-error] failed to compile summary: {_sum_err}", flush=True)
 
