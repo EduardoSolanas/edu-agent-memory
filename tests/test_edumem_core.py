@@ -577,6 +577,52 @@ class TestTROracle:
         assert "2" in answer
 
 
+class TestImplicitContradictionRecall:
+    """Verify CR retrieval surfaces BOTH sides of an implicit (no negation word) contradiction."""
+
+    def test_implicit_contradiction_both_sides_retrievable(self):
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
+            db_path = Path(tmp.name)
+        try:
+            beam = BeamMemory(db_path=db_path)
+            beam.remember_batch([
+                {"content": "We are using PostgreSQL for the main database.", "source": "test", "importance": 0.5},
+                {"content": "I migrated the project to MySQL last sprint.", "source": "test", "importance": 0.5},
+            ])
+            # Broad topic-mention retrieval: pull ALL mentions of the topic word
+            rows = beam.conn.execute(
+                "SELECT content FROM working_memory WHERE content LIKE ? OR content LIKE ?",
+                ("%PostgreSQL%", "%MySQL%")
+            ).fetchall()
+            contents = " ".join(r["content"] for r in rows)
+            assert "PostgreSQL" in contents
+            assert "MySQL" in contents
+            beam.conn.close()
+        finally:
+            if db_path.exists():
+                try: db_path.unlink()
+                except PermissionError: pass
+
+
+class TestPass2Routing:
+    """Verify Pass-2 prompt routing: only duration questions get the calculator prompt."""
+
+    def test_duration_question_uses_calculator(self):
+        from tools.evaluate_beam_end_to_end import _is_calculator_question
+        assert _is_calculator_question("How many days between the start and the end?")
+        assert _is_calculator_question("How long did the sprint last?")
+
+    def test_ordering_question_does_not_use_calculator(self):
+        from tools.evaluate_beam_end_to_end import _is_calculator_question
+        # Ordering questions must NOT get the duration calculator prompt
+        assert not _is_calculator_question("In what order did I discuss the features?")
+        assert not _is_calculator_question("Walk me through the sequence of events.")
+
+    def test_simple_question_does_not_use_calculator(self):
+        from tools.evaluate_beam_end_to_end import _is_calculator_question
+        assert not _is_calculator_question("What is my favorite color?")
+
+
 class TestEOAndSUMPrompts:
     """Verify EO and SUM query detection and prompt modifiers."""
 

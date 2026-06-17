@@ -55,7 +55,13 @@ import urllib.error
 import numpy as np
 
 from edumem.core.beam import BeamMemory, init_beam, _embeddings, _vec_available, _vec_insert, _fts_search_working, _generate_id
-from edumem.core.query_mode import build_system_prompt, is_temporal_query, needs_second_pass, is_ordering_query
+from edumem.core.query_mode import build_system_prompt, is_temporal_query, needs_second_pass, is_ordering_query, is_duration_query
+
+
+def _is_calculator_question(question: str) -> bool:
+    """True only for DURATION questions (compute a number). Ordering questions
+    must NOT use the calculator prompt — they need an ordered list, not a number."""
+    return is_duration_query(question) and not is_ordering_query(question)
 
 # --- Config ---
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
@@ -881,7 +887,27 @@ def _multi_strategy_recall(beam: BeamMemory, question: str, top_k: int = DEFAULT
                                          "source": "negation_search"}])
                 except Exception:
                     pass
-    
+
+        # 2c: Broad topic-mention search for IMPLICIT contradictions.
+        # Many contradictions carry no negation word ("uses PostgreSQL" then
+        # "migrated to MySQL"). Pull ALL mentions of each topic term so the LLM
+        # sees every claim and can detect the conflict itself.
+        for _term in _neg_topic_terms[:5]:
+            try:
+                _topic_rows = beam.conn.execute(
+                    "SELECT id, content FROM working_memory WHERE content LIKE ? "
+                    "UNION "
+                    "SELECT id, content FROM episodic_memory WHERE content LIKE ? "
+                    "LIMIT 8",
+                    (f"%{_term}%", f"%{_term}%")
+                ).fetchall()
+                for _tr in _topic_rows:
+                    if _tr[1]:
+                        _add_unique([{"id": _tr[0], "content": _tr[1], "score": 0.70,
+                                     "source": "topic_mention"}])
+            except Exception:
+                pass
+
     # Strategy 3: Key entity/term searches
     terms = _extract_search_terms(question)
     for term in terms[:5]:
@@ -1754,7 +1780,9 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
         # --- Helper: build context string from memory list ---
         def _build_context(mems, recents):
             if ability == "EO":
-                mems = sorted(mems, key=lambda x: (0 if "memoria" in x.get("source", "") else 1, x.get("timestamp") or ""))
+                # Sort by message_index (true conversation order). All messages
+                # share a constant ingest timestamp, so timestamp sort is a no-op.
+                mems = sorted(mems, key=lambda x: x.get("message_index") if x.get("message_index") is not None else float('inf'))
             ctx_blocks = []
             if recents:
                 ctx_blocks.append("RECENT CONVERSATION:\n" + "\n".join(recents))
@@ -1921,14 +1949,18 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
                     all_mems.append(gm)
             all_mems.sort(key=lambda m: m.get("score", 0), reverse=True)
             
-            # Rebuild context with augmented memories, trimmed for pass2
+            # Rebuild context with augmented memories, trimmed for pass2.
+            # Ordering questions need ALL events to order correctly, so give them
+            # a much larger budget; duration questions only need a few dates.
             pass2_ctx = _build_context(all_mems, recent_parts)
-            # Trim pass2 context to prevent output truncation
-            if len(pass2_ctx) > 6000:
-                pass2_ctx = pass2_ctx[:6000] + "...[truncated]"
+            _pass2_limit = 16000 if is_ordering_query(question) else 6000
+            if len(pass2_ctx) > _pass2_limit:
+                pass2_ctx = pass2_ctx[:_pass2_limit] + "...[truncated]"
             
-            # Switch to Calculator prompt for TR/EO abilities
-            if is_temporal_query(question):
+            # Switch to Calculator prompt ONLY for DURATION questions.
+            # Ordering (EO) questions must use the ordering prompt below — routing
+            # them to the calculator made them output a number, killing tau-b.
+            if _is_calculator_question(question):
                 calc_prompt = """You are a precise temporal calculator. You have been provided with specific retrieved evidence (dates, event timelines).
 Your task is to compute the duration or interval between the events.
 DO NOT use chat pleasantries or summarize the conversation.
@@ -2302,8 +2334,11 @@ def evaluate_conversation(
         print(f"    [{ability}] score={score:.2f} ans={answer_time*1000:.0f}ms judge={judge_time*1000:.0f}ms "
               f"Q: {question[:60]}...")
         
-        # Rate-limit avoidance: long pause between questions (20s to avoid provider burst limits)
-        time.sleep(20)
+        # Rate-limit avoidance: pause between questions. Default 20s for burst-limited
+        # providers; set BEAM_QUESTION_DELAY=2 (or 0) for higher-tier APIs like gpt-4o.
+        _q_delay = float(os.environ.get("BEAM_QUESTION_DELAY", "20"))
+        if _q_delay > 0:
+            time.sleep(_q_delay)
 
     return {
         "conversation_id": conv_id,
