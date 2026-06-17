@@ -577,6 +577,33 @@ class TestTROracle:
         assert "2" in answer
 
 
+class TestContextFactsClean:
+    """Verify the context->value index is built from clean text, not synthetic tags."""
+
+    def test_context_phrases_have_no_synthetic_tags(self):
+        from tools.evaluate_beam_end_to_end import ingest_conversation
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
+            db_path = Path(tmp.name)
+        try:
+            beam = BeamMemory(db_path=db_path)
+            ingest_conversation(beam, [
+                {"role": "user", "content": "My first sprint ends on 2024-03-15 with the dashboard launch."},
+            ])
+            keys = list(getattr(beam, "_context_facts", {}).keys())
+            # No context phrase should contain the synthetic MSGIDX/DATES/DURATIONS tags
+            for k in keys:
+                assert "msgidx" not in k, f"tag pollution in context phrase: {k!r}"
+                assert "[dates" not in k, f"tag pollution in context phrase: {k!r}"
+                assert "[durations" not in k, f"tag pollution in context phrase: {k!r}"
+            # The real natural-language fact should still be indexed
+            assert any("sprint ends on" in k for k in keys)
+            beam.conn.close()
+        finally:
+            if db_path.exists():
+                try: db_path.unlink()
+                except PermissionError: pass
+
+
 class TestRerankMerge:
     """Verify reranked candidates always tier above the un-reranked tail (no scale mixing)."""
 

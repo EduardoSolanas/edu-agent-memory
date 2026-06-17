@@ -537,17 +537,20 @@ def ingest_conversation(beam: BeamMemory, messages: list[dict]) -> dict:
             })
             stats["total_chars"] += len(content)
             
-            # Extract context→value facts: words before AND after each fact value
+            # Extract context→value facts: words before AND after each fact value.
+            # Use raw_content (NOT the tag-augmented `content`) so context phrases are
+            # clean natural language — the synthetic [MSGIDX:N]/[DATES:]/[DURATIONS:]
+            # tags would otherwise pollute phrases and create junk duplicate entries.
             # SKIP version numbers (e.g., "3.39", "2.3.1") -- they pollute fact matching
             # and are never the answer to BEAM questions (which ask about dates, counts, names).
             _VERSION_RE = _re2.compile(r'^\d+\.\d+(?:\.\d+)?(?:-[a-zA-Z0-9.]+)?$')
-            for match in _FACT_VALUE_RE.finditer(content):
+            for match in _FACT_VALUE_RE.finditer(raw_content):
                 value = match.group()
                 if _VERSION_RE.match(value):
                     continue  # Skip bare version numbers
                 # Extract context: up to 12 words before + 8 words after the fact
-                before = content[:match.start()].split()[-12:]
-                after = content[match.end():].split()[:8]
+                before = raw_content[:match.start()].split()[-12:]
+                after = raw_content[match.end():].split()[:8]
                 context_words = before + after
                 context = ' '.join(context_words).lower().strip()
                 if context and len(context) > 5:
