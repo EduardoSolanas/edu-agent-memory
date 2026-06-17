@@ -794,6 +794,46 @@ class TestImplicitContradictionRecall:
                 except PermissionError: pass
 
 
+class TestTRTrustGuard:
+    """Verify Python TR answers are trusted only on sparse timelines; dense -> defer to LLM."""
+
+    def test_dense_timeline_defers_even_for_large_duration(self):
+        from tools.evaluate_beam_end_to_end import _tr_python_answer_is_trustworthy
+        # On a dense timeline Python date-pair matching is unreliable -> defer to LLM
+        ans = "Between A and B, there are 70 days."
+        assert _tr_python_answer_is_trustworthy(ans, timeline_size=120) is False
+
+    def test_sparse_timeline_trusts_large_duration(self):
+        from tools.evaluate_beam_end_to_end import _tr_python_answer_is_trustworthy
+        ans = "Between A and B, there are 70 days."
+        assert _tr_python_answer_is_trustworthy(ans, timeline_size=4) is True
+
+    def test_sparse_timeline_trusts_small_duration(self):
+        from tools.evaluate_beam_end_to_end import _tr_python_answer_is_trustworthy
+        ans = "Between A and B, there are 2 days."
+        assert _tr_python_answer_is_trustworthy(ans, timeline_size=3) is True
+
+    def test_round_duration_not_rejected_as_zero(self):
+        from tools.evaluate_beam_end_to_end import _tr_python_answer_is_trustworthy
+        # Regression: "70 days" must NOT be treated as "0 days" (substring bug)
+        ans = "Between A and B, there are 70 days."
+        assert _tr_python_answer_is_trustworthy(ans, timeline_size=4) is True
+
+    def test_weeks_format_total_days_parsed(self):
+        from tools.evaluate_beam_end_to_end import _tr_python_answer_is_trustworthy
+        # "4 weeks and 2 days (30 days)" on a sparse timeline -> trusted
+        ans = "Between A and B, there are 4 weeks and 2 days (30 days)."
+        assert _tr_python_answer_is_trustworthy(ans, timeline_size=4) is True
+
+    def test_zero_duration_never_trusted(self):
+        from tools.evaluate_beam_end_to_end import _tr_python_answer_is_trustworthy
+        assert _tr_python_answer_is_trustworthy("Between A and B, there are 0 days.", timeline_size=3) is False
+
+    def test_none_not_trusted(self):
+        from tools.evaluate_beam_end_to_end import _tr_python_answer_is_trustworthy
+        assert _tr_python_answer_is_trustworthy(None, timeline_size=3) is False
+
+
 class TestPass2Routing:
     """Verify Pass-2 prompt routing: only duration questions get the calculator prompt."""
 

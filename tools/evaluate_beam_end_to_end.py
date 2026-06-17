@@ -64,6 +64,34 @@ def _is_calculator_question(question: str) -> bool:
     return is_duration_query(question) and not is_ordering_query(question)
 
 
+def _tr_python_answer_is_trustworthy(py_answer: str, timeline_size: int,
+                                     dense_threshold: int = 15) -> bool:
+    """Decide whether to trust the zero-LLM Python TR answer or defer to the LLM.
+
+    The Python oracle picks the two best keyword-matching dates. That matching is
+    reliable on a SPARSE timeline (few candidate dates) but unreliable on a DENSE
+    one -- with 100+ dates the wrong pair is easily selected (observed: 123 dates
+    -> a duration between two unrelated events). So we trust Python only on sparse
+    timelines and defer every dense-timeline TR question to the LLM-with-timeline
+    path (which is fed the same extracted dates). Zero-durations never trust.
+    """
+    import re as _re_tr
+    if not py_answer:
+        return False
+    low = py_answer.lower()
+    # Reject zero spans. Parse "N days" rather than substring-matching "0 days",
+    # which also matches "70 days"/"30 days".
+    day_counts = [int(x) for x in _re_tr.findall(r'(\d+)\s+days', low)]
+    if day_counts and max(day_counts) == 0:
+        return False
+    if not day_counts and _re_tr.search(r'\b0\s+(?:weeks|months|years)\b', low):
+        return False
+    # Dense timeline => Python date-pair matching is unreliable; defer to the LLM.
+    if timeline_size > dense_threshold:
+        return False
+    return True
+
+
 _CTX_MATCH_STOP = {
     'when', 'does', 'do', 'did', 'what', 'how', 'where', 'which', 'who', 'why',
     'is', 'are', 'was', 'were', 'can', 'will', 'would', 'should', 'could', 'may',
@@ -1603,13 +1631,15 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
         timeline = _extract_timeline_from_conversation(conversation_messages)
         print(f"    [TR] extracted {len(timeline)} dates from {len(conversation_messages)} msgs")
         if timeline and len(timeline) >= 2:
-            # Phase 1: zero-LLM Python date math (fast, no tokens)
+            # Phase 1: zero-LLM Python date math (fast, no tokens).
+            # Only short-circuit when the Python answer is trustworthy; a small
+            # duration on a dense BEAM timeline usually means the wrong date pair
+            # was matched, so defer those to the LLM-with-timeline path below.
             py_answer = _compute_tr_python(question, timeline)
-            if py_answer and not any(phrase in py_answer.lower()
-                                     for phrase in ["0 days", "0 weeks", "0 months", "0 years"]):
+            if _tr_python_answer_is_trustworthy(py_answer, len(timeline)):
                 print(f"    [TR-zero-LLM] Python computed: {py_answer[:150]}")
                 return _ret(py_answer)
-            print(f"    [TR-zero-LLM] Python could not compute, trying LLM")
+            print(f"    [TR-zero-LLM] Python answer not trusted (dense-timeline guard), trying LLM")
             # Phase 2: LLM-assisted with timeline prompt
             tr_prompt = _compute_tr_answer(question, timeline)
             if tr_prompt:
