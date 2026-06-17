@@ -1038,16 +1038,137 @@ def _extract_timeline_from_conversation(messages: list) -> list[dict]:
                 except ValueError:
                     pass
     
+        # Pattern 3: ISO dates (2024-03-15)
+        for m in _re.finditer(r'\b(?P<year>\d{4})-(?P<month>\d{2})-(?P<day>\d{2})\b', content):
+            if _is_code_context(content, m.start()):
+                continue
+            try:
+                dt = _dt(int(m.group('year')), int(m.group('month')), int(m.group('day')))
+                start = max(0, m.start() - 60)
+                end = min(len(content), m.end() + 60)
+                event_text = content[start:end].strip()
+                timeline.append({
+                    'date_obj': dt, 'date_str': m.group(0),
+                    'event_text': event_text, 'msg_index': i,
+                })
+            except ValueError:
+                pass
+
+        # Pattern 4: Ordinal dates — "15th of March, 2024" / "15th of March"
+        for m in _re.finditer(
+            r'(?P<day>\d{1,2})(?:st|nd|rd|th)\s+(?:of\s+)?'
+            r'(?P<month>January|February|March|April|May|June|July|August|September|October|November|December|'
+            r'Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*'
+            r'(?:[,\s]+(?P<year>\d{4}))?',
+            content, _re.IGNORECASE
+        ):
+            if _is_code_context(content, m.start()):
+                continue
+            month_num = MONTH_MAP.get(m.group('month').lower()[:3])
+            if month_num:
+                yr = int(m.group('year')) if m.group('year') else default_year
+                try:
+                    dt = _dt(yr, month_num, int(m.group('day')))
+                    start = max(0, m.start() - 60)
+                    end = min(len(content), m.end() + 60)
+                    event_text = content[start:end].strip()
+                    timeline.append({
+                        'date_obj': dt, 'date_str': m.group(0),
+                        'event_text': event_text, 'msg_index': i,
+                    })
+                except ValueError:
+                    pass
+
+        # Pattern 5: Slash dates — MM/DD/YYYY
+        for m in _re.finditer(r'\b(?P<m>\d{1,2})/(?P<d>\d{1,2})/(?P<y>\d{4})\b', content):
+            if _is_code_context(content, m.start()):
+                continue
+            try:
+                dt = _dt(int(m.group('y')), int(m.group('m')), int(m.group('d')))
+                start = max(0, m.start() - 60)
+                end = min(len(content), m.end() + 60)
+                event_text = content[start:end].strip()
+                timeline.append({
+                    'date_obj': dt, 'date_str': m.group(0),
+                    'event_text': event_text, 'msg_index': i,
+                })
+            except ValueError:
+                pass
+
+        # Pattern 6: Informal month references — "early/mid/late Month Year"
+        for m in _re.finditer(
+            r'(?P<qual>early|mid|late)[- ]'
+            r'(?P<month>January|February|March|April|May|June|July|August|September|October|November|December)'
+            r'(?:\s+(?P<year>\d{4}))?',
+            content, _re.IGNORECASE
+        ):
+            if _is_code_context(content, m.start()):
+                continue
+            month_num = MONTH_MAP.get(m.group('month').lower()[:3])
+            if month_num:
+                yr = int(m.group('year')) if m.group('year') else default_year
+                qual = m.group('qual').lower()
+                day = 5 if qual == 'early' else 15 if qual == 'mid' else 25
+                try:
+                    dt = _dt(yr, month_num, day)
+                    start = max(0, m.start() - 60)
+                    end = min(len(content), m.end() + 60)
+                    event_text = content[start:end].strip()
+                    timeline.append({
+                        'date_obj': dt, 'date_str': m.group(0),
+                        'event_text': event_text, 'msg_index': i,
+                    })
+                except ValueError:
+                    pass
+
+        # Pattern 7: Relative durations — "N weeks/days later", "N weeks/days ago"
+        # Resolved against the nearest preceding absolute date in the same message.
+        from datetime import timedelta as _td_rel
+        _NUM_MAP = {'one': 1, 'two': 2, 'three': 3, 'four': 4, 'five': 5,
+                    'six': 6, 'seven': 7, 'eight': 8, 'nine': 9, 'ten': 10}
+        for m in _re.finditer(
+            r'\b(?P<num>\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+'
+            r'(?P<unit>day|week|month|year)s?\s+'
+            r'(?P<dir>later|after|ago|before|earlier)',
+            content, _re.IGNORECASE
+        ):
+            if _is_code_context(content, m.start()):
+                continue
+            num_str = m.group('num').lower()
+            num = int(num_str) if num_str.isdigit() else _NUM_MAP.get(num_str, 0)
+            if num == 0:
+                continue
+            unit = m.group('unit').lower()
+            direction = m.group('dir').lower()
+            delta_days = num * {'day': 1, 'week': 7, 'month': 30, 'year': 365}[unit]
+            anchor = None
+            for prev in timeline:
+                if prev['msg_index'] == i and prev['date_obj']:
+                    anchor = prev['date_obj']
+            if anchor is None:
+                continue
+            if direction in ('later', 'after'):
+                dt = anchor + _td_rel(days=delta_days)
+            else:
+                dt = anchor - _td_rel(days=delta_days)
+            start = max(0, m.start() - 60)
+            end = min(len(content), m.end() + 60)
+            event_text = content[start:end].strip()
+            timeline.append({
+                'date_obj': dt, 'date_str': f"{num} {unit}s {direction} ({dt.strftime('%Y-%m-%d')})",
+                'event_text': event_text, 'msg_index': i,
+            })
+
     # Sort chronologically and deduplicate (same date, same event text)
     timeline.sort(key=lambda x: (x['date_obj'], x['event_text']))
     seen = set()
     deduped = []
     for t in timeline:
-        key = (t['date_str'], t['event_text'][:40])
+        key = (t['date_obj'].strftime('%Y-%m-%d'), t['event_text'][:40])
         if key not in seen:
             seen.add(key)
             deduped.append(t)
-    
+
     return deduped
 
 
@@ -1066,78 +1187,101 @@ def _build_tr_timeline_prompt(timeline: list[dict]) -> str:
 def _compute_tr_python(question: str, timeline: list[dict]) -> str | None:
     """Compute TR answer in pure Python (date math, no LLM). Returns answer string or None."""
     import re as _re
-    from datetime import timedelta as _td
-    
+
     q_lower = question.lower()
-    
-    # Detect question type: "how many days between X and Y"
-    # Extract event keywords from question
-    event_keywords = []
-    # Look for "end of first sprint", "start of second sprint" type phrases
-    phrases = _re.findall(r'(?:end|start|beginning|completion|finish|launch|release|deploy|merge|push|commit|sprint|milestone|phase|wave|beta|alpha|MVP|demo|presentation|meeting|call|review|audit|test|benchmark)[a-z]*\s+(?:of\s+)?(?:the\s+)?(?:my\s+)?(?:first|second|third|\d+(?:st|nd|rd|th)?)?\s*[a-z]+(?:\s+[a-z]+){0,3}', q_lower)
-    event_keywords.extend(phrases)
-    
-    # Also try simpler: extract noun phrases from question
-    q_words = q_lower.replace('?', '').split()
-    
-    # Score each timeline entry against the question
+
+    # --- Detect question type ---
+    _is_before_after = bool(_re.search(r'before\s+or\s+after|earlier\s+or\s+later|which.*(?:came|happened).*first', q_lower))
+    _asks_weeks = 'week' in q_lower
+    _asks_months = 'month' in q_lower
+    _asks_years = 'year' in q_lower
+
+    # --- Score each timeline entry against the question ---
+    _stop = {'the','a','an','in','on','at','to','for','of','with','my','me','i','you',
+             'how','many','long','did','does','was','were','is','are','do','what','between',
+             'and','or','take','from','it','its','this','that','before','after'}
+    q_words = [w for w in _re.findall(r'[a-z]+', q_lower) if w not in _stop and len(w) > 2]
+
     scored = []
     for t in timeline:
         event = t['event_text'].lower()
-        score = 0
-        # Direct substring match bonus
-        for phrase in event_keywords:
-            if phrase in event or any(w in event for w in phrase.split() if len(w) > 3):
-                score += 3
-        # Word overlap
-        for w in q_words:
-            if len(w) > 3 and w in event:
-                score += 1
-        # Date proximity bonus (prefer dates with event context)
+        score = sum(2 for w in q_words if w in event)
         if len(t['event_text']) > 20:
-            score += 2
+            score += 1
         scored.append((score, t))
-    
+
     scored.sort(key=lambda x: x[0], reverse=True)
-    
-    # Try to find two distinct events
-    if len(scored) >= 2 and scored[0][0] > 0 and scored[1][0] > 0:
+
+    # Pick the two best-matching timeline entries with distinct dates
+    best_pair = None
+    if len(scored) >= 2 and scored[0][0] > 0:
         t1 = scored[0][1]
-        t2 = scored[1][1]
-        d1 = t1['date_obj']
-        d2 = t2['date_obj']
-        diff = abs((d2 - d1).days)
-        
-        # Determine which is earlier/later based on question
-        if 'between' in q_lower:
-            evt_a = t1['date_str'] if d1 <= d2 else t2['date_str']
-            evt_b = t2['date_str'] if d1 <= d2 else t1['date_str']
-            d_a = d1 if d1 <= d2 else d2
-            d_b = d2 if d1 <= d2 else d1
+        for s, t in scored[1:]:
+            if s <= 0:
+                break
+            if t['date_obj'] != t1['date_obj']:
+                best_pair = (t1, t)
+                break
+        if best_pair is None and scored[1][0] > 0:
+            best_pair = (scored[0][1], scored[1][1])
+
+    if best_pair is None:
+        if len(scored) >= 2:
+            candidates = [t for s, t in scored if s > 0][:2]
+            if len(candidates) >= 2:
+                best_pair = (candidates[0], candidates[1])
+
+    if best_pair is None:
+        return None
+
+    t1, t2 = best_pair
+    d1, d2 = t1['date_obj'], t2['date_obj']
+    earlier = d1 if d1 <= d2 else d2
+    later = d2 if d1 <= d2 else d1
+    evt_early = t1['date_str'] if d1 <= d2 else t2['date_str']
+    evt_late = t2['date_str'] if d1 <= d2 else t1['date_str']
+    diff_days = abs((d2 - d1).days)
+
+    # --- Before/after questions ---
+    if _is_before_after:
+        evt1_text = t1['event_text'][:60].strip()
+        evt2_text = t2['event_text'][:60].strip()
+        if d1 < d2:
+            return (f"The event near {t1['date_str']} happened before the event near {t2['date_str']} "
+                    f"({d1.strftime('%Y-%m-%d')} vs {d2.strftime('%Y-%m-%d')}, {diff_days} days earlier).")
+        elif d1 > d2:
+            return (f"The event near {t1['date_str']} happened after the event near {t2['date_str']} "
+                    f"({d1.strftime('%Y-%m-%d')} vs {d2.strftime('%Y-%m-%d')}, {diff_days} days later).")
         else:
-            evt_a, evt_b = t1['date_str'], t2['date_str']
-            d_a, d_b = d1, d2
-            diff = abs((d_b - d_a).days)
-        
-        answer = (
-            f"Between {evt_a} ({d_a.strftime('%B %d, %Y')}) and "
-            f"{evt_b} ({d_b.strftime('%B %d, %Y')}), "
-            f"there are {diff} days."
-        )
-        return answer
-    
-    # Fallback: just take the two most relevant dates by word overlap
-    if len(scored) >= 2:
-        best = [t for s, t in scored if s > 0][:2]
-        if len(best) >= 2:
-            d1, d2 = best[0]['date_obj'], best[1]['date_obj']
-            diff = abs((d2 - d1).days)
-            return (
-                f"Based on the conversation timeline, the time between "
-                f"{best[0]['date_str']} and {best[1]['date_str']} is {diff} days."
-            )
-    
-    return None  # Can't compute, let LLM handle it
+            return f"Both events occurred on the same date: {d1.strftime('%Y-%m-%d')}."
+
+    # --- Duration questions: convert to the unit the question asks for ---
+    if _asks_months:
+        months = (later.year - earlier.year) * 12 + (later.month - earlier.month)
+        return (f"Between {evt_early} ({earlier.strftime('%B %d, %Y')}) and "
+                f"{evt_late} ({later.strftime('%B %d, %Y')}), "
+                f"there are approximately {months} months ({diff_days} days).")
+
+    if _asks_weeks:
+        weeks = diff_days // 7
+        remainder = diff_days % 7
+        week_str = f"{weeks} weeks" + (f" and {remainder} days" if remainder else "")
+        return (f"Between {evt_early} ({earlier.strftime('%B %d, %Y')}) and "
+                f"{evt_late} ({later.strftime('%B %d, %Y')}), "
+                f"there are {week_str} ({diff_days} days).")
+
+    if _asks_years:
+        years = later.year - earlier.year
+        if (later.month, later.day) < (earlier.month, earlier.day):
+            years -= 1
+        return (f"Between {evt_early} ({earlier.strftime('%B %d, %Y')}) and "
+                f"{evt_late} ({later.strftime('%B %d, %Y')}), "
+                f"there are approximately {years} years ({diff_days} days).")
+
+    # Default: days
+    return (f"Between {evt_early} ({earlier.strftime('%B %d, %Y')}) and "
+            f"{evt_late} ({later.strftime('%B %d, %Y')}), "
+            f"there are {diff_days} days.")
 
 
 
@@ -1377,20 +1521,8 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
         if timeline and len(timeline) >= 2:
             # Phase 1: zero-LLM Python date math (fast, no tokens)
             py_answer = _compute_tr_python(question, timeline)
-            # Validate: skip if Python computed 0 days (same date matched twice)
-            # or if the answer contains "0 days" or "0 weeks" (twin match).
-            # Also skip very small durations (< 7 days, < 2 weeks) as they
-            # usually indicate keyword matching picked the wrong dates from a
-            # dense timeline (observed: 123 dates → 2 days between wrong events).
-            _small_duration = False
-            if py_answer:
-                import re as _re_small
-                _day_m = _re_small.search(r'\b([0-9]| [1-6])\s+days?\b', py_answer.lower())
-                _week_m = _re_small.search(r'\b([0-9]|1)\s+weeks?\b', py_answer.lower())
-                _small_duration = bool(_day_m or _week_m)
             if py_answer and not any(phrase in py_answer.lower()
-                                     for phrase in ["0 days", "0 weeks", "0 months", "0 years"]) \
-                               and not _small_duration:
+                                     for phrase in ["0 days", "0 weeks", "0 months", "0 years"]):
                 print(f"    [TR-zero-LLM] Python computed: {py_answer[:150]}")
                 return _ret(py_answer)
             print(f"    [TR-zero-LLM] Python could not compute, trying LLM")
@@ -1820,15 +1952,38 @@ Follow this format strictly:
         # No gaps: fall through to the single final LLM answer below
     # ---- END Recursive Retrieval Loop ----
 
-    # ---- SUM: Context budget expansion + MMR diversity ----
+    # ---- SUM: Broad topic sampling for summarization ----
     _is_sum = any(w in question.lower() for w in ["summarize", "summary", "overview", "main topics", "key themes"])
     if _is_sum:
         try:
+            total_rows = beam.conn.execute("SELECT COUNT(*) FROM working_memory").fetchone()[0]
+            if total_rows > 0:
+                stride = max(1, total_rows // 60)
+                broad_rows = beam.conn.execute(
+                    "SELECT id, content, message_index FROM working_memory "
+                    "WHERE content != '' ORDER BY ROWID LIMIT 60 OFFSET 0"
+                ).fetchall()
+                if stride > 1:
+                    broad_rows = beam.conn.execute(
+                        f"SELECT id, content, message_index FROM working_memory "
+                        f"WHERE content != '' AND (ROWID % {stride}) = 0 "
+                        f"ORDER BY ROWID LIMIT 60"
+                    ).fetchall()
+                _sum_seen = {m.get("content", "")[:80] for m in memories}
+                for row in broad_rows:
+                    ck = row["content"][:80]
+                    if ck not in _sum_seen:
+                        _sum_seen.add(ck)
+                        memories.append({
+                            "id": row["id"], "content": row["content"],
+                            "score": 0.3, "source": "sum_broad_sample",
+                            "message_index": row["message_index"],
+                        })
+        except Exception:
+            pass
+        try:
             from edumem.core.mmr import mmr_rerank as _mmr
-            if _mmr and _embeddings.available():
-                q_emb = _embeddings.embed_query(question)
-                if q_emb is not None:
-                    memories = _mmr(memories, q_emb, lambda_param=0.5, top_k=top_k * 2)
+            memories = _mmr(memories, lambda_param=0.5, top_k=top_k * 3)
         except Exception:
             pass
 

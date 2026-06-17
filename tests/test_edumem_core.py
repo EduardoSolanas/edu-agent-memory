@@ -446,7 +446,7 @@ class TestQueryModePrompts:
     def test_eo_ordering_modifier_mentions_message_index(self):
         from edumem.core.query_mode import build_system_prompt
         prompt = build_system_prompt("In what order did I discuss the topics?")
-        assert "FIRST MENTION" in prompt
+        assert "MSGIDX" in prompt
         assert "message index" in prompt
 
     def test_no_modifiers_for_simple_question(self):
@@ -456,6 +456,148 @@ class TestQueryModePrompts:
         assert "DURATION" not in prompt
         assert "KNOWLEDGE UPDATE" not in prompt
         assert "MULTI-HOP" not in prompt
+
+
+class TestTROracle:
+    """Verify the temporal reasoning oracle: timeline extraction, date matching, answer computation."""
+
+    def _make_msgs(self, texts):
+        return [{"role": "user", "content": t} for t in texts]
+
+    # --- Timeline extraction coverage ---
+
+    def test_extract_iso_dates(self):
+        """ISO dates (2024-03-15) should be extracted."""
+        from tools.evaluate_beam_end_to_end import _extract_timeline_from_conversation
+        msgs = self._make_msgs(["The sprint started on 2024-03-15 and ended on 2024-04-12."])
+        tl = _extract_timeline_from_conversation(msgs)
+        dates = {t["date_obj"].strftime("%Y-%m-%d") for t in tl}
+        assert "2024-03-15" in dates
+        assert "2024-04-12" in dates
+
+    def test_extract_ordinal_dates(self):
+        """Ordinal dates like '15th of March 2024' should be extracted."""
+        from tools.evaluate_beam_end_to_end import _extract_timeline_from_conversation
+        msgs = self._make_msgs(["We launched on the 15th of March, 2024."])
+        tl = _extract_timeline_from_conversation(msgs)
+        dates = {t["date_obj"].strftime("%Y-%m-%d") for t in tl}
+        assert "2024-03-15" in dates
+
+    def test_extract_relative_dates(self):
+        """Relative dates like 'two weeks ago' should be resolved against message context."""
+        from tools.evaluate_beam_end_to_end import _extract_timeline_from_conversation
+        msgs = [{"role": "user", "content": "The incident happened on March 15, 2024. Two weeks later we deployed the fix."}]
+        tl = _extract_timeline_from_conversation(msgs)
+        dates = {t["date_obj"].strftime("%Y-%m-%d") for t in tl}
+        assert "2024-03-15" in dates
+        assert "2024-03-29" in dates
+
+    def test_extract_informal_month_references(self):
+        """'mid-March 2024', 'early April 2024', 'late January 2024' should produce approximate dates."""
+        from tools.evaluate_beam_end_to_end import _extract_timeline_from_conversation
+        msgs = self._make_msgs(["Planning started in early April 2024 and finished in late June 2024."])
+        tl = _extract_timeline_from_conversation(msgs)
+        dates = {t["date_obj"].strftime("%Y-%m-%d") for t in tl}
+        # early April ≈ April 5, late June ≈ June 25
+        assert any(d.startswith("2024-04") for d in dates)
+        assert any(d.startswith("2024-06") for d in dates)
+
+    def test_extract_slash_dates(self):
+        """Dates like '03/15/2024' or '15/03/2024' should be extracted."""
+        from tools.evaluate_beam_end_to_end import _extract_timeline_from_conversation
+        msgs = self._make_msgs(["Meeting scheduled for 03/15/2024."])
+        tl = _extract_timeline_from_conversation(msgs)
+        dates = {t["date_obj"].strftime("%Y-%m-%d") for t in tl}
+        assert "2024-03-15" in dates
+
+    # --- Python date math ---
+
+    def test_compute_tr_python_weeks(self):
+        """When question asks 'how many weeks', answer should include weeks."""
+        from tools.evaluate_beam_end_to_end import _compute_tr_python
+        from datetime import datetime as _dt
+        timeline = [
+            {"date_obj": _dt(2024, 3, 1), "date_str": "March 1", "event_text": "started the project", "msg_index": 0},
+            {"date_obj": _dt(2024, 3, 29), "date_str": "March 29", "event_text": "finished the project", "msg_index": 5},
+        ]
+        answer = _compute_tr_python("How many weeks between starting and finishing the project?", timeline)
+        assert answer is not None
+        assert "4" in answer or "week" in answer.lower()
+
+    def test_compute_tr_python_months(self):
+        """When question asks 'how many months', answer should include months."""
+        from tools.evaluate_beam_end_to_end import _compute_tr_python
+        from datetime import datetime as _dt
+        timeline = [
+            {"date_obj": _dt(2024, 1, 15), "date_str": "January 15", "event_text": "started alpha", "msg_index": 0},
+            {"date_obj": _dt(2024, 4, 15), "date_str": "April 15", "event_text": "finished beta", "msg_index": 10},
+        ]
+        answer = _compute_tr_python("How many months between alpha and beta?", timeline)
+        assert answer is not None
+        assert "3" in answer or "month" in answer.lower()
+
+    def test_compute_tr_python_earlier_later(self):
+        """'Did X happen before or after Y?' should produce a before/after answer."""
+        from tools.evaluate_beam_end_to_end import _compute_tr_python
+        from datetime import datetime as _dt
+        timeline = [
+            {"date_obj": _dt(2024, 2, 10), "date_str": "February 10", "event_text": "database migration", "msg_index": 0},
+            {"date_obj": _dt(2024, 5, 20), "date_str": "May 20", "event_text": "API deployment", "msg_index": 5},
+        ]
+        answer = _compute_tr_python("Did the database migration happen before or after the API deployment?", timeline)
+        assert answer is not None
+        assert "before" in answer.lower()
+
+    def test_compute_tr_python_best_event_match(self):
+        """With 4+ timeline entries, the oracle should pick the two most relevant to the question."""
+        from tools.evaluate_beam_end_to_end import _compute_tr_python
+        from datetime import datetime as _dt
+        timeline = [
+            {"date_obj": _dt(2024, 1, 5), "date_str": "Jan 5", "event_text": "team standup meeting", "msg_index": 0},
+            {"date_obj": _dt(2024, 2, 10), "date_str": "Feb 10", "event_text": "started the database migration sprint", "msg_index": 2},
+            {"date_obj": _dt(2024, 3, 15), "date_str": "Mar 15", "event_text": "launched the new homepage redesign", "msg_index": 5},
+            {"date_obj": _dt(2024, 4, 20), "date_str": "Apr 20", "event_text": "completed the database migration rollout", "msg_index": 8},
+        ]
+        answer = _compute_tr_python("How long did the database migration take from start to completion?", timeline)
+        assert answer is not None
+        # Should pick Feb 10 and Apr 20 (the database migration events), not Jan 5 or Mar 15
+        assert "69" in answer or "70" in answer  # Feb 10 to Apr 20 = 70 days
+
+    def test_compute_tr_python_no_small_duration_false_positive(self):
+        """The small-duration guard should not block valid short durations when events match strongly."""
+        from tools.evaluate_beam_end_to_end import _compute_tr_python
+        from datetime import datetime as _dt
+        timeline = [
+            {"date_obj": _dt(2024, 3, 10), "date_str": "March 10", "event_text": "started the code review", "msg_index": 0},
+            {"date_obj": _dt(2024, 3, 12), "date_str": "March 12", "event_text": "finished the code review", "msg_index": 3},
+        ]
+        # Only 2 entries and both strongly match — should produce an answer even though it's 2 days
+        answer = _compute_tr_python("How long did the code review take?", timeline)
+        assert answer is not None
+        assert "2" in answer
+
+
+class TestEOAndSUMPrompts:
+    """Verify EO and SUM query detection and prompt modifiers."""
+
+    def test_summarization_query_detected(self):
+        from edumem.core.query_mode import is_summarization_query
+        assert is_summarization_query("Can you summarize the main topics we discussed?")
+        assert is_summarization_query("Give me an overview of our conversation.")
+        assert is_summarization_query("What were the key themes in our discussion?")
+        assert not is_summarization_query("What is my favorite color?")
+
+    def test_sum_modifier_in_prompt(self):
+        from edumem.core.query_mode import build_system_prompt
+        prompt = build_system_prompt("Summarize the main topics we discussed.")
+        assert "SUMMARIZATION" in prompt
+        assert "theme" in prompt.lower() or "topic" in prompt.lower()
+
+    def test_eo_modifier_includes_msgidx_instruction(self):
+        from edumem.core.query_mode import build_system_prompt
+        prompt = build_system_prompt("In what order did I discuss the features?")
+        assert "MSGIDX" in prompt or "message index" in prompt
+        assert "one item per line" in prompt.lower() or "one per line" in prompt.lower()
 
 
 class TestNegationRecall:

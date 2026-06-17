@@ -42,6 +42,11 @@ _MR_KEYWORDS = (
     "connect", "related to",
 )
 
+_SUM_KEYWORDS = (
+    "summarize", "summary", "overview", "main topics",
+    "key themes", "recap", "highlights", "gist",
+)
+
 
 def is_ordering_query(question: str) -> bool:
     q = question.lower()
@@ -61,6 +66,11 @@ def is_knowledge_update_query(question: str) -> bool:
 def is_multi_hop_query(question: str) -> bool:
     q = question.lower()
     return any(k in q for k in _MR_KEYWORDS)
+
+
+def is_summarization_query(question: str) -> bool:
+    q = question.lower()
+    return any(k in q for k in _SUM_KEYWORDS)
 
 
 def is_temporal_query(question: str) -> bool:
@@ -88,7 +98,7 @@ Output the final answer only: no step labels, no JSON, no preamble, no commentar
 
 _ORDERING_MODIFIER = """
 
-ORDERING: This question asks for the order in which topics or events were DISCUSSED in the conversation — the order they were mentioned, NOT when they happened in real life. CRITICAL: Order by FIRST MENTION in the conversation (message index), NOT by real-world dates. If topic A was first discussed in message 5 and topic B in message 20, A comes before B regardless of when A and B happened in real life. List them in the order they were first mentioned, earliest first, one item per line as short clauses. No numbering, no bullets, no preamble."""
+ORDERING: This question asks for the order in which topics or events were DISCUSSED in the conversation — the order they were mentioned, NOT when they happened in real life. CRITICAL: Each memory has a [MSGIDX:N] tag showing its message index (position in the conversation). Order by the LOWEST MSGIDX where each topic FIRST appears, NOT by real-world dates. If topic A first appears at MSGIDX:5 and topic B at MSGIDX:20, A comes before B regardless of chronological dates. List them one item per line as short clauses, earliest first. No preamble."""
 
 _DURATION_MODIFIER = """
 
@@ -108,6 +118,14 @@ of the conversation. Look for connections between separate facts. If fact A says
 and fact B says "Y requires Z", then the answer to "what does X require?" is Z.
 Chain the facts step by step."""
 
+_SUM_MODIFIER = """
+
+SUMMARIZATION: This question asks for a broad summary of the conversation topics.
+Cover ALL major themes and topics discussed, not just the most recent ones.
+Structure your answer as a comprehensive overview organized by topic.
+For each topic, mention key details (names, technologies, decisions, outcomes).
+Aim for completeness — missing a topic is worse than being slightly verbose."""
+
 
 def build_system_prompt(question: str) -> str:
     """Base behavior always; append format guidance only when the question asks for it."""
@@ -120,4 +138,6 @@ def build_system_prompt(question: str) -> str:
         prompt += _KU_MODIFIER
     if is_multi_hop_query(question):
         prompt += _MR_MODIFIER
+    if is_summarization_query(question):
+        prompt += _SUM_MODIFIER
     return prompt
