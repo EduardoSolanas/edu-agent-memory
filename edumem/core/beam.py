@@ -1442,6 +1442,19 @@ _RECALL_SYNONYMS: Dict[str, tuple[str, ...]] = {
 }
 
 
+def _recall_content_limit() -> int:
+    """Max chars of memory content returned per recall hit.
+
+    Default 500 bounds context size for chat use. BEAM and other long-message
+    workloads can raise it via EDUMEM_RECALL_CONTENT_CHARS so the answering LLM
+    sees facts (and appended [NEG] tags) past the first 500 chars.
+    """
+    try:
+        return int(os.environ.get("EDUMEM_RECALL_CONTENT_CHARS", "500"))
+    except ValueError:
+        return 500
+
+
 def _recall_tokens(text: str) -> List[str]:
     """Meaningful lexical tokens for precision gates and fallback scoring."""
     return [
@@ -4950,7 +4963,7 @@ class BeamMemory:
                     _wm_vec_kept += 1
                 results.append({
                     "id": row["id"],
-                    "content": row["content"][:500],
+                    "content": row["content"][:_recall_content_limit()],
                     "source": row["source"],
                     "timestamp": row["timestamp"],
                     "tier": "working",
@@ -5013,7 +5026,7 @@ class BeamMemory:
                         score *= (1.0 + temporal_weight * t_boost)
                     results.append({
                         "id": row["id"],
-                        "content": row["content"][:500],
+                        "content": row["content"][:_recall_content_limit()],
                         "source": row["source"],
                         "timestamp": row["timestamp"],
                         "tier": "working",
@@ -5078,7 +5091,7 @@ class BeamMemory:
                         score *= (1.0 + temporal_weight * t_boost)
                     results.append({
                         "id": row["id"],
-                        "content": row["content"][:500],
+                        "content": row["content"][:_recall_content_limit()],
                         "source": row["source"],
                         "timestamp": row["timestamp"],
                         "tier": "episodic",
@@ -5142,7 +5155,7 @@ class BeamMemory:
                         score *= (1.0 + temporal_weight * t_boost)
                     results.append({
                         "id": row["id"],
-                        "content": row["content"][:500],
+                        "content": row["content"][:_recall_content_limit()],
                         "source": row["source"],
                         "timestamp": row["timestamp"],
                         "tier": "working",
@@ -5206,7 +5219,7 @@ class BeamMemory:
                         score *= (1.0 + temporal_weight * t_boost)
                     results.append({
                         "id": row["id"],
-                        "content": row["content"][:500],
+                        "content": row["content"][:_recall_content_limit()],
                         "source": row["source"],
                         "timestamp": row["timestamp"],
                         "tier": "episodic",
@@ -5431,7 +5444,7 @@ class BeamMemory:
                 _em_vec_kept += 1
             results.append({
                 "id": row["id"],
-                "content": row["content"][:500],
+                "content": row["content"][:_recall_content_limit()],
                 "source": row["source"],
                 "timestamp": row["timestamp"],
                 "tier": "episodic",
@@ -5529,7 +5542,7 @@ class BeamMemory:
                     _em_fallback_kept += 1
                     results.append({
                         "id": row["id"],
-                        "content": row["content"][:500],
+                        "content": row["content"][:_recall_content_limit()],
                         "source": row["source"],
                         "timestamp": row["timestamp"],
                         "tier": "episodic",
@@ -5676,7 +5689,7 @@ class BeamMemory:
                         for _row in _src_rows:
                             results.append({
                                 "id": f"memoria_source_{_row['id']}",
-                                "content": _row["content"][:500],
+                                "content": _row["content"][:_recall_content_limit()],
                                 "source": _row["source"],
                                 "timestamp": _row["timestamp"],
                                 "tier": "memoria_source",

@@ -355,6 +355,47 @@ class TestNegationTagging:
                 except PermissionError: pass
 
 
+class TestRecallContentLimit:
+    """Verify recall content truncation is configurable via EDUMEM_RECALL_CONTENT_CHARS."""
+
+    def test_default_truncates_to_about_500(self):
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
+            db_path = Path(tmp.name)
+        os.environ.pop("EDUMEM_RECALL_CONTENT_CHARS", None)
+        try:
+            beam = BeamMemory(db_path=db_path)
+            long_text = "Kafka streaming pipeline. " + ("detail " * 200)  # ~1400 chars
+            beam.remember_batch([{"content": long_text, "source": "test", "importance": 0.5}])
+            results = beam.recall("Kafka streaming pipeline", top_k=5)
+            assert results, "expected a recall hit"
+            # Body truncated to 500 (a short date prefix may be prepended) -> well under full length
+            assert len(results[0]["content"]) < 600
+            beam.conn.close()
+        finally:
+            if db_path.exists():
+                try: db_path.unlink()
+                except PermissionError: pass
+
+    def test_env_raises_limit(self):
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
+            db_path = Path(tmp.name)
+        os.environ["EDUMEM_RECALL_CONTENT_CHARS"] = "2000"
+        try:
+            beam = BeamMemory(db_path=db_path)
+            long_text = "Kafka streaming pipeline. " + ("detail " * 200)  # ~1400 chars
+            beam.remember_batch([{"content": long_text, "source": "test", "importance": 0.5}])
+            results = beam.recall("Kafka streaming pipeline", top_k=5)
+            assert results, "expected a recall hit"
+            # With a 2000-char limit the full ~1400-char body should survive
+            assert len(results[0]["content"]) > 1000
+            beam.conn.close()
+        finally:
+            os.environ.pop("EDUMEM_RECALL_CONTENT_CHARS", None)
+            if db_path.exists():
+                try: db_path.unlink()
+                except PermissionError: pass
+
+
 class TestMessageIndex:
     """Verify message_index is stored during ingestion and returned during recall."""
 
