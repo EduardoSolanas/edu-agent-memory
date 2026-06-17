@@ -121,7 +121,7 @@ DEFAULT_MODEL = "gpt-4o"
 CONSOLIDATION_MODEL = "deepseek/deepseek-v4-flash"  # Cheap model for LLM-based consolidation summaries
 FALLBACK_MODELS = []  # Disabled -- fallback cascade burned $30 in credits
 DEFAULT_TOP_K = 10  # Memories to retrieve per question
-MAX_MEMORY_CONTEXT_CHARS = 16000  # Max chars of retrieved context to send to LLM
+MAX_MEMORY_CONTEXT_CHARS = int(os.environ.get("EDUMEM_MAX_CONTEXT_CHARS", "16000"))  # Max chars of retrieved context to send to LLM
 
 
 # C31: env-var truthy parser. Accepts standard truthy values
@@ -770,11 +770,11 @@ def normalize_for_judge(raw_answer: str, ability: str = None) -> str:
 
 DEFAULT_TOP_K = 30  # Memories to retrieve per question (increased for broader context)
 RECENT_CONTEXT_COUNT = 12  # Last N messages to include as recent context
-MAX_MEMORY_CONTEXT_CHARS = 16000  # More context for LLM to find contradictions
+MAX_MEMORY_CONTEXT_CHARS = int(os.environ.get("EDUMEM_MAX_CONTEXT_CHARS", "16000"))  # More context for LLM to find contradictions
 
 DEFAULT_TOP_K = 30  # Memories to retrieve per question (increased for broader context)
 RECENT_CONTEXT_COUNT = 12  # Last N messages to include as recent context
-MAX_MEMORY_CONTEXT_CHARS = 16000  # More context for LLM to find contradictions
+MAX_MEMORY_CONTEXT_CHARS = int(os.environ.get("EDUMEM_MAX_CONTEXT_CHARS", "16000"))  # More context for LLM to find contradictions
 
 
 def _recall_safe(beam: BeamMemory, query: str, top_k: int, temporal_weight: float = 0.0) -> list:
