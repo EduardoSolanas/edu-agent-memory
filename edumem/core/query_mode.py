@@ -27,12 +27,10 @@ def build_system_prompt(question: str) -> str:
     q = question.lower()
     
     # 1. Event Ordering (EO)
-    eo_keywords = ["order", "sequence", "happened first", "chronological", "first built", "built first", "timeline"]
+    eo_keywords = ["order", "sequence", "happened first", "chronological", "first built", "built first", "timeline", "walk me through", "order in which", "sequence of events", "in what order"]
     if any(w in q for w in eo_keywords):
-        return """You are an Event Ordering specialist. Order the events chronologically based on the provided facts.
-CRITICAL: Order them by the real-world conversational turn (e.g. [Event at turn X]) when the topic was actually discussed in the chat, NOT by any internal project plan dates, deadlines, or timelines mentioned in the text.
-Respond with a natural language numbered list, with one event per line.
-Do NOT output JSON. Respond directly and concisely."""
+        return """You are an Event Ordering specialist.
+This question asks for the order in which topics or events were DISCUSSED in the conversation — the order they were MENTIONED, not when they happened in real life. List them in the order they first came up, earliest mention first, one item per line. No numbering, no bullets, no preamble. Do NOT reorder by calendar/real-world dates."""
 
     # 2. Temporal Reasoning (TR)
     tr_keywords = ["how long", "how many days", "how many weeks", "how many months", "duration", "time between", "interval", "days between", "weeks between", "gym"]

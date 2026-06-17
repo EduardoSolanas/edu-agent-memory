@@ -5741,35 +5741,25 @@ class BeamMemory:
             except Exception:
                 logger.debug("fact recall integration failed (non-fatal)", exc_info=True)
 
-        # Prefix content with occurred_at or recorded_at date
-        for r in final_results:
-            date_str = r.get("occurred_at")
-            if not date_str:
-                ts = r.get("timestamp") or r.get("recorded_at")
-                if ts and len(ts) >= 10:
-                    date_str = ts[:10]
-            if date_str:
-                r["content"] = f"{date_str} — {r['content']}"
+        # Prefix content with occurred_at or recorded_at date unless it is an Event Ordering query
+        eo_keywords = ["order", "sequence", "happened first", "chronological", "first built", "built first", "timeline", "walk me through", "order in which", "sequence of events", "in what order"]
+        q_lower = query.lower()
+        is_eo_query = any(w in q_lower for w in eo_keywords)
 
-        # Generate derived temporal facts for temporal queries
-        derived_facts = generate_derived_temporal_facts(final_results, query)
-        if derived_facts:
-            final_results = derived_facts + final_results
+        if not is_eo_query:
+            for r in final_results:
+                date_str = r.get("occurred_at")
+                if not date_str:
+                    ts = r.get("timestamp") or r.get("recorded_at")
+                    if ts and len(ts) >= 10:
+                        date_str = ts[:10]
+                if date_str:
+                    r["content"] = f"{date_str} — {r['content']}"
 
-        # Prefix content with occurred_at or recorded_at date
-        for r in final_results:
-            date_str = r.get("occurred_at")
-            if not date_str:
-                ts = r.get("timestamp") or r.get("recorded_at")
-                if ts and len(ts) >= 10:
-                    date_str = ts[:10]
-            if date_str:
-                r["content"] = f"{date_str} — {r['content']}"
-
-        # Generate derived temporal facts for temporal queries
-        derived_facts = generate_derived_temporal_facts(final_results, query)
-        if derived_facts:
-            final_results = derived_facts + final_results
+            # Generate derived temporal facts for temporal queries
+            derived_facts = generate_derived_temporal_facts(final_results, query)
+            if derived_facts:
+                final_results = derived_facts + final_results
 
         return final_results
 

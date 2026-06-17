@@ -1515,7 +1515,7 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
     # may miss (dates, metrics, versions, negations, sequences, entity mappings).
     # Injected as synthetic high-score entries so they surface ahead of fuzzy matches.
     try:
-        _memoria_result = beam.memoria_retrieve(question, ability=None, top_k=top_k)
+        _memoria_result = beam.memoria_retrieve(question, ability=ability, top_k=top_k)
         if _memoria_result and _memoria_result.get("source") != "fallback" and _memoria_result.get("context"):
             _memoria_facts = _memoria_result.get("facts", [])
             print(f"    [MEMORIA] {_memoria_result['source']} hit for ability={ability}: {len(_memoria_facts)} facts", flush=True)
@@ -1634,6 +1634,8 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
     if needs_second_pass(question):
         # --- Helper: build context string from memory list ---
         def _build_context(mems, recents):
+            if ability == "EO":
+                mems = sorted(mems, key=lambda x: (0 if "memoria" in x.get("source", "") else 1, x.get("timestamp") or ""))
             ctx_blocks = []
             if recents:
                 ctx_blocks.append("RECENT CONVERSATION:\n" + "\n".join(recents))
