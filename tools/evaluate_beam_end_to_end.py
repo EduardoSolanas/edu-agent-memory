@@ -1958,14 +1958,93 @@ Return ONLY this JSON:
 Where scores[i] corresponds to rubric[i], and overall_score is the average."""
 
 
-def judge_with_rubrics(llm: LLMClient, question: str, rubric: list, ai_answer: str) -> dict:
-    """Judge an AI answer against pre-written BEAM rubric items."""
+def judge_with_rubrics(llm: LLMClient, question: str, rubric: list, ai_answer: str, ability: str = None) -> dict:
+    """Judge an AI answer against pre-written BEAM rubric items using the official BEAM grader."""
     if not rubric:
-        # Fall back to generic nugget scoring if no rubric available
         return {"scores": [], "overall_score": 0.0, "assessment": "no rubric available"}
-    
+
+    MAPPING = {
+        "ABS": "evaluate_abstention",
+        "CR": "evaluate_contradiction_resolution",
+        "EO": "evaluate_event_ordering",
+        "IE": "evaluate_information_extraction",
+        "IF": "evaluate_instruction_following",
+        "KU": "evaluate_knowledge_update",
+        "MR": "evaluate_multi_session_reasoning",
+        "PF": "evaluate_preference_following",
+        "SUM": "evaluate_summarization",
+        "TR": "evaluate_temporal_reasoning",
+    }
+
+    func_name = MAPPING.get(ability) if ability else None
+    if not func_name:
+        return _legacy_judge_with_rubrics(llm, question, rubric, ai_answer)
+
+    try:
+        import sys
+        if "/tmp/BEAM_official" not in sys.path:
+            sys.path.append("/tmp/BEAM_official")
+        
+        import os
+        if "OPENAI_API_KEY" not in os.environ:
+            os.environ["OPENAI_API_KEY"] = "dummy"
+
+        import importlib
+        compute_metrics = importlib.import_module("src.evaluation.compute_metrics")
+        eval_func = getattr(compute_metrics, func_name, None)
+
+        if not eval_func:
+            print(f"      [Grader-Swap] Warning: {func_name} not found in compute_metrics, falling back")
+            return _legacy_judge_with_rubrics(llm, question, rubric, ai_answer)
+
+        class LangchainLLMWrapper:
+            def __init__(self, client):
+                self.client = client
+            
+            def invoke(self, prompt: str):
+                res = self.client.chat([{"role": "user", "content": prompt}], temperature=0.0, max_tokens=1024)
+                class Response:
+                    def __init__(self, content):
+                        self.content = content
+                return Response(res or "")
+
+        wrapped_model = LangchainLLMWrapper(llm)
+
+        print(f"      [Grader-Swap] Running official {func_name}...")
+        eval_result = eval_func(rubric=rubric, llm_response=ai_answer, probing_question=question, model=wrapped_model)
+
+        score = eval_result.get("llm_judge_score", 0.0)
+        responses = eval_result.get("llm_judge_responses", [])
+
+        scores = []
+        for r in responses:
+            if isinstance(r, dict) and "score" in r:
+                try:
+                    scores.append(float(r["score"]))
+                except (ValueError, TypeError):
+                    scores.append(0.0)
+            else:
+                scores.append(0.0)
+
+        while len(scores) < len(rubric):
+            scores.append(0.0)
+
+        return {
+            "scores": scores[:len(rubric)],
+            "overall_score": float(score),
+            "assessment": f"Evaluated using official BEAM compute_metrics.{func_name}",
+            "raw_result": eval_result
+        }
+
+    except Exception as e:
+        print(f"      [Grader-Swap] Error executing official {func_name}: {e}, falling back")
+        import traceback
+        traceback.print_exc()
+        return _legacy_judge_with_rubrics(llm, question, rubric, ai_answer)
+
+
+def _legacy_judge_with_rubrics(llm: LLMClient, question: str, rubric: list, ai_answer: str) -> dict:
     rubric_text = "\n".join(f"{i+1}. {item}" for i, item in enumerate(rubric))
-    
     user_prompt = f"""QUESTION: {question}
 
 RUBRIC ITEMS:
@@ -1974,22 +2053,17 @@ RUBRIC ITEMS:
 AI's ANSWER: {ai_answer}
 
 For each rubric item, score how well the AI's answer matches. Return JSON with scores array and overall_score (average)."""
-
     messages = [
         {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
         {"role": "user", "content": user_prompt},
     ]
-
     response = llm.chat(messages, temperature=0.0, max_tokens=500)
-
-    # Parse JSON from response
     if response is None:
         return {
             "scores": [0.0] * len(rubric),
             "overall_score": 0.0,
             "assessment": "LLM judge returned None (timeout or error)",
         }
-    
     try:
         json_start = response.find("{")
         json_end = response.rfind("}") + 1
@@ -1998,8 +2072,6 @@ For each rubric item, score how well the AI's answer matches. Return JSON with s
             return result
     except (json.JSONDecodeError, ValueError):
         pass
-
-    # Fallback: basic text matching
     return {
         "scores": [0.0] * len(rubric),
         "overall_score": basic_text_similarity(ai_answer, " ".join(rubric)),
@@ -2070,7 +2142,7 @@ def evaluate_conversation(
         # Step 2: LLM-as-judge scores the answer (after normalizing EO/KU JSON output)
         t0 = time.perf_counter()
         normalized_answer = normalize_for_judge(ai_answer, ability)
-        judgment = judge_with_rubrics(judge_llm, question, rubric, normalized_answer)
+        judgment = judge_with_rubrics(judge_llm, question, rubric, normalized_answer, ability=ability)
         judge_time = time.perf_counter() - t0
 
         score = judgment.get("overall_score", 0.0)
