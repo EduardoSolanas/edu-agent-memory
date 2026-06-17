@@ -1516,6 +1516,27 @@ def _summarize_recall_memories(memories: list) -> dict:
     }
 
 
+def _apply_rerank_scores(memories: list, scores: list, top_n: int) -> list:
+    """Merge cross-encoder scores into memories and tier-sort.
+
+    Only a prefix of `memories` is sent to the reranker, so only those carry a
+    `rerank_score`. Cross-encoder scores and the original 0-1 `score` are on
+    different scales, so we sort in two tiers: every reranked memory ranks above
+    the un-reranked tail; within each tier we sort by the relevant score. This
+    prevents an unreviewed tail memory with a high raw score from leapfrogging a
+    reranked candidate.
+    """
+    for item in scores:
+        idx = item["index"]
+        if idx < len(memories):
+            memories[idx]["rerank_score"] = item["score"]
+    memories.sort(
+        key=lambda m: (1, m["rerank_score"]) if "rerank_score" in m else (0, m.get("score", 0)),
+        reverse=True,
+    )
+    return memories[:top_n]
+
+
 def _rerank(question: str, memories: list, top_n: int = 30) -> list:
     """Re-score candidates with local cross-encoder reranker."""
     import requests as _rr
@@ -1527,14 +1548,10 @@ def _rerank(question: str, memories: list, top_n: int = 30) -> list:
         resp = _rr.post(_reranker_url, json={"query": question, "texts": texts}, timeout=5)
         resp.raise_for_status()
         scores = resp.json()
-        for item in scores:
-            idx = item["index"]
-            if idx < len(memories):
-                memories[idx]["rerank_score"] = item["score"]
-        memories.sort(key=lambda m: m.get("rerank_score", m.get("score", 0)), reverse=True)
+        memories = _apply_rerank_scores(memories, scores, top_n)
     except Exception:
-        pass
-    return memories[:top_n]
+        return memories[:top_n]
+    return memories
 
 
 def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,

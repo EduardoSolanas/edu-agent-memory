@@ -577,6 +577,40 @@ class TestTROracle:
         assert "2" in answer
 
 
+class TestRerankMerge:
+    """Verify reranked candidates always tier above the un-reranked tail (no scale mixing)."""
+
+    def test_reranked_tier_above_unreranked(self):
+        from tools.evaluate_beam_end_to_end import _apply_rerank_scores
+        memories = [
+            {"content": "A", "score": 0.9},   # idx 0 - will be reranked low
+            {"content": "B", "score": 0.1},   # idx 1 - will be reranked high
+            {"content": "C", "score": 0.95},  # idx 2 - NOT reranked (tail), high raw score
+        ]
+        # Reranker only saw the first two; gives B a higher rerank score than A
+        scores = [{"index": 0, "score": 0.2}, {"index": 1, "score": 0.8}]
+        out = _apply_rerank_scores(memories, scores, top_n=3)
+        # B (reranked high) first, A (reranked low) second, C (un-reranked tail) last —
+        # even though C has the highest raw score, it must not leapfrog reranked items.
+        assert out[0]["content"] == "B"
+        assert out[1]["content"] == "A"
+        assert out[2]["content"] == "C"
+
+    def test_reranked_sorted_by_rerank_score(self):
+        from tools.evaluate_beam_end_to_end import _apply_rerank_scores
+        memories = [{"content": "X", "score": 0.5}, {"content": "Y", "score": 0.5}]
+        scores = [{"index": 0, "score": 0.3}, {"index": 1, "score": 0.9}]
+        out = _apply_rerank_scores(memories, scores, top_n=2)
+        assert [m["content"] for m in out] == ["Y", "X"]
+
+    def test_top_n_truncation(self):
+        from tools.evaluate_beam_end_to_end import _apply_rerank_scores
+        memories = [{"content": str(i), "score": 0.5} for i in range(5)]
+        scores = [{"index": i, "score": 1.0 - i * 0.1} for i in range(5)]
+        out = _apply_rerank_scores(memories, scores, top_n=2)
+        assert len(out) == 2
+
+
 class TestContextValueMatch:
     """Verify the IE/KU context->value matcher gates weak matches behind a confidence floor."""
 
