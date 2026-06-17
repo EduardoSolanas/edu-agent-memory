@@ -63,6 +63,44 @@ def _is_calculator_question(question: str) -> bool:
     must NOT use the calculator prompt — they need an ordered list, not a number."""
     return is_duration_query(question) and not is_ordering_query(question)
 
+
+_CTX_MATCH_STOP = {
+    'when', 'does', 'do', 'did', 'what', 'how', 'where', 'which', 'who', 'why',
+    'is', 'are', 'was', 'were', 'can', 'will', 'would', 'should', 'could', 'may',
+    'the', 'a', 'an', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'my', 'me', 'i', 'you',
+}
+
+
+def _context_value_match(question: str, context_facts: dict, min_score: float = 0.5):
+    """Match a question against the context->value side index.
+
+    Returns (best_value, best_score). best_score is the fraction of the matched
+    context phrase's words that the question covers. Callers should only bypass
+    the LLM when best_score >= min_score — weak matches (a couple of incidental
+    shared words) return a low score so they fall through to full LLM reasoning.
+    """
+    if not context_facts:
+        return None, 0.0
+    q_words = [w.lower() for w in question.split()
+               if w.lower() not in _CTX_MATCH_STOP and len(w) > 1]
+    q_set = set(q_words)
+    if not q_set:
+        return None, 0.0
+    best_value = None
+    best_score = 0.0
+    for context_phrase, values in context_facts.items():
+        c_words = set(context_phrase.split())
+        overlap = q_set & c_words
+        if len(overlap) < 2:
+            continue
+        score = len(overlap) / max(len(c_words), 1)
+        if score > best_score:
+            best_score = score
+            best_value = values[0] if values else None
+    if best_value is not None and best_score >= min_score:
+        return best_value, best_score
+    return None, best_score
+
 # --- Config ---
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 if not OPENROUTER_API_KEY:
@@ -1594,22 +1632,9 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
         # conversation but skips the zero-LLM context→value shortcut.
         _FACT_ABILITIES = {'IE', 'KU'}
         if not _pure_recall and ability in _FACT_ABILITIES and hasattr(beam, '_context_facts') and beam._context_facts:
-            _q_stop = {'when','does','do','did','what','how','where','which','who','why',
-                       'is','are','was','were','can','will','would','should','could','may',
-                       'the','a','an','in','on','at','to','for','of','with','my','me','i','you'}
-            q_words = [w.lower() for w in question.split() if w.lower() not in _q_stop and len(w) > 1]
-            q_set = set(q_words)
-            best_match = None
-            best_score = 0
-            for context_phrase, values in beam._context_facts.items():
-                c_words = set(context_phrase.split())
-                overlap = q_set & c_words
-                if len(overlap) < 2:
-                    continue
-                score = len(overlap) / max(len(c_words), 1)
-                if score > best_score:
-                    best_score = score
-                    best_match = values[0]
+            # Strong-match gate: only bypass the LLM on a confident match.
+            _ctx_floor = float(os.environ.get("BEAM_CTX_MATCH_FLOOR", "0.5"))
+            best_match, _ctx_score = _context_value_match(question, beam._context_facts, min_score=_ctx_floor)
             if best_match:
                 return _ret(best_match)  # Direct fact answer, zero LLM cost
         
@@ -1691,24 +1716,11 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
                             'how did i', 'how do i', 'how would i', 'how should i',
                             'what were the', 'what are the', 'list the']
         if not any(ind in _q_lower for ind in _proc_indicators):
-            # Build question word set (filtered like FTS5 search does)
-            _q_stop = {'when','does','do','did','what','how','where','which','who','why',
-                       'is','are','was','were','can','will','would','should','could','may',
-                       'the','a','an','in','on','at','to','for','of','with','my','me','i','you'}
-            q_words = [w.lower() for w in question.split() if w.lower() not in _q_stop and len(w) > 1]
-            q_set = set(q_words)
-            best_match = None
-            best_score = 0
-            for context_phrase, values in beam._context_facts.items():
-                c_words = set(context_phrase.split())
-                overlap = q_set & c_words
-                if len(overlap) < 2:
-                    continue
-                # Score: overlap count / max(context_words, question_words) for fairness
-                score = len(overlap) / max(len(c_words), 1)
-                if score > best_score and len(overlap) >= 2:
-                    best_score = score
-                    best_match = values[0]
+            # Only short-circuit the LLM on a STRONG match. Weak matches (a couple
+            # of incidental shared words) returned a bare uncomposed value and made
+            # IE a coin-flip; below the floor we fall through to full LLM reasoning.
+            _ctx_floor = float(os.environ.get("BEAM_CTX_MATCH_FLOOR", "0.5"))
+            best_match, _ctx_score = _context_value_match(question, beam._context_facts, min_score=_ctx_floor)
             if best_match:
                 context_answer = best_match
 

@@ -577,6 +577,31 @@ class TestTROracle:
         assert "2" in answer
 
 
+class TestContextValueMatch:
+    """Verify the IE/KU context->value matcher gates weak matches behind a confidence floor."""
+
+    def test_strong_match_returns_value(self):
+        from tools.evaluate_beam_end_to_end import _context_value_match
+        facts = {"main database engine postgres version": ["PostgreSQL 14"]}
+        val, score = _context_value_match("What is the main database engine version?", facts)
+        assert val == "PostgreSQL 14"
+        assert score >= 0.5
+
+    def test_weak_match_below_floor(self):
+        from tools.evaluate_beam_end_to_end import _context_value_match
+        # Question shares only 2 words with a long, unrelated context phrase
+        facts = {"deployed the staging server with docker compose and nginx config": ["xyz"]}
+        val, score = _context_value_match("What server did I deploy?", facts)
+        # Only ~2 words overlap out of 9 context words -> low score
+        assert score < 0.5
+
+    def test_no_match_returns_none(self):
+        from tools.evaluate_beam_end_to_end import _context_value_match
+        facts = {"completely unrelated topic about cats": ["meow"]}
+        val, score = _context_value_match("What is the API rate limit?", facts)
+        assert val is None
+
+
 class TestImplicitContradictionRecall:
     """Verify CR retrieval surfaces BOTH sides of an implicit (no negation word) contradiction."""
 
