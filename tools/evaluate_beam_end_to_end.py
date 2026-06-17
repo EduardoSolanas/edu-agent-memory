@@ -2396,20 +2396,25 @@ def compute_ability_scores(all_results: list[dict]) -> dict:
     summary = {}
     for scale, abilities in by_scale_ability.items():
         scale_scores = {}
-        all_scores = []
+        ability_avgs = []
+        total_count = 0
         for ability, scores in abilities.items():
             avg = sum(scores) / len(scores) if scores else 0.0
             scale_scores[ability] = {
                 "avg_score": avg,
                 "count": len(scores),
             }
-            all_scores.extend(scores)
+            ability_avgs.append(avg)
+            total_count += len(scores)
 
-        # Overall average across all abilities
-        overall = sum(all_scores) / len(all_scores) if all_scores else 0.0
+        # OVERALL is a MACRO-average: the mean of per-ability scores, each ability
+        # weighted equally. This matches BEAM's leaderboard convention and keeps the
+        # SOTA comparison valid when abilities have unequal question counts. (A micro
+        # average over pooled questions would let high-frequency abilities dominate.)
+        overall = sum(ability_avgs) / len(ability_avgs) if ability_avgs else 0.0
         scale_scores["OVERALL"] = {
             "avg_score": overall,
-            "count": len(all_scores),
+            "count": total_count,
         }
 
         summary[scale] = scale_scores
@@ -2490,7 +2495,8 @@ def print_sota_report(ability_summary: dict, metadata: dict):
         print()
 
     print(f"\n  Note: Published SOTA numbers from Hindsight blog (Apr 2026) and BEAM paper Table 3.")
-    print(f"  edumem uses DeepSeek V4 Pro as answering + judging LLM.")
+    print(f"  edumem uses {metadata.get('model', 'unknown')} as answering + judging LLM.")
+    print(f"  OVERALL is a macro-average across abilities (BEAM leaderboard convention).")
     print(f"  Direct comparison valid: identical BEAM dataset, identical LLM-as-judge protocol.")
     print(f"{'='*80}")
 

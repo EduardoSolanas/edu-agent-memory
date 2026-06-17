@@ -577,6 +577,39 @@ class TestTROracle:
         assert "2" in answer
 
 
+class TestOverallMacroAverage:
+    """Verify OVERALL is a macro-average (per-ability equal weight), matching BEAM's leaderboard."""
+
+    def test_overall_is_macro_not_micro(self):
+        from tools.evaluate_beam_end_to_end import compute_ability_scores
+        # Ability A: 1 question scored 1.0; Ability B: 3 questions all 0.0
+        all_results = [{
+            "scale": "100K",
+            "results": [
+                {"ability": "ABS", "score": 1.0},
+                {"ability": "IE", "score": 0.0},
+                {"ability": "IE", "score": 0.0},
+                {"ability": "IE", "score": 0.0},
+            ],
+        }]
+        summary = compute_ability_scores(all_results)
+        overall = summary["100K"]["OVERALL"]["avg_score"]
+        # Macro: (1.0 + 0.0) / 2 = 0.5   (micro would be 1/4 = 0.25)
+        assert abs(overall - 0.5) < 1e-9, f"expected macro 0.5, got {overall}"
+
+    def test_per_ability_averages_unchanged(self):
+        from tools.evaluate_beam_end_to_end import compute_ability_scores
+        all_results = [{
+            "scale": "100K",
+            "results": [
+                {"ability": "IE", "score": 1.0},
+                {"ability": "IE", "score": 0.0},
+            ],
+        }]
+        summary = compute_ability_scores(all_results)
+        assert abs(summary["100K"]["IE"]["avg_score"] - 0.5) < 1e-9
+
+
 class TestContextFactsClean:
     """Verify the context->value index is built from clean text, not synthetic tags."""
 
