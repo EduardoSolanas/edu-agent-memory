@@ -32,6 +32,16 @@ _DURATION_KEYWORDS = (
     "how old", "between",  # broad, but base prompt safely handles any misroute
 )
 
+_KU_KEYWORDS = (
+    "current", "latest", "updated", "changed to", "switched to",
+    "now using", "most recent",
+)
+
+_MR_KEYWORDS = (
+    "across", "combining", "together", "relationship between",
+    "connect", "related to",
+)
+
 
 def is_ordering_query(question: str) -> bool:
     q = question.lower()
@@ -41,6 +51,16 @@ def is_ordering_query(question: str) -> bool:
 def is_duration_query(question: str) -> bool:
     q = question.lower()
     return any(k in q for k in _DURATION_KEYWORDS)
+
+
+def is_knowledge_update_query(question: str) -> bool:
+    q = question.lower()
+    return any(k in q for k in _KU_KEYWORDS)
+
+
+def is_multi_hop_query(question: str) -> bool:
+    q = question.lower()
+    return any(k in q for k in _MR_KEYWORDS)
 
 
 def is_temporal_query(question: str) -> bool:
@@ -57,7 +77,7 @@ _BASE_PROMPT = """You are a precise memory assistant. Answer the question using 
 
 Reason through these internally, then output only the final answer:
 1. FACTS — gather every relevant fact from the context (dates, numbers, names, events, statements) and note when each was said.
-2. CONFLICTS — if the context contains statements that contradict each other about the same thing, surface BOTH explicitly; do not silently pick one.
+2. CONFLICTS — if the context contains statements that contradict each other about the same thing, you MUST surface BOTH explicitly. Start your answer with 'The conversation contains contradictory information:' and present both sides. Do NOT silently pick one side.
 3. CHANGE OVER TIME — if a fact, preference, or instruction was updated, the most recent value is the current answer.
 4. ABSENCE — if the specific topic of the question does not appear anywhere in the context, say clearly that the conversation does not contain that information. Never guess or use outside knowledge.
 5. ANSWER — give a direct, complete answer grounded only in the context.
@@ -68,11 +88,25 @@ Output the final answer only: no step labels, no JSON, no preamble, no commentar
 
 _ORDERING_MODIFIER = """
 
-ORDERING: This question asks for the order in which topics or events were DISCUSSED in the conversation — the order they were mentioned, NOT when they happened in real life. List them in the order they were first mentioned, earliest first, one item per line as short clauses. No numbering, no bullets, no preamble. Do not reorder by calendar/real-world dates."""
+ORDERING: This question asks for the order in which topics or events were DISCUSSED in the conversation — the order they were mentioned, NOT when they happened in real life. CRITICAL: Order by FIRST MENTION in the conversation (message index), NOT by real-world dates. If topic A was first discussed in message 5 and topic B in message 20, A comes before B regardless of when A and B happened in real life. List them in the order they were first mentioned, earliest first, one item per line as short clauses. No numbering, no bullets, no preamble."""
 
 _DURATION_MODIFIER = """
 
 DURATION: This question asks for an amount of elapsed time, or which event came earlier/later. Identify the two absolute dates from the context, compute the difference, and state the result explicitly (e.g. "2024-03-12 to 2024-06-20 = 100 days"). Compute strictly from dates present in the context; do not estimate. End with the exact value the question asks for."""
+
+_KU_MODIFIER = """
+
+KNOWLEDGE UPDATE: This question asks about the CURRENT state of something that may have changed.
+If the context shows multiple values for the same thing at different times, the MOST RECENT value
+is the correct answer. State the current value directly. If you can identify when it changed,
+mention the change briefly (e.g., "Previously X, now Y as of [date]")."""
+
+_MR_MODIFIER = """
+
+MULTI-HOP REASONING: This question requires combining information from multiple parts
+of the conversation. Look for connections between separate facts. If fact A says "X uses Y"
+and fact B says "Y requires Z", then the answer to "what does X require?" is Z.
+Chain the facts step by step."""
 
 
 def build_system_prompt(question: str) -> str:
@@ -82,4 +116,8 @@ def build_system_prompt(question: str) -> str:
         prompt += _ORDERING_MODIFIER
     if is_duration_query(question):
         prompt += _DURATION_MODIFIER
+    if is_knowledge_update_query(question):
+        prompt += _KU_MODIFIER
+    if is_multi_hop_query(question):
+        prompt += _MR_MODIFIER
     return prompt

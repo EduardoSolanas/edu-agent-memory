@@ -206,6 +206,12 @@ except Exception:
 import os
 import re
 
+# Negation pattern for FTS5 tagging -- detects negation sentences for search
+_NEG_RE = re.compile(
+    r'((?:^|[.!?]\s+)[^.!?]*\b(?:never|not|haven\'t|didn\'t|wasn\'t|don\'t|can\'t|won\'t|no longer|stopped)\b[^.!?]*)',
+    re.IGNORECASE | re.MULTILINE
+)
+
 # On Fly.io and other ephemeral VMs, only ~/.hermes is persisted.
 # Default to the legacy Hermes path so memories survive restarts.
 _DEFAULT_ROOT = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
@@ -500,7 +506,8 @@ def init_beam(db_path: Path = None):
             veracity TEXT DEFAULT 'unknown',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             occurred_at TEXT,
-            recorded_at TEXT
+            recorded_at TEXT,
+            message_index INTEGER
         )
     """)
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_wm_session ON working_memory(session_id)")
@@ -978,6 +985,9 @@ def init_beam(db_path: Path = None):
     _add_column_if_missing(conn, "episodic_memory", "corrected_by", "INTEGER DEFAULT NULL")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_wm_event_date ON working_memory(event_date)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_em_event_date ON episodic_memory(event_date)")
+
+    # --- Message index column for message threading (for future use) ---
+    _add_column_if_missing(conn, "working_memory", "message_index", "INTEGER")
 
 
 class _BeamConnection(sqlite3.Connection):
@@ -2398,7 +2408,8 @@ class BeamMemory:
                  extract: bool = False,
                  veracity: str = "unknown",
                  trust_tier: str = None,
-                 timestamp: str = None) -> str:
+                 timestamp: str = None,
+                 message_index: int = None) -> str:
         """Store into working_memory. Deduplicates exact content matches.
 
         When called from the legacy-compatible Mnemosyne.remember() path,
@@ -2531,14 +2542,26 @@ class BeamMemory:
         memory_id = memory_id or _generate_id(content)
         timestamp = datetime.now().isoformat()
         cursor = self.conn.cursor()
-        cursor.execute("""
-            INSERT INTO working_memory
-            (id, content, source, timestamp, session_id, importance, metadata_json, valid_until, scope,
-             author_id, author_type, channel_id, veracity, memory_type, trust_tier, occurred_at, recorded_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (memory_id, content, source, recorded_at, self.session_id, importance,
-              json.dumps(metadata or {}), valid_until, scope,
-              self.author_id, self.author_type, self.channel_id, veracity, memory_type, trust_tier, occurred_at, recorded_at))
+
+        # Build INSERT with optional message_index
+        if message_index is not None:
+            cursor.execute("""
+                INSERT INTO working_memory
+                (id, content, source, timestamp, session_id, importance, metadata_json, valid_until, scope,
+                 author_id, author_type, channel_id, veracity, memory_type, trust_tier, occurred_at, recorded_at, message_index)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (memory_id, content, source, recorded_at, self.session_id, importance,
+                  json.dumps(metadata or {}), valid_until, scope,
+                  self.author_id, self.author_type, self.channel_id, veracity, memory_type, trust_tier, occurred_at, recorded_at, message_index))
+        else:
+            cursor.execute("""
+                INSERT INTO working_memory
+                (id, content, source, timestamp, session_id, importance, metadata_json, valid_until, scope,
+                 author_id, author_type, channel_id, veracity, memory_type, trust_tier, occurred_at, recorded_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (memory_id, content, source, recorded_at, self.session_id, importance,
+                  json.dumps(metadata or {}), valid_until, scope,
+                  self.author_id, self.author_type, self.channel_id, veracity, memory_type, trust_tier, occurred_at, recorded_at))
         self.conn.commit()
         self._trim_working_memory()
 
@@ -2754,27 +2777,61 @@ class BeamMemory:
             meta_by_id[memory_id] = (item_source, item_veracity)
             item_recorded_at = item.get("recorded_at") or item.get("timestamp") or timestamp
             item_occurred_at = item.get("occurred_at") or parse_relative_date(item["content"], item_recorded_at) or item_recorded_at.split('T')[0]
-            cursor.execute("""
-                INSERT INTO working_memory (id, content, source, timestamp, session_id, importance, metadata_json,
-                author_id, author_type, channel_id, memory_type, veracity, trust_tier, occurred_at, recorded_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                memory_id,
-                item["content"],
-                item_source,
-                item_recorded_at,
-                self.session_id,
-                item.get("importance", 0.5),
-                json.dumps(item.get("metadata") or {}),
-                item.get("author_id", self.author_id),
-                item.get("author_type", self.author_type),
-                item.get("channel_id", self.channel_id),
-                item_type,
-                item_veracity,
-                trust_tier,
-                item_occurred_at,
-                item_recorded_at,
-            ))
+
+            # Negation tagging for FTS5 discoverability
+            content_to_store = item["content"]
+            neg_matches = _NEG_RE.findall(content_to_store)
+            if neg_matches:
+                for neg in neg_matches[:3]:
+                    content_to_store += f" [NEG] {neg.strip()}"
+
+            # Build INSERT with optional message_index
+            message_index = item.get("message_index")
+            if message_index is not None:
+                cursor.execute("""
+                    INSERT INTO working_memory (id, content, source, timestamp, session_id, importance, metadata_json,
+                    author_id, author_type, channel_id, memory_type, veracity, trust_tier, occurred_at, recorded_at, message_index)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    memory_id,
+                    content_to_store,
+                    item_source,
+                    item_recorded_at,
+                    self.session_id,
+                    item.get("importance", 0.5),
+                    json.dumps(item.get("metadata") or {}),
+                    item.get("author_id", self.author_id),
+                    item.get("author_type", self.author_type),
+                    item.get("channel_id", self.channel_id),
+                    item_type,
+                    item_veracity,
+                    trust_tier,
+                    item_occurred_at,
+                    item_recorded_at,
+                    message_index,
+                ))
+            else:
+                cursor.execute("""
+                    INSERT INTO working_memory (id, content, source, timestamp, session_id, importance, metadata_json,
+                    author_id, author_type, channel_id, memory_type, veracity, trust_tier, occurred_at, recorded_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    memory_id,
+                    content_to_store,
+                    item_source,
+                    item_recorded_at,
+                    self.session_id,
+                    item.get("importance", 0.5),
+                    json.dumps(item.get("metadata") or {}),
+                    item.get("author_id", self.author_id),
+                    item.get("author_type", self.author_type),
+                    item.get("channel_id", self.channel_id),
+                    item_type,
+                    item_veracity,
+                    trust_tier,
+                    item_occurred_at,
+                    item_recorded_at,
+                ))
         self.conn.commit()
         
         # Generate vector embeddings for working memory hybrid search.
@@ -4793,7 +4850,7 @@ class BeamMemory:
             placeholders = ",".join("?" * len(wm_ids))
             cursor = self.conn.cursor()
             cursor.execute(f"""
-                SELECT id, content, source, timestamp, importance, recall_count, last_recalled, valid_until, superseded_by, scope, author_id, author_type, channel_id, veracity, memory_type, occurred_at, recorded_at, occurred_at, recorded_at
+                SELECT id, content, source, timestamp, importance, recall_count, last_recalled, valid_until, superseded_by, scope, author_id, author_type, channel_id, veracity, memory_type, occurred_at, recorded_at, message_index
                 FROM working_memory
                 WHERE id IN ({placeholders})
                   AND {wm_where}
@@ -4803,7 +4860,7 @@ class BeamMemory:
             # Fallback: fetch recent items and score in Python (old path)
             cursor = self.conn.cursor()
             cursor.execute(f"""
-                SELECT id, content, source, timestamp, importance, recall_count, last_recalled, valid_until, superseded_by, scope, author_id, author_type, channel_id, veracity, memory_type, occurred_at, recorded_at, occurred_at, recorded_at
+                SELECT id, content, source, timestamp, importance, recall_count, last_recalled, valid_until, superseded_by, scope, author_id, author_type, channel_id, veracity, memory_type, occurred_at, recorded_at, message_index
                 FROM working_memory
                 WHERE {wm_where}
                 ORDER BY timestamp DESC
@@ -4904,8 +4961,7 @@ class BeamMemory:
                     "superseded_by": row["superseded_by"] if "superseded_by" in row.keys() else None,
                     "occurred_at": row["occurred_at"] if "occurred_at" in row.keys() else None,
                     "recorded_at": row["recorded_at"] if "recorded_at" in row.keys() else None,
-                    "occurred_at": row["occurred_at"] if "occurred_at" in row.keys() else None,
-                    "recorded_at": row["recorded_at"] if "recorded_at" in row.keys() else None
+                    "message_index": row["message_index"] if "message_index" in row.keys() else None
                 })
 
         if _wm_fallback_used and rows and _wm_fallback_kept == 0:
@@ -4921,7 +4977,7 @@ class BeamMemory:
             placeholders = ",".join("?" * len(entity_memory_ids))
             cursor = self.conn.cursor()
             cursor.execute(f"""
-                SELECT id, content, source, timestamp, importance, recall_count, last_recalled, valid_until, superseded_by, scope, author_id, author_type, channel_id, veracity, memory_type, occurred_at, recorded_at, occurred_at, recorded_at
+                SELECT id, content, source, timestamp, importance, recall_count, last_recalled, valid_until, superseded_by, scope, author_id, author_type, channel_id, veracity, memory_type, occurred_at, recorded_at, message_index
                 FROM working_memory
                 WHERE id IN ({placeholders})
                   AND {wm_where}

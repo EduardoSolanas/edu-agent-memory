@@ -121,8 +121,12 @@ class TestEdumemCore:
             assert "2024-03-05" in row["occurred_at"]
             
         finally:
+            beam.conn.close()
             if db_path.exists():
-                db_path.unlink()
+                try:
+                    db_path.unlink()
+                except PermissionError:
+                    pass
 
     def test_beam_memory_fts_query_sanitization(self):
         """Verify that BeamMemory query path protects FTS queries containing punctuation or quotes from crashing."""
@@ -142,8 +146,12 @@ class TestEdumemCore:
             assert len(results) > 0
             assert "rock climbing" in results[0]["content"]
         finally:
+            beam.conn.close()
             if db_path.exists():
-                db_path.unlink()
+                try:
+                    db_path.unlink()
+                except PermissionError:
+                    pass
 
     def test_beam_memory_sandbox_database_ttl_bypass(self):
         """Verify that database paths indicating a sandbox/test environment bypass working memory TTL pruning."""
@@ -168,8 +176,12 @@ class TestEdumemCore:
             count = cursor.fetchone()[0]
             assert count == 1, "Historical memory was incorrectly pruned in a sandbox/test database!"
         finally:
+            beam.conn.close()
             if db_path.exists():
-                db_path.unlink()
+                try:
+                    db_path.unlink()
+                except PermissionError:
+                    pass
 
     def test_beam_memory_thread_local_connection_syncing(self):
         """Verify that cached engines automatically synchronize database connections when the master handle changes."""
@@ -194,8 +206,12 @@ class TestEdumemCore:
             
             new_conn.close()
         finally:
+            beam.conn.close()
             if db_path.exists():
-                db_path.unlink()
+                try:
+                    db_path.unlink()
+                except PermissionError:
+                    pass
 
     def test_beam_memory_expanded_query_tokens_singular_plural(self):
         """Verify query-side expansion maps plural forms to singulars to bypass FTS limitations."""
@@ -252,3 +268,242 @@ class TestEdumemCore:
         finally:
             if db_path.exists():
                 db_path.unlink()
+
+
+class TestNegationTagging:
+    """Verify [NEG] tags are appended to content containing negation sentences during ingestion."""
+
+    def test_negation_tag_appended_on_remember_batch(self):
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
+            db_path = Path(tmp.name)
+        try:
+            beam = BeamMemory(db_path=db_path)
+            beam.remember_batch([
+                {"content": "I have never worked with Flask routes.", "source": "test", "importance": 0.5},
+            ])
+            row = beam.conn.execute("SELECT content FROM working_memory").fetchone()
+            assert "[NEG]" in row["content"]
+            assert "never worked with Flask" in row["content"]
+            beam.conn.close()
+        finally:
+            if db_path.exists():
+                try: db_path.unlink()
+                except PermissionError: pass
+
+    def test_no_negation_tag_on_positive_content(self):
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
+            db_path = Path(tmp.name)
+        try:
+            beam = BeamMemory(db_path=db_path)
+            beam.remember_batch([
+                {"content": "I love working with Flask routes.", "source": "test", "importance": 0.5},
+            ])
+            row = beam.conn.execute("SELECT content FROM working_memory").fetchone()
+            assert "[NEG]" not in row["content"]
+            beam.conn.close()
+        finally:
+            if db_path.exists():
+                try: db_path.unlink()
+                except PermissionError: pass
+
+    def test_negation_tag_found_by_fts(self):
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
+            db_path = Path(tmp.name)
+        try:
+            beam = BeamMemory(db_path=db_path)
+            beam.remember_batch([
+                {"content": "I have never used Docker in production.", "source": "test", "importance": 0.5},
+                {"content": "I deployed the app using Docker on staging.", "source": "test", "importance": 0.5},
+            ])
+            results = beam.recall("NEG Docker", top_k=5)
+            neg_results = [r for r in results if "[NEG]" in r.get("content", "")]
+            assert len(neg_results) >= 1
+            beam.conn.close()
+        finally:
+            if db_path.exists():
+                try: db_path.unlink()
+                except PermissionError: pass
+
+
+class TestMessageIndex:
+    """Verify message_index is stored during ingestion and returned during recall."""
+
+    def test_message_index_stored_in_remember_batch(self):
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
+            db_path = Path(tmp.name)
+        try:
+            beam = BeamMemory(db_path=db_path)
+            beam.remember_batch([
+                {"content": "First message about Python.", "source": "test", "importance": 0.5, "message_index": 0},
+                {"content": "Second message about Flask.", "source": "test", "importance": 0.5, "message_index": 1},
+                {"content": "Third message about Django.", "source": "test", "importance": 0.5, "message_index": 2},
+            ])
+            rows = beam.conn.execute("SELECT content, message_index FROM working_memory ORDER BY message_index").fetchall()
+            assert len(rows) == 3
+            assert rows[0]["message_index"] == 0
+            assert rows[1]["message_index"] == 1
+            assert rows[2]["message_index"] == 2
+            beam.conn.close()
+        finally:
+            if db_path.exists():
+                try: db_path.unlink()
+                except PermissionError: pass
+
+    def test_message_index_returned_in_recall(self):
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
+            db_path = Path(tmp.name)
+        try:
+            beam = BeamMemory(db_path=db_path)
+            beam.remember_batch([
+                {"content": "The API uses Flask framework.", "source": "test", "importance": 0.5, "message_index": 42},
+            ])
+            results = beam.recall("Flask", top_k=5)
+            assert len(results) > 0
+            assert results[0].get("message_index") == 42
+            beam.conn.close()
+        finally:
+            if db_path.exists():
+                try: db_path.unlink()
+                except PermissionError: pass
+
+    def test_message_index_none_when_not_provided(self):
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
+            db_path = Path(tmp.name)
+        try:
+            beam = BeamMemory(db_path=db_path)
+            beam.remember_batch([
+                {"content": "A regular message without index.", "source": "test", "importance": 0.5},
+            ])
+            row = beam.conn.execute("SELECT message_index FROM working_memory").fetchone()
+            assert row["message_index"] is None
+            beam.conn.close()
+        finally:
+            if db_path.exists():
+                try: db_path.unlink()
+                except PermissionError: pass
+
+    def test_remember_single_with_message_index(self):
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
+            db_path = Path(tmp.name)
+        try:
+            beam = BeamMemory(db_path=db_path)
+            beam.remember(content="A message with index.", source="test", message_index=99)
+            row = beam.conn.execute("SELECT message_index FROM working_memory").fetchone()
+            assert row["message_index"] == 99
+            beam.conn.close()
+        finally:
+            if db_path.exists():
+                try: db_path.unlink()
+                except PermissionError: pass
+
+
+class TestQueryModePrompts:
+    """Verify query_mode.py correctly detects question types and appends modifiers."""
+
+    def test_ordering_query_detected(self):
+        from edumem.core.query_mode import is_ordering_query, build_system_prompt
+        assert is_ordering_query("In what order did I discuss the features?")
+        assert is_ordering_query("Walk me through the sequence of events.")
+        assert not is_ordering_query("What is my favorite color?")
+
+    def test_duration_query_detected(self):
+        from edumem.core.query_mode import is_duration_query, build_system_prompt
+        assert is_duration_query("How many days between the start and the end?")
+        assert is_duration_query("How long did the sprint last?")
+        assert not is_duration_query("What framework do I use?")
+
+    def test_knowledge_update_query_detected(self):
+        from edumem.core.query_mode import is_knowledge_update_query, build_system_prompt
+        assert is_knowledge_update_query("What is the current version of the API?")
+        assert is_knowledge_update_query("What is the latest status of the deployment?")
+        assert is_knowledge_update_query("I switched to PostgreSQL, what am I now using?")
+        assert not is_knowledge_update_query("What framework do I use?")
+
+    def test_multi_hop_query_detected(self):
+        from edumem.core.query_mode import is_multi_hop_query, build_system_prompt
+        assert is_multi_hop_query("How is the API related to the database?")
+        assert is_multi_hop_query("What connects the auth module to the user table?")
+        assert not is_multi_hop_query("What is my favorite color?")
+
+    def test_ku_modifier_in_prompt(self):
+        from edumem.core.query_mode import build_system_prompt
+        prompt = build_system_prompt("What is the current version?")
+        assert "KNOWLEDGE UPDATE" in prompt
+        assert "MOST RECENT" in prompt
+
+    def test_mr_modifier_in_prompt(self):
+        from edumem.core.query_mode import build_system_prompt
+        prompt = build_system_prompt("How is X related to Y across sessions?")
+        assert "MULTI-HOP REASONING" in prompt
+        assert "Chain the facts" in prompt
+
+    def test_cr_conflict_in_base_prompt(self):
+        from edumem.core.query_mode import build_system_prompt
+        prompt = build_system_prompt("What is my name?")
+        assert "contradictory information" in prompt
+        assert "Do NOT silently pick one side" in prompt
+
+    def test_eo_ordering_modifier_mentions_message_index(self):
+        from edumem.core.query_mode import build_system_prompt
+        prompt = build_system_prompt("In what order did I discuss the topics?")
+        assert "FIRST MENTION" in prompt
+        assert "message index" in prompt
+
+    def test_no_modifiers_for_simple_question(self):
+        from edumem.core.query_mode import build_system_prompt
+        prompt = build_system_prompt("What is my favorite programming language?")
+        assert "ORDERING" not in prompt
+        assert "DURATION" not in prompt
+        assert "KNOWLEDGE UPDATE" not in prompt
+        assert "MULTI-HOP" not in prompt
+
+
+class TestNegationRecall:
+    """Verify that negation content is retrievable via SQL LIKE search for CR questions."""
+
+    def test_negation_content_found_via_like_search(self):
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
+            db_path = Path(tmp.name)
+        try:
+            beam = BeamMemory(db_path=db_path)
+            beam.remember_batch([
+                {"content": "I have never worked with Flask routes in any project.", "source": "test", "importance": 0.5},
+                {"content": "I implemented the Flask API endpoints last week.", "source": "test", "importance": 0.5},
+            ])
+            neg_rows = beam.conn.execute(
+                "SELECT id, content FROM working_memory "
+                "WHERE content LIKE ? AND content LIKE ?",
+                ("%Flask%", "%never%")
+            ).fetchall()
+            assert len(neg_rows) >= 1
+            assert "never" in neg_rows[0]["content"]
+            beam.conn.close()
+        finally:
+            if db_path.exists():
+                try: db_path.unlink()
+                except PermissionError: pass
+
+    def test_both_positive_and_negative_retrievable(self):
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
+            db_path = Path(tmp.name)
+        try:
+            beam = BeamMemory(db_path=db_path)
+            beam.remember_batch([
+                {"content": "I have never used Docker containers.", "source": "test", "importance": 0.5},
+                {"content": "I deployed the service using Docker on the staging server.", "source": "test", "importance": 0.5},
+            ])
+            positive = beam.conn.execute(
+                "SELECT content FROM working_memory WHERE content LIKE ? AND content NOT LIKE ?",
+                ("%Docker%", "%never%")
+            ).fetchall()
+            negative = beam.conn.execute(
+                "SELECT content FROM working_memory WHERE content LIKE ? AND content LIKE ?",
+                ("%Docker%", "%never%")
+            ).fetchall()
+            assert len(positive) >= 1
+            assert len(negative) >= 1
+            beam.conn.close()
+        finally:
+            if db_path.exists():
+                try: db_path.unlink()
+                except PermissionError: pass

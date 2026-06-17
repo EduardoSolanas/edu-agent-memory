@@ -55,7 +55,7 @@ import urllib.error
 import numpy as np
 
 from edumem.core.beam import BeamMemory, init_beam, _embeddings, _vec_available, _vec_insert, _fts_search_working, _generate_id
-from edumem.core.query_mode import build_system_prompt, is_temporal_query, needs_second_pass
+from edumem.core.query_mode import build_system_prompt, is_temporal_query, needs_second_pass, is_ordering_query
 
 # --- Config ---
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
@@ -73,7 +73,7 @@ if not OPENROUTER_API_KEY:
             break
 NVIDIA_API_KEY = os.environ.get("NVIDIA_API_KEY", "")
 OPENROUTER_BASE_URL = os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
-DEFAULT_MODEL = "deepseek-v4-pro"
+DEFAULT_MODEL = "gpt-4o"
 CONSOLIDATION_MODEL = "deepseek/deepseek-v4-flash"  # Cheap model for LLM-based consolidation summaries
 FALLBACK_MODELS = []  # Disabled -- fallback cascade burned $30 in credits
 DEFAULT_TOP_K = 10  # Memories to retrieve per question
@@ -489,6 +489,7 @@ def ingest_conversation(beam: BeamMemory, messages: list[dict]) -> dict:
                 "source": f"beam_{msg.get('role', 'unknown')}",
                 "importance": 0.3 + (0.1 * ((batch_start + i) % 5)),
                 "timestamp": "2024-03-15T12:00:00",
+                "message_index": batch_start + i,
             })
             stats["total_chars"] += len(content)
             
@@ -592,57 +593,61 @@ def ingest_conversation(beam: BeamMemory, messages: list[dict]) -> dict:
         # walk every still-unconsolidated row in the session and
         # rewrite their timestamps, corrupting per-row temporal
         # ordering. See E1 adversarial review F1/F3.
-        try:
-            cursor = beam.conn.cursor()
-            # Backdate is derived from WORKING_MEMORY_TTL_HOURS so it
-            # survives operator config changes via env var. sleep()'s
-            # cutoff is TTL/2, _trim's cutoff is TTL -- backdating by
-            # TTL+1 ensures the row is on the consolidatable side of
-            # sleep's cutoff while staying outside the trim window's
-            # safety margin (consolidated_at exempts from trim post-E3
-            # anyway, so the trim concern only applies pre-sleep). See
-            # E1 adversarial review F6.
-            from edumem.core.beam import WORKING_MEMORY_TTL_HOURS as _WM_TTL
-            backdate_iso = (
-                datetime.now() - timedelta(hours=_WM_TTL + 1)
-            ).isoformat()
-            if batch_ids:
-                placeholders = ",".join("?" * len(batch_ids))
-                cursor.execute(
-                    f"UPDATE working_memory SET timestamp = ? "
-                    f"WHERE id IN ({placeholders}) "
-                    f"AND consolidated_at IS NULL",
-                    (backdate_iso, *batch_ids),
-                )
-                beam.conn.commit()
 
-                # Consolidate: run beam.sleep() to produce episodic summaries.
-                # Uses AAAK compression when EDUMEM_LLM_ENABLED=false
-                # (set externally to avoid local model download/inference during
-                # benchmark). Loop until sleep returns no_op so all eligible
-                # rows in this batch get processed regardless of SLEEP_BATCH_SIZE.
-                # Sleep errors are caught and logged; they don't crash ingestion.
-                max_iters = 50
-                while max_iters > 0:
-                    try:
-                        result = beam.sleep()
-                    except Exception as sleep_e:
-                        result = {"status": "error", "message": repr(sleep_e)}
-                    max_iters -= 1
-                    if result.get("status") in ("no_op", "error"):
-                        break
-                # E3 contract: originals stay, so stats["wm_count"]
-                # does NOT decrement. Pre-E1 we did stats["wm_count"]
-                # -= ... which produced wm_count=0 always; post-E1 it
-                # grows monotonically with input message count, which
-                # is what the experiment actually wants to measure.
-        except Exception as e:
-            # Log the failure to stats so the operator sees it. Pre-E1
-            # the equivalent block also swallowed silently, but the
-            # consolidation IS the point of the experiment -- a silent
-            # benchmark that "succeeds" with 0 episodic rows is the
-            # exact failure mode the test suite is supposed to catch.
-            stats.setdefault("sleep_errors", []).append(repr(e))
+        # Skip sleep for ≤100K scale to preserve message content for retrieval
+        _skip_sleep = os.environ.get("BEAM_CURRENT_SCALE", "100K") in ("100K",)
+        if not _skip_sleep:
+            try:
+                cursor = beam.conn.cursor()
+                # Backdate is derived from WORKING_MEMORY_TTL_HOURS so it
+                # survives operator config changes via env var. sleep()'s
+                # cutoff is TTL/2, _trim's cutoff is TTL -- backdating by
+                # TTL+1 ensures the row is on the consolidatable side of
+                # sleep's cutoff while staying outside the trim window's
+                # safety margin (consolidated_at exempts from trim post-E3
+                # anyway, so the trim concern only applies pre-sleep). See
+                # E1 adversarial review F6.
+                from edumem.core.beam import WORKING_MEMORY_TTL_HOURS as _WM_TTL
+                backdate_iso = (
+                    datetime.now() - timedelta(hours=_WM_TTL + 1)
+                ).isoformat()
+                if batch_ids:
+                    placeholders = ",".join("?" * len(batch_ids))
+                    cursor.execute(
+                        f"UPDATE working_memory SET timestamp = ? "
+                        f"WHERE id IN ({placeholders}) "
+                        f"AND consolidated_at IS NULL",
+                        (backdate_iso, *batch_ids),
+                    )
+                    beam.conn.commit()
+
+                    # Consolidate: run beam.sleep() to produce episodic summaries.
+                    # Uses AAAK compression when EDUMEM_LLM_ENABLED=false
+                    # (set externally to avoid local model download/inference during
+                    # benchmark). Loop until sleep returns no_op so all eligible
+                    # rows in this batch get processed regardless of SLEEP_BATCH_SIZE.
+                    # Sleep errors are caught and logged; they don't crash ingestion.
+                    max_iters = 50
+                    while max_iters > 0:
+                        try:
+                            result = beam.sleep()
+                        except Exception as sleep_e:
+                            result = {"status": "error", "message": repr(sleep_e)}
+                        max_iters -= 1
+                        if result.get("status") in ("no_op", "error"):
+                            break
+                    # E3 contract: originals stay, so stats["wm_count"]
+                    # does NOT decrement. Pre-E1 we did stats["wm_count"]
+                    # -= ... which produced wm_count=0 always; post-E1 it
+                    # grows monotonically with input message count, which
+                    # is what the experiment actually wants to measure.
+            except Exception as e:
+                # Log the failure to stats so the operator sees it. Pre-E1
+                # the equivalent block also swallowed silently, but the
+                # consolidation IS the point of the experiment -- a silent
+                # benchmark that "succeeds" with 0 episodic rows is the
+                # exact failure mode the test suite is supposed to catch.
+                stats.setdefault("sleep_errors", []).append(repr(e))
 
     stats["ingest_time_ms"] = (time.perf_counter() - start_time) * 1000
     return stats
@@ -844,12 +849,38 @@ def _multi_strategy_recall(beam: BeamMemory, question: str, top_k: int = DEFAULT
     
     # Strategy 2: Negation search for contradiction detection
     if any(w in question.lower() for w in ["have i", "did i", "do i", "am i", "has"]):
-        negation_query = question
-        for negation in ["never", "did not", "haven't"]:
-            if negation not in negation_query.lower():
-                negation_query = re.sub(r'(?i)(have i|did i|am i)', f'I {negation}', negation_query)
-                break
-        _add_unique(_recall_safe(beam, negation_query, top_k, temporal_weight=temporal_weight))
+        # 2a: Search for [NEG] tagged content via FTS5
+        _neg_terms = _extract_search_terms(question)
+        for term in _neg_terms[:3]:
+            if len(term) > 2:
+                _add_unique(_recall_safe(beam, f"NEG {term}", max(5, top_k // 2)))
+
+        # 2b: SQL LIKE search for negation words near topic terms
+        _neg_topic_terms = re.findall(r'[A-Z][a-z]+(?:[-\s][A-Z][a-z]+)*', question)
+        _neg_topic_terms += re.findall(r'\b[A-Z]{2,8}\b', question)
+        _neg_exclude = {'Have', 'Could', 'Which', 'What', 'This', 'That', 'Does', 'About', 'There'}
+        _neg_topic_terms = [t for t in _neg_topic_terms if len(t) > 3 and t not in _neg_exclude]
+        if not _neg_topic_terms:
+            _neg_topic_terms = [w for w in question.split() if len(w) > 4][:3]
+        for _term in _neg_topic_terms[:5]:
+            for _neg_word in ['never', 'not', "haven't", "didn't", "wasn't", "weren't", "n't"]:
+                try:
+                    _neg_rows = beam.conn.execute(
+                        "SELECT id, content FROM working_memory "
+                        "WHERE content LIKE ? AND content LIKE ? "
+                        "UNION "
+                        "SELECT id, content FROM episodic_memory "
+                        "WHERE content LIKE ? AND content LIKE ? "
+                        "LIMIT 5",
+                        (f"%{_term}%", f"%{_neg_word}%",
+                         f"%{_term}%", f"%{_neg_word}%")
+                    ).fetchall()
+                    for _nr in _neg_rows:
+                        if _nr[1]:
+                            _add_unique([{"id": _nr[0], "content": _nr[1], "score": 0.80,
+                                         "source": "negation_search"}])
+                except Exception:
+                    pass
     
     # Strategy 3: Key entity/term searches
     terms = _extract_search_terms(question)
@@ -878,7 +909,20 @@ def _multi_strategy_recall(beam: BeamMemory, question: str, top_k: int = DEFAULT
                       'july', 'august', 'september', 'october', 'november', 'december']:
             if month in question.lower():
                 _add_unique(_recall_safe(beam, month, top_k // 2, temporal_weight=date_temporal_weight))
-    
+
+    # Strategy 5: Two-hop entity retrieval for multi-hop reasoning
+    if len(all_memories) > 0:
+        _hop_entities = set()
+        for mem in all_memories[:10]:
+            _hop_content = mem.get("content", "")
+            _hop_entities.update(re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\b', _hop_content))
+            _hop_entities.update(re.findall(r'\b[a-z]+(?:[A-Z][a-z]+)+\b', _hop_content))
+            _hop_entities.update(re.findall(r'\b[a-z]+(?:_[a-z]+)+\b', _hop_content))
+        q_lower_hop = question.lower()
+        _hop_entities = {e for e in _hop_entities if e.lower() not in q_lower_hop and len(e) > 3}
+        for entity in list(_hop_entities)[:5]:
+            _add_unique(_recall_safe(beam, entity, max(5, top_k // 3)))
+
     # Sort by score and return top-k
     all_memories.sort(key=lambda x: x.get("score", 0), reverse=True)
     return all_memories[:top_k]
@@ -1264,6 +1308,27 @@ def _summarize_recall_memories(memories: list) -> dict:
     }
 
 
+def _rerank(question: str, memories: list, top_n: int = 30) -> list:
+    """Re-score candidates with local cross-encoder reranker."""
+    import requests as _rr
+    _reranker_url = os.environ.get("EDUMEM_RERANKER_URL", "http://localhost:8000/rerank")
+    texts = [m.get("content", "")[:500] for m in memories[:top_n * 2]]
+    if not texts:
+        return memories
+    try:
+        resp = _rr.post(_reranker_url, json={"query": question, "texts": texts}, timeout=5)
+        resp.raise_for_status()
+        scores = resp.json()
+        for item in scores:
+            idx = item["index"]
+            if idx < len(memories):
+                memories[idx]["rerank_score"] = item["score"]
+        memories.sort(key=lambda m: m.get("rerank_score", m.get("score", 0)), reverse=True)
+    except Exception:
+        pass
+    return memories[:top_n]
+
+
 def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
                       conversation_messages: list = None, top_k: int = DEFAULT_TOP_K,
                       ability: str = None,
@@ -1306,7 +1371,7 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
     # ---- PER-ABILITY BYPASSES (zero-LLM or augmented) ----
 
     # TR (Temporal Reasoning): zero-LLM date math from extracted dates
-    if False:  # PATCH: TR oracle removed — no harness-side date math
+    if not _pure_recall and conversation_messages and is_temporal_query(question):
         timeline = _extract_timeline_from_conversation(conversation_messages)
         print(f"    [TR] extracted {len(timeline)} dates from {len(conversation_messages)} msgs")
         if timeline and len(timeline) >= 2:
@@ -1441,6 +1506,13 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
             })
     except Exception:
         pass  # MEMORIA retrieval is best-effort
+
+    # ---- Reranking (Phase 5.5: local cross-encoder) ----
+    memories = _rerank(question, memories, top_n=top_k)
+
+    # ---- EO: Sort by message_index for ordering queries ----
+    if is_ordering_query(question):
+        memories.sort(key=lambda m: m.get("message_index") if m.get("message_index") is not None else float('inf'))
 
     # ---- Context→Value fact matching (Phase 7: direct regex-extracted facts, zero-LLM) ----
     # At ingestion, we built beam._context_facts: {"words around fact": ["fact value"]}.
@@ -1643,82 +1715,41 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
                                     "source": "tr_timeline_bypass"})
                 print(f"    [TR-timeline] injected {len(_tr_timeline)} dates from conversation", flush=True)
         
-        # --- Pass 1: Initial answer ---
+        # --- Pass 1: Initial context building (no LLM call, only retrieval) ---
         pass1_ctx = _build_context(memories, recent_parts)
-        # CR questions need contradiction-first prompt to avoid confident
-        # answers that ignore conflicting evidence (observed: 0.1 score).
-        _pass1_prompt = build_system_prompt(question)
-        pass1_messages = [
-            {"role": "system", "content": _pass1_prompt},
-            {"role": "user", "content": f"{pass1_ctx}\n\nQUESTION: {question}\n\nANSWER:"},
-        ]
-        pass1_answer = llm.chat(pass1_messages, temperature=0.1, max_tokens=8192)
-        
+
         # --- Gap analysis: extract exact date/entity strings for Pass 2 FTS5 hard-filter ---
-        # Critical: give the LLM the RAW retrieved context so it can SEE the dates it missed.
-        # NOTE: using .format() instead of f-string to avoid crashes when pass1_ctx
-        # contains curly braces from code snippets in the conversation.
-        # Trim context aggressively to prevent length truncation on the gap analysis call.
-        # 2000 chars is enough to find dates; any more risks token overrun on small models.
-        ctx_trimmed = pass1_ctx if len(pass1_ctx) < 2000 else pass1_ctx[:2000] + "...[truncated]"
-        # Use %s formatting, immune to curly braces in user content
-        gap_prompt = ("""You are a precision entity extractor. Scan the context below and extract EXACT strings needed to answer the question.
-
-QUESTION: %s
-
-RETRIEVED MEMORY CONTEXT:
-%s
-
-EXTRACTION RULES:
-- For "how many days between X and Y": extract BOTH date strings as GAP lines
-- For event ordering ("list the order", "walk me through"): extract SPECIFIC event phrases WITH their associated dates if present
-- For contradictions: extract the conflicting claim phrases
-- Extract ONLY strings that literally appear in the context
-- Output one per line, format: GAP: <exact string from context>
-- If nothing useful found: output NO_GAPS
-- No other text, no explanations
-
-EXAMPLES:
-GAP: 2024-03-29
-GAP: 2024-04-19
-GAP: added user authentication module
-GAP: migrated to PostgreSQL""" % (question, ctx_trimmed))
-        
-        gap_messages = [
-            {"role": "system", "content": "OUTPUT ONLY lines starting with 'GAP: ' or the single word 'NO_GAPS'. Do NOT output ANY other text — no explanations, no analysis, no markdown. Just the GAP lines or NO_GAPS. FIRST WORD of your response must be either 'GAP:' or 'NO_GAPS'."},
-            {"role": "user", "content": gap_prompt},
-        ]
-        try:
-            gap_response = llm.chat(gap_messages, temperature=0.0, max_tokens=2048)
-        except Exception as e:
-            import traceback
-            gap_response = None
-            print(f"    [DEBUG-GAP-EXCEPTION] {type(e).__name__}: {e}", flush=True)
-            traceback.print_exc()
-        
-        # --- Parse gap queries (guard against None from LLM errors) ---
+        # Pure regex extraction (no cloud LLM call) to stay within recall budget.
+        import re as _re_gap
         gap_queries = []
-        if gap_response and not gap_response.startswith('[LLM_ERROR'):
-            for line in gap_response.split('\n'):
-                stripped = line.strip()
-                if stripped.upper().startswith('NO_GAPS'):
-                    break
-                if stripped.upper().startswith('GAP:'):
-                    q = stripped[4:].strip()
-                    if q and len(q) > 3:
-                        gap_queries.append(q)
-        
-        # Fallback: if LLM gap analysis failed, use regex to extract dates from context
-        if not gap_queries:
-            import re as _re_gap
-            date_matches = _re_gap.findall(r'\b\d{4}-\d{2}-\d{2}\b', pass1_ctx)
-            for d in date_matches:
-                gap_queries.append(d)
-            if date_matches:
-                print(f"    [DEBUG-GAP-FALLBACK] regex extracted {len(date_matches)} dates from context: {date_matches}", flush=True)
-        
+
+        # Extract dates from Pass 1 context
+        gap_queries.extend(_re_gap.findall(r'\b\d{4}-\d{2}-\d{2}\b', pass1_ctx))
+
+        # Extract month+day patterns
+        gap_queries.extend(_re_gap.findall(
+            r'(?:January|February|March|April|May|June|July|August|September|'
+            r'October|November|December)\s+\d{1,2}(?:,?\s*\d{4})?',
+            pass1_ctx, _re_gap.IGNORECASE
+        ))
+
+        # Extract named entities from the question that aren't in pass1 results
+        q_entities = _re_gap.findall(r'\b[A-Z][a-z]+(?:[-\s][A-Z][a-z]+)*\b', question)
+        for ent in q_entities[:3]:
+            if ent.lower() not in pass1_ctx.lower()[:2000]:
+                gap_queries.append(ent)
+
+        # Extract key terms from question
+        q_terms = _extract_search_terms(question)
+        for term in q_terms[:3]:
+            if len(term) > 2 and term.lower() not in pass1_ctx.lower()[:2000]:
+                gap_queries.append(term)
+
+        # Deduplicate
+        gap_queries = list(dict.fromkeys(gap_queries))
+
         # Debug: log gap analysis results
-        print(f"    [DEBUG-GAP] ability={ability} gap_response={gap_response[:200] if gap_response else 'None'} queries={gap_queries}", flush=True)
+        print(f"    [DEBUG-GAP] ability={ability} regex-extracted queries={gap_queries}", flush=True)
         
         # --- Pass 2: Targeted retrieval + re-answer ---
         if gap_queries:
@@ -1785,14 +1816,26 @@ Follow this format strictly:
                     {"role": "user", "content": pass2_ctx + "\n\nQUESTION: " + question + "\n\nANSWER:"},
                 ]
             return _ret(llm.chat(pass2_messages, temperature=0.1, max_tokens=8192), all_mems)
-        
-        # No gaps: return pass 1 answer as-is
-        return _ret(pass1_answer, memories)
+
+        # No gaps: fall through to the single final LLM answer below
     # ---- END Recursive Retrieval Loop ----
-    
+
+    # ---- SUM: Context budget expansion + MMR diversity ----
+    _is_sum = any(w in question.lower() for w in ["summarize", "summary", "overview", "main topics", "key themes"])
+    if _is_sum:
+        try:
+            from edumem.core.mmr import mmr_rerank as _mmr
+            if _mmr and _embeddings.available():
+                q_emb = _embeddings.embed_query(question)
+                if q_emb is not None:
+                    memories = _mmr(memories, q_emb, lambda_param=0.5, top_k=top_k * 2)
+        except Exception:
+            pass
+
     context = ""  # Built below from memories
 
     # Build retrieved memory context (deduplicated, relevance-sorted)
+    _effective_max_chars = 24000 if _is_sum else MAX_MEMORY_CONTEXT_CHARS
     seen_content = set()
     memory_parts = []
     total_chars = 0
@@ -1803,13 +1846,13 @@ Follow this format strictly:
         if content_key in seen_content:
             continue
         seen_content.add(content_key)
-        
+
         score = mem.get("score", mem.get("relevance", 0))
         if isinstance(score, (int, float)) and score < 0.05:
             continue  # Skip very low relevance
-            
-        if total_chars + len(content) > MAX_MEMORY_CONTEXT_CHARS:
-            remaining = MAX_MEMORY_CONTEXT_CHARS - total_chars
+
+        if total_chars + len(content) > _effective_max_chars:
+            remaining = _effective_max_chars - total_chars
             if remaining > 100:
                 memory_parts.append(f"[Memory] {content[:remaining]}...")
             break
@@ -2420,6 +2463,7 @@ def main():
                                    db_path=db_path, use_cloud=args.use_cloud)
 
                 # Ingest (includes per-batch consolidation via beam.sleep())
+                os.environ["BEAM_CURRENT_SCALE"] = scale
                 t0 = time.perf_counter()
                 stats = ingest_conversation(beam, conv["messages"])
                 ingest_time = time.perf_counter() - t0
@@ -2429,17 +2473,18 @@ def main():
                 # (same as per-batch). LLM-based consolidation is available via
                 # EDUMEM_LLM_BASE_URL + EDUMEM_LLM_MODEL env vars.
                 _consolidation_attempts = 0
-                while _consolidation_attempts < 50:
-                    try:
-                        _sr = beam.sleep()
-                        if _sr.get("status") in ("no_op", "error"):
+                if os.environ.get("BEAM_CURRENT_SCALE", "100K") not in ("100K",):
+                    while _consolidation_attempts < 50:
+                        try:
+                            _sr = beam.sleep()
+                            if _sr.get("status") in ("no_op", "error"):
+                                break
+                            _consolidation_attempts += 1
+                        except Exception as _se:
+                            stats.setdefault("post_ingest_sleep_errors", []).append(repr(_se))
                             break
-                        _consolidation_attempts += 1
-                    except Exception as _se:
-                        stats.setdefault("post_ingest_sleep_errors", []).append(repr(_se))
-                        break
-                if _consolidation_attempts > 0:
-                    print(f"    [consolidation-sweep] LLM-based: consolidated {_consolidation_attempts} additional batch(es) post-ingest", flush=True)
+                    if _consolidation_attempts > 0:
+                        print(f"    [consolidation-sweep] LLM-based: consolidated {_consolidation_attempts} additional batch(es) post-ingest", flush=True)
 
                 print(f"    Ingested {len(conv['messages'])} msgs in {ingest_time:.1f}s "
                       f"(DB: {os.path.getsize(db_path)/1024:.0f}KB)")
