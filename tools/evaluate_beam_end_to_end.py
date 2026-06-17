@@ -2193,6 +2193,52 @@ Return ONLY this JSON:
 Where scores[i] corresponds to rubric[i], and overall_score is the average."""
 
 
+def _clean_judge_json(raw: str) -> str:
+    """Normalize an LLM judge response into clean JSON for the official grader.
+
+    Judge models (esp. gpt-4o) wrap their JSON in ```json fences or prepend
+    assessment prose. The official compute_metrics grader parses strictly, so any
+    non-pristine payload silently scores 0. This strips markdown fences, isolates
+    the JSON payload from surrounding chatter, repairs it, and unwraps a single-
+    element list to the inner dict. Conservative: if nothing parses, return the
+    original string unchanged (never make a parseable response worse).
+    """
+    if not raw or not raw.strip():
+        return raw
+    import re as _re_j
+    import json as _json_j
+    text = raw.strip()
+    # 1) Strip a leading ```json / ``` fence and trailing ``` if present.
+    fence = _re_j.match(r'^```(?:json)?\s*(.*?)\s*```$', text, _re_j.DOTALL)
+    if fence:
+        text = fence.group(1).strip()
+    # 2) Isolate the JSON payload from surrounding prose: first '{' or '[' to the
+    #    last matching '}' or ']'. Pick whichever bracket type appears first.
+    obj_start = text.find('{')
+    arr_start = text.find('[')
+    candidates = [p for p in (obj_start, arr_start) if p != -1]
+    if candidates:
+        start = min(candidates)
+        end = max(text.rfind('}'), text.rfind(']'))
+        if end > start:
+            text = text[start:end + 1]
+    # 3) Parse. Try plain json first (fence-strip + isolation usually suffices),
+    #    then json_repair if available, else fall back to the original raw string.
+    parsed = None
+    try:
+        parsed = _json_j.loads(text)
+    except Exception:
+        try:
+            from json_repair import repair_json
+            parsed = _json_j.loads(repair_json(text))
+        except Exception:
+            return raw
+    # 4) Unwrap a single-element list of one score dict -> the inner dict.
+    if isinstance(parsed, list) and len(parsed) == 1 and isinstance(parsed[0], dict) and "score" in parsed[0]:
+        parsed = parsed[0]
+    return _json_j.dumps(parsed)
+
+
 def judge_with_rubrics(llm: LLMClient, question: str, rubric: list, ai_answer: str, ability: str = None) -> dict:
     """Judge an AI answer against pre-written BEAM rubric items using the official BEAM grader."""
     if not rubric:
@@ -2242,15 +2288,9 @@ def judge_with_rubrics(llm: LLMClient, question: str, rubric: list, ai_answer: s
                     messages = [{"role": "user", "content": prompt}]
                 res = self.client.chat(messages, temperature=0.0, max_tokens=1024)
                 if res:
-                    try:
-                        import json
-                        from json_repair import repair_json
-                        repaired = repair_json(res)
-                        parsed = json.loads(repaired)
-                        if isinstance(parsed, list) and len(parsed) == 1 and isinstance(parsed[0], dict) and "score" in parsed[0]:
-                            res = json.dumps(parsed[0])
-                    except Exception:
-                        pass
+                    # Harden against markdown-fenced / prose-wrapped judge output
+                    # that would otherwise reach the strict grader raw and score 0.
+                    res = _clean_judge_json(res)
                 class Response:
                     def __init__(self, content):
                         self.content = content

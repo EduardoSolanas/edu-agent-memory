@@ -834,6 +834,53 @@ class TestTRTrustGuard:
         assert _tr_python_answer_is_trustworthy(None, timeline_size=3) is False
 
 
+class TestJudgeJsonCleaning:
+    """Verify the judge-output cleaner survives markdown fences and prose chatter."""
+
+    def _score(self, cleaned):
+        return json.loads(cleaned)
+
+    def test_pristine_json_unchanged(self):
+        from tools.evaluate_beam_end_to_end import _clean_judge_json
+        out = self._score(_clean_judge_json('{"score": 1.0}'))
+        assert out["score"] == 1.0
+
+    def test_markdown_fenced_json(self):
+        from tools.evaluate_beam_end_to_end import _clean_judge_json
+        raw = '```json\n{"score": 1.0}\n```'
+        out = self._score(_clean_judge_json(raw))
+        assert out["score"] == 1.0
+
+    def test_prose_prefix_then_json(self):
+        from tools.evaluate_beam_end_to_end import _clean_judge_json
+        raw = 'The answer fully matches the rubric item. {"score": 1.0}'
+        out = self._score(_clean_judge_json(raw))
+        assert out["score"] == 1.0
+
+    def test_single_element_list_unwrapped(self):
+        from tools.evaluate_beam_end_to_end import _clean_judge_json
+        raw = '[{"score": 0.5}]'
+        out = self._score(_clean_judge_json(raw))
+        assert isinstance(out, dict)
+        assert out["score"] == 0.5
+
+    def test_scores_array_preserved(self):
+        from tools.evaluate_beam_end_to_end import _clean_judge_json
+        raw = '```json\n{"scores": [1.0, 0.5], "overall_score": 0.75}\n```'
+        out = self._score(_clean_judge_json(raw))
+        assert out["scores"] == [1.0, 0.5]
+        assert out["overall_score"] == 0.75
+
+    def test_unparseable_returns_original(self):
+        from tools.evaluate_beam_end_to_end import _clean_judge_json
+        raw = "I cannot produce a score."
+        assert _clean_judge_json(raw) == raw
+
+    def test_empty_returns_original(self):
+        from tools.evaluate_beam_end_to_end import _clean_judge_json
+        assert _clean_judge_json("") == ""
+
+
 class TestPass2Routing:
     """Verify Pass-2 prompt routing: only duration questions get the calculator prompt."""
 
