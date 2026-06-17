@@ -652,91 +652,6 @@ def ingest_conversation(beam: BeamMemory, messages: list[dict]) -> dict:
 #  LLM Answering with edumem Memory
 # ============================================================
 
-ANSWER_SYSTEM_PROMPT = """You are a precise memory assistant answering questions about past conversations. You receive conversation context that may contain the answer.
-
-CRITICAL: Think step-by-step before answering. Follow this structure:
-
-STEP 1 - RELEVANT FACTS: List all specific facts from the context that relate to the question (dates, numbers, names, events, statements).
-STEP 2 - CONTRADICTIONS: If the context contains conflicting statements about the same topic, identify BOTH sides explicitly. For factual values that have changed over time (e.g., a metric or deadline that was updated), the LATEST value is the correct one. The context may show "was: OLD -> NEW" or "evolved: A -> B -> C" — use the final (latest) value.
-STEP 3 - TEMPORAL/CALCULATIONS: For date/time questions, extract all relevant dates and compute the answer.
-STEP 4 - ANSWER: Provide a thorough final answer with all relevant details from the context.
-
-RULES:
-- For EVENT ORDERING: list items in chronological order as they appear.
-- For CONTRADICTION: explicitly state "The conversation contains contradictory information: [A] vs [B]"
-- For FACTS THAT CHANGED OVER TIME: the LATEST value is the answer. If the context shows "(was: OLD, updated at msg_idx N)" or "evolved: A -> B -> C", report the final value.
-- For SUMMARIZATION: include all key details -- project stages, features, timelines, security, database, challenges.
-- NEVER say "I don't have enough information" unless absolutely nothing in the context mentions the topic.
-- For "how many" questions, provide the specific count, not a range."""
-
-# CR-specific prompt: Contradiction Resolution questions MUST detect conflicting
-# statements before answering. The generic prompt produced confident answers
-# that ignored contradictions (observed: 0.1 rubric score vs correct content).
-CR_SYSTEM_PROMPT = """You are a contradiction detector. Your ONLY job is to find conflicting statements in the retrieved memories.
-
-SCAN FOR:
-- A user statement that directly contradicts another user statement
-- A claim made then later reversed or denied
-- "I have never X" followed by evidence of doing X
-- "I have not Y" followed by "I implemented Y"
-- **SPECIAL MARKERS in the context**:
-  - `[Negation] user said never/not: ...` — these are EXACT contradiction statements. If you see one for the topic in the question, it IS a contradiction.
-  - `[MEMORIA ...]` blocks — structured fact extractions that include stored negations
-  - `[CR-detect]` blocks — these are pre-identified contradictions injected above the context
-
-CRITICAL: Carefully compare all user statements in the retrieved memories. If the user explicitly states they have never done something (e.g., "I have never...", "I have not..."), but another retrieved memory shows evidence of them doing it, you MUST flag it as a contradiction. Base your decision strictly on the semantic meaning of the text.
-
-OUTPUT FORMAT (strictly follow):
-STEP 1 - SCAN: List EVERY statement by the user about the topic in the question. Include BOTH positive claims and negations. If [Negation] markers exist, include them explicitly.
-STEP 2 - CONTRADICTIONS: For each pair of conflicting statements, state: "The user said [A] but also said [B]."
-STEP 3 - RESOLUTION: If contradictions exist, your ENTIRE answer must call them out. Do NOT give a simple yes/no.
-  Format: "I notice you've mentioned contradictory information about this. You said [negation], but you also mentioned [positive claim]. Could you clarify which is correct?"
-Step 3 - ANSWER: Only if NO contradictions found, give a direct answer.
-
-CRITICAL: Your final answer must lead with the contradiction if one exists. Never resolve ambiguity by picking the majority evidence."""
-
-# ABS-specific prompt: Abstention questions MUST withhold answer when
-# the topic is not found in the conversation. The generic prompt's
-# "NEVER say I don't have enough information" causes the LLM to
-# confabulate answers for topics outside the conversation.
-ABS_SYSTEM_PROMPT = """You are a precise memory assistant answering questions about past conversations.
-
-CRITICAL: Your FIRST job is to determine if the question asks about something that IS in the conversation.
-- If the question asks about a topic, event, or detail that does NOT appear in the provided context, your answer MUST be: "This information is not present in the conversation."
-- If the question asks for background information about a person that was never discussed, your answer MUST be: "This information is not present in the conversation."
-- Only provide a detailed answer if the EXACT topic of the question is found in the conversation context.
-
-Think step-by-step:
-STEP 1 - RELEVANCE CHECK: Is the EXACT topic of the question present in the context?
-STEP 2 - If NOT present: answer "This information is not present in the conversation."
-STEP 3 - If present: list relevant facts and answer the question directly."""
-
-# EO-specific prompt: Event Ordering MUST produce a chronological numbered list.
-# The BEAM judge expects explicit ordering markers, not narrative prose.
-# CRITICAL: The model tends to output narrative format; the JSON ultimatum
-# comes FIRST and the response MUST start with "{" to pass judge checks.
-EO_SYSTEM_PROMPT = """You are an Event Ordering specialist. Order the events chronologically based on the provided facts. CRITICAL: Order them by the real-world conversational turn (e.g. [Event at turn X]) when the topic was actually discussed in the chat, NOT by any internal project plan dates, deadlines, or timelines mentioned in the text. Respond with a natural language numbered list. Do NOT output JSON. Respond directly and concisely."""
-
-KU_SYSTEM_PROMPT = """You are a Knowledge Understanding specialist. Synthesize the user's knowledge, background, and facts. Respond accurately based on the provided context."""
-
-# PF-specific prompt: Preference Following MUST track evolving user tastes.
-PF_SYSTEM_PROMPT = """You are a Preference Following specialist. Identify the user's preferences, likes, dislikes, and how they evolved over time.
-
-SCAN THE CONTEXT FOR:
-- "I like/love/prefer X" statements
-- "I hate/don't like/dislike X" statements
-- "Switched to" / "moved to" / "changed to" evolution markers
-- Tool/taste preferences that changed over time
-
-OUTPUT:
-Think step by step. If you find relevant preferences:
-1. List each preference with the user's exact wording and which message
-2. Show the evolution if available ("was: X -> now: Y")
-3. Identify the current (latest) preference
-4. Answer the question directly
-
-If NO preferences about the topic exist: say you have no preference information about this topic.
-"""
 
 def normalize_for_judge(raw_answer: str, ability: str = None) -> str:
     """Convert JSON specialist output into judge-friendly bullet list."""
@@ -1920,10 +1835,8 @@ Follow this format strictly:
     if _cr_context:
         _cr_prefix_ret = f"\n\n{_cr_context}\n\n"
 
-    # Use ability-specific prompt for KU (JSON updates format expected by judge).
-    # Non-recursive path: KU, IE, MR, SUM, ABS all share this block.
-    # KU_SYSTEM_PROMPT produces JSON {updates: [...]} while ANSWER_SYSTEM_PROMPT
-    # produces free-form text the judge can't evaluate correctly.
+    # All queries use build_system_prompt() dynamically, which appends
+    # light format modifiers to an always-on base prompt for EO/TR queries.
     _prompt = build_system_prompt(question)
     messages = [
         {"role": "system", "content": _prompt},
