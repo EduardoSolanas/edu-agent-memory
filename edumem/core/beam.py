@@ -2752,15 +2752,17 @@ class BeamMemory:
                 item_veracity = default_veracity
             item_source = item.get("source", "conversation")
             meta_by_id[memory_id] = (item_source, item_veracity)
+            item_recorded_at = item.get("recorded_at") or item.get("timestamp") or timestamp
+            item_occurred_at = item.get("occurred_at") or parse_relative_date(item["content"], item_recorded_at) or item_recorded_at.split('T')[0]
             cursor.execute("""
                 INSERT INTO working_memory (id, content, source, timestamp, session_id, importance, metadata_json,
-                author_id, author_type, channel_id, memory_type, veracity, trust_tier)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                author_id, author_type, channel_id, memory_type, veracity, trust_tier, occurred_at, recorded_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 memory_id,
                 item["content"],
                 item_source,
-                timestamp,
+                item_recorded_at,
                 self.session_id,
                 item.get("importance", 0.5),
                 json.dumps(item.get("metadata") or {}),
@@ -2770,6 +2772,8 @@ class BeamMemory:
                 item_type,
                 item_veracity,
                 trust_tier,
+                item_occurred_at,
+                item_recorded_at,
             ))
         self.conn.commit()
         
@@ -3528,15 +3532,36 @@ class BeamMemory:
         # Strip closed <think>...</think> blocks that some LLMs emit
         import re as _re
         summary = _re.sub(r"<think>.*?</think>", "", summary, flags=_re.DOTALL).strip()
+        # Extract occurred_at and recorded_at from source working memories
         cursor = self.conn.cursor()
+        source_dates = []
+        if source_wm_ids:
+            placeholders = ",".join(["?"] * len(source_wm_ids))
+            cursor.execute(f"SELECT occurred_at, recorded_at FROM working_memory WHERE id IN ({placeholders})", source_wm_ids)
+            source_dates = cursor.fetchall()
+        
+        # Determine consolidated occurred_at and recorded_at
+        ep_occurred_at = None
+        ep_recorded_at = None
+        for row in source_dates:
+            occ, rec = row[0], row[1]
+            if occ and (not ep_occurred_at or occ < ep_occurred_at):
+                ep_occurred_at = occ
+            if rec and (not ep_recorded_at or rec < ep_recorded_at):
+                ep_recorded_at = rec
+                
+        # Fallbacks if source rows don't have them
+        ep_recorded_at = ep_recorded_at or timestamp
+        ep_occurred_at = ep_occurred_at or parse_relative_date(summary, ep_recorded_at) or ep_recorded_at.split('T')[0]
+
         cursor.execute("""
             INSERT INTO episodic_memory
             (id, content, source, timestamp, session_id, importance, metadata_json, summary_of, valid_until, scope,
-             author_id, author_type, channel_id, memory_type, veracity)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (memory_id, _sanitize_utf8(summary), source, timestamp, self.session_id, importance,
+             author_id, author_type, channel_id, memory_type, veracity, occurred_at, recorded_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (memory_id, _sanitize_utf8(summary), source, ep_recorded_at, self.session_id, importance,
               json.dumps(metadata or {}), ",".join(source_wm_ids), valid_until, scope,
-              self.author_id, self.author_type, self.channel_id, ep_type, row_veracity))
+              self.author_id, self.author_type, self.channel_id, ep_type, row_veracity, ep_occurred_at, ep_recorded_at))
         rowid = cursor.lastrowid
 
         if _embeddings.available():

@@ -55,6 +55,7 @@ import urllib.error
 import numpy as np
 
 from edumem.core.beam import BeamMemory, init_beam, _embeddings, _vec_available, _vec_insert, _fts_search_working, _generate_id
+from edumem.core.query_mode import build_system_prompt, is_temporal_query, needs_second_pass
 
 # --- Config ---
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
@@ -487,6 +488,7 @@ def ingest_conversation(beam: BeamMemory, messages: list[dict]) -> dict:
                 "content": content,
                 "source": f"beam_{msg.get('role', 'unknown')}",
                 "importance": 0.3 + (0.1 * ((batch_start + i) % 5)),
+                "timestamp": "2024-03-15T12:00:00",
             })
             stats["total_chars"] += len(content)
             
@@ -919,7 +921,7 @@ def _multi_strategy_recall(beam: BeamMemory, question: str, top_k: int = DEFAULT
                          'august', 'september', 'october', 'november', 'december',
                          'monday', 'tuesday', 'wednesday', 'thursday', 'friday',
                          'how many days', 'how long', 'timeline', 'schedule']
-    is_temporal = ability in ('TR', 'EO') or any(w in question.lower() for w in temporal_keywords)
+    is_temporal = is_temporal_query(question) or any(w in question.lower() for w in temporal_keywords)
     temporal_weight = 0.3 if is_temporal else 0.0
     
     # Strategy 1: Direct question search (mostly keyword via FTS5)
@@ -1389,7 +1391,7 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
     # ---- PER-ABILITY BYPASSES (zero-LLM or augmented) ----
 
     # TR (Temporal Reasoning): zero-LLM date math from extracted dates
-    if not _pure_recall and ability == 'TR' and conversation_messages:
+    if False:  # PATCH: TR oracle removed — no harness-side date math
         timeline = _extract_timeline_from_conversation(conversation_messages)
         print(f"    [TR] extracted {len(timeline)} dates from {len(conversation_messages)} msgs")
         if timeline and len(timeline) >= 2:
@@ -1427,14 +1429,7 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
         else:
             print(f"    [TR] no timeline extracted or too few dates")
     
-    # CR (Contradiction Resolution): detect contradictory statements
-    _cr_context = None
-    if ability == 'CR' and conversation_messages:
-        _cr_context = _detect_contradictions(conversation_messages, question)
-        if _cr_context:
-            print(f"    [CR-detect] FOUND contradictions, injecting context ({len(_cr_context)} chars)")
-        else:
-            print(f"    [CR-detect] no contradictions found")
+    _cr_context = None  # PATCH: CR injection removed — contradictions handled generically by CONSOLIDATED_SYSTEM_PROMPT step 2
     # ---- END PER-ABILITY BYPASSES ----
     
     # FULL-CONTEXT MODE: send the entire conversation to the LLM, bypassing edumem retrieval.
@@ -1501,7 +1496,7 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
             _cr_prefix = f"\n\n{_cr_context}\n\n"
         
         messages = [
-            {"role": "system", "content": EO_SYSTEM_PROMPT if ability == "EO" else KU_SYSTEM_PROMPT if ability == "KU" else IF_SYSTEM_PROMPT if ability == "IF" else PF_SYSTEM_PROMPT if ability == "PF" else ABS_SYSTEM_PROMPT if ability == "ABS" else CR_SYSTEM_PROMPT if ability == "CR" else ANSWER_SYSTEM_PROMPT},
+            {"role": "system", "content": build_system_prompt(question)},
             {"role": "user", "content": f"{_cr_prefix}{context}\n\nQUESTION: {question}\n\nANSWER:"},
         ]
         return _ret(llm.chat(messages, temperature=0.1, max_tokens=2048))
@@ -1512,7 +1507,7 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
     # This benchmark exists to measure MEMORY performance, not LLM reading comprehension.
     
     # Multi-strategy retrieval
-    memories = _multi_strategy_recall(beam, question, top_k * 3, ability=ability)  # Get 3x more for reranking
+    memories = _multi_strategy_recall(beam, question, top_k * 3, ability=None)  # PATCH: label-free recall
 
     # ---- MEMORIA: Structured Fact Retrieval (Phase 2) ----
     # Supplement recall with structured facts from memoria_facts, memoria_timelines,
@@ -1520,7 +1515,7 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
     # may miss (dates, metrics, versions, negations, sequences, entity mappings).
     # Injected as synthetic high-score entries so they surface ahead of fuzzy matches.
     try:
-        _memoria_result = beam.memoria_retrieve(question, ability=ability, top_k=top_k)
+        _memoria_result = beam.memoria_retrieve(question, ability=None, top_k=top_k)
         if _memoria_result and _memoria_result.get("source") != "fallback" and _memoria_result.get("context"):
             _memoria_facts = _memoria_result.get("facts", [])
             print(f"    [MEMORIA] {_memoria_result['source']} hit for ability={ability}: {len(_memoria_facts)} facts", flush=True)
@@ -1636,7 +1631,7 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
     # Pass 1: answer with current context -> Pass 2: gap analysis + targeted re-retrieval + re-answer.
     _RECURSIVE_ABILITIES = {'TR', 'EO', 'CR'}
     
-    if ability in _RECURSIVE_ABILITIES:
+    if needs_second_pass(question):
         # --- Helper: build context string from memory list ---
         def _build_context(mems, recents):
             ctx_blocks = []
@@ -1672,7 +1667,7 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
         # statements because "never"/"not"/"haven't" are stop-words or
         # don't co-occur with query terms in the same FTS5 token window.
         # LIKE-based exact substring search catches what FTS5 misses.
-        if ability == 'CR':
+        if "contradict" in question.lower() or "conflict" in question.lower() or any(w in question.lower() for w in ["have i", "did i", "do i"]):
             import re as _re_cr_neg
             # Extract key noun phrases from the question.
             # Use word boundaries to also catch all-caps acronyms (HTTP, API, SQL)
@@ -1718,7 +1713,7 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
         # weighting can't compensate. Direct timeline extraction from the raw
         # conversation gives the LLM all dates with surrounding event context.
         _tr_timeline = None
-        if not _pure_recall and ability == 'TR' and conversation_messages:
+        if not _pure_recall and is_temporal_query(question) and conversation_messages:
             _tr_timeline = _extract_timeline_from_conversation(conversation_messages)
             if _tr_timeline and len(_tr_timeline) >= 2:
                 # Build a timeline string to inject as pre-context
@@ -1735,7 +1730,7 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
         pass1_ctx = _build_context(memories, recent_parts)
         # CR questions need contradiction-first prompt to avoid confident
         # answers that ignore conflicting evidence (observed: 0.1 score).
-        _pass1_prompt = EO_SYSTEM_PROMPT if ability == 'EO' else KU_SYSTEM_PROMPT if ability == 'KU' else CR_SYSTEM_PROMPT if ability == 'CR' else ABS_SYSTEM_PROMPT if ability == 'ABS' else ANSWER_SYSTEM_PROMPT
+        _pass1_prompt = build_system_prompt(question)
         pass1_messages = [
             {"role": "system", "content": _pass1_prompt},
             {"role": "user", "content": f"{pass1_ctx}\n\nQUESTION: {question}\n\nANSWER:"},
@@ -1853,7 +1848,7 @@ GAP: migrated to PostgreSQL""" % (question, ctx_trimmed))
                 pass2_ctx = pass2_ctx[:6000] + "...[truncated]"
             
             # Switch to Calculator prompt for TR/EO abilities
-            if ability == 'TR':
+            if is_temporal_query(question):
                 calc_prompt = """You are a precise temporal calculator. You have been provided with specific retrieved evidence (dates, event timelines).
 Your task is to compute the duration or interval between the events.
 DO NOT use chat pleasantries or summarize the conversation.
@@ -1867,7 +1862,7 @@ Follow this format strictly:
                 ]
             else:
                 # CR questions need contradiction-first prompt even in Pass 2
-                _pass2_prompt = EO_SYSTEM_PROMPT if ability == 'EO' else KU_SYSTEM_PROMPT if ability == 'KU' else CR_SYSTEM_PROMPT if ability == 'CR' else ABS_SYSTEM_PROMPT if ability == 'ABS' else ANSWER_SYSTEM_PROMPT
+                _pass2_prompt = build_system_prompt(question)
                 pass2_messages = [
                     {"role": "system", "content": _pass2_prompt},
                     {"role": "user", "content": pass2_ctx + "\n\nQUESTION: " + question + "\n\nANSWER:"},
@@ -1927,7 +1922,7 @@ Follow this format strictly:
     # Non-recursive path: KU, IE, MR, SUM, ABS all share this block.
     # KU_SYSTEM_PROMPT produces JSON {updates: [...]} while ANSWER_SYSTEM_PROMPT
     # produces free-form text the judge can't evaluate correctly.
-    _prompt = KU_SYSTEM_PROMPT if ability == 'KU' else ANSWER_SYSTEM_PROMPT
+    _prompt = build_system_prompt(question)
     messages = [
         {"role": "system", "content": _prompt},
         {"role": "user", "content": f"{_cr_prefix_ret}{context}\n\nQUESTION: {question}\n\nANSWER:"},
