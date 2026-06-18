@@ -47,6 +47,13 @@ _SUM_KEYWORDS = (
     "key themes", "recap", "highlights", "gist",
 )
 
+_AGGREGATION_KEYWORDS = (
+    "how many", "how much", "total", "all the", "across",
+    "across my", "across our", "across sessions",
+    "combined", "altogether", "in total",
+    "everything", "every time", "each time",
+)
+
 
 def is_ordering_query(question: str) -> bool:
     q = question.lower()
@@ -71,6 +78,11 @@ def is_multi_hop_query(question: str) -> bool:
 def is_summarization_query(question: str) -> bool:
     q = question.lower()
     return any(k in q for k in _SUM_KEYWORDS)
+
+
+def is_aggregation_query(question: str) -> bool:
+    q = question.lower()
+    return any(k in q for k in _AGGREGATION_KEYWORDS)
 
 
 def is_temporal_query(question: str) -> bool:
@@ -116,7 +128,10 @@ _MR_MODIFIER = """
 MULTI-HOP REASONING: This question requires combining information from multiple parts
 of the conversation. Look for connections between separate facts. If fact A says "X uses Y"
 and fact B says "Y requires Z", then the answer to "what does X require?" is Z.
-Chain the facts step by step."""
+Chain the facts step by step.
+
+When the question asks "how many" or requires counting across sessions, make sure to list
+ALL distinct items you found and then count them."""
 
 _SUM_MODIFIER = """
 

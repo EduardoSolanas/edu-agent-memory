@@ -1613,3 +1613,208 @@ class TestWriteTimeConflictResolution:
                 shutil.rmtree(tmpdir)
             except PermissionError:
                 pass  # Windows file lock; ignore
+
+
+class TestInstructionPreferenceDetection:
+    """Test IF and PF instruction/preference detection and tagging."""
+
+    def test_instruction_detected_always_format(self):
+        from tools.evaluate_beam_end_to_end import _detect_instruction
+        assert _detect_instruction("Always format all code snippets with syntax highlighting when I ask about implementation details.")
+
+    def test_instruction_detected_always_include(self):
+        from tools.evaluate_beam_end_to_end import _detect_instruction
+        assert _detect_instruction("Always include version numbers when I ask about software dependencies or libraries used.")
+
+    def test_instruction_not_detected_regular_chat(self):
+        from tools.evaluate_beam_end_to_end import _detect_instruction
+        assert not _detect_instruction("I'm working on a Flask app for budget tracking.")
+
+    def test_preference_detected_i_prefer(self):
+        from tools.evaluate_beam_end_to_end import _detect_preference
+        assert _detect_preference("I prefer simple, minimal dependencies to keep the app lightweight.")
+
+    def test_preference_detected_pragmatic(self):
+        from tools.evaluate_beam_end_to_end import _detect_preference
+        assert _detect_preference("I prefer pragmatic security enhancements that don't compromise user experience.")
+
+    def test_preference_not_detected_regular_chat(self):
+        from tools.evaluate_beam_end_to_end import _detect_preference
+        assert not _detect_preference("The login endpoint uses JWT tokens for authentication.")
+
+    def test_instruction_tag_appended_at_ingest(self):
+        from edumem.core.beam import BeamMemory
+        import tempfile
+        from pathlib import Path
+
+        tmpdir = Path(tempfile.mkdtemp())
+        try:
+            db_path = tmpdir / "test.db"
+            beam = BeamMemory(db_path=db_path)
+            from tools.evaluate_beam_end_to_end import ingest_conversation
+            messages = [
+                {"role": "user", "content": "Always format code with syntax highlighting when I ask about implementation."},
+                {"role": "user", "content": "Can you help me with Flask?"},
+            ]
+            ingest_conversation(beam, messages)
+
+            rows = beam.conn.execute("SELECT content FROM working_memory").fetchall()
+            tagged = [r for r in rows if "[INSTRUCTION]" in r["content"]]
+            untagged = [r for r in rows if "[INSTRUCTION]" not in r["content"]]
+            assert len(tagged) >= 1
+            assert len(untagged) >= 1
+        finally:
+            beam.conn.close()
+            import shutil
+            try:
+                shutil.rmtree(tmpdir)
+            except PermissionError:
+                pass
+
+    def test_preference_tag_appended_at_ingest(self):
+        from edumem.core.beam import BeamMemory
+        import tempfile
+        from pathlib import Path
+
+        tmpdir = Path(tempfile.mkdtemp())
+        try:
+            db_path = tmpdir / "test.db"
+            beam = BeamMemory(db_path=db_path)
+            from tools.evaluate_beam_end_to_end import ingest_conversation
+            messages = [
+                {"role": "user", "content": "I prefer minimal dependencies to keep the app lightweight."},
+                {"role": "user", "content": "Let me set up the database schema."},
+            ]
+            ingest_conversation(beam, messages)
+
+            rows = beam.conn.execute("SELECT content FROM working_memory").fetchall()
+            tagged = [r for r in rows if "[PREFERENCE]" in r["content"]]
+            untagged = [r for r in rows if "[PREFERENCE]" not in r["content"]]
+            assert len(tagged) >= 1
+            assert len(untagged) >= 1
+        finally:
+            beam.conn.close()
+            import shutil
+            try:
+                shutil.rmtree(tmpdir)
+            except PermissionError:
+                pass
+
+
+class TestAggregationQuery:
+    """Test MR aggregation query detection and broader recall."""
+
+    def test_how_many_detected(self):
+        from edumem.core.query_mode import is_aggregation_query
+        assert is_aggregation_query("How many new columns did I want to add to the transactions table?")
+
+    def test_across_sessions_detected(self):
+        from edumem.core.query_mode import is_aggregation_query
+        assert is_aggregation_query("How many different user roles am I trying to implement across my sessions?")
+
+    def test_total_detected(self):
+        from edumem.core.query_mode import is_aggregation_query
+        assert is_aggregation_query("What is the total number of features we discussed?")
+
+    def test_simple_question_not_aggregation(self):
+        from edumem.core.query_mode import is_aggregation_query
+        assert not is_aggregation_query("When does my first sprint end?")
+
+    def test_ordering_question_not_aggregation(self):
+        from edumem.core.query_mode import is_aggregation_query
+        assert not is_aggregation_query("In what order did I bring up the development topics?")
+
+    def test_aggregation_increases_topk(self):
+        from edumem.core.query_mode import is_aggregation_query
+        q = "How many different security features am I implementing across sessions?"
+        assert is_aggregation_query(q)
+        base_topk = 30
+        effective_topk = base_topk * 3 if is_aggregation_query(q) else base_topk
+        assert effective_topk == 90
+
+
+class TestCRSupersededRecall:
+    """Test that CR queries can retrieve superseded facts."""
+
+    def test_superseded_facts_retrievable_with_like_query(self):
+        """Superseded working_memory rows should be findable via SQL LIKE."""
+        from edumem.core.beam import BeamMemory
+        import tempfile
+        from pathlib import Path
+
+        tmpdir = Path(tempfile.mkdtemp())
+        try:
+            db_path = tmpdir / "test.db"
+            beam = BeamMemory(db_path=db_path)
+
+            # Insert a superseded fact and a current fact
+            beam.conn.execute(
+                "INSERT INTO working_memory (id, content, superseded_by) VALUES (?, ?, ?)",
+                ("mem1", "[MSGIDX:0] I have never written any Flask routes", "mem2")
+            )
+            beam.conn.execute(
+                "INSERT INTO working_memory (id, content, superseded_by) VALUES (?, ?, ?)",
+                ("mem2", "[MSGIDX:50] I integrated Flask routes into my project", None)
+            )
+            beam.conn.commit()
+
+            # Query for superseded facts about Flask
+            superseded = beam.conn.execute(
+                "SELECT id, content FROM working_memory "
+                "WHERE content LIKE ? AND superseded_by IS NOT NULL",
+                ("%Flask%",)
+            ).fetchall()
+            assert len(superseded) == 1
+            assert "never" in superseded[0]["content"]
+
+            # Normal recall (superseded_by IS NULL) should only find the current fact
+            current = beam.conn.execute(
+                "SELECT id, content FROM working_memory "
+                "WHERE content LIKE ? AND superseded_by IS NULL",
+                ("%Flask%",)
+            ).fetchall()
+            assert len(current) == 1
+            assert "integrated" in current[0]["content"]
+        finally:
+            beam.conn.close()
+            import shutil
+            try:
+                shutil.rmtree(tmpdir)
+            except PermissionError:
+                pass
+
+
+class TestEOMessageIndexSorting:
+    """Test that EO context is sorted by message index."""
+
+    def test_msgidx_extraction_and_sort(self):
+        """Memories with MSGIDX tags should be sortable by index."""
+        import re
+        memories = [
+            {"content": "[MSGIDX:50] Set up deployment config"},
+            {"content": "[MSGIDX:10] Created database schema"},
+            {"content": "[MSGIDX:30] Implemented user auth"},
+        ]
+        def extract_msgidx(mem):
+            m = re.search(r'\[MSGIDX:(\d+)\]', mem.get("content", ""))
+            return int(m.group(1)) if m else 999999
+
+        sorted_mems = sorted(memories, key=extract_msgidx)
+        assert "schema" in sorted_mems[0]["content"]
+        assert "auth" in sorted_mems[1]["content"]
+        assert "deployment" in sorted_mems[2]["content"]
+
+    def test_msgidx_missing_sorts_last(self):
+        """Memories without MSGIDX should sort to the end."""
+        import re
+        memories = [
+            {"content": "Some random memory without index"},
+            {"content": "[MSGIDX:5] First event"},
+        ]
+        def extract_msgidx(mem):
+            m = re.search(r'\[MSGIDX:(\d+)\]', mem.get("content", ""))
+            return int(m.group(1)) if m else 999999
+
+        sorted_mems = sorted(memories, key=extract_msgidx)
+        assert "First event" in sorted_mems[0]["content"]
+        assert "random" in sorted_mems[1]["content"]

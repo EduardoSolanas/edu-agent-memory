@@ -55,7 +55,7 @@ import urllib.error
 import numpy as np
 
 from edumem.core.beam import BeamMemory, init_beam, _embeddings, _vec_available, _vec_insert, _fts_search_working, _generate_id
-from edumem.core.query_mode import build_system_prompt, is_temporal_query, needs_second_pass, is_ordering_query, is_duration_query
+from edumem.core.query_mode import build_system_prompt, is_temporal_query, needs_second_pass, is_ordering_query, is_duration_query, is_aggregation_query
 
 
 def _is_calculator_question(question: str) -> bool:
@@ -509,6 +509,45 @@ def _extract_facts(content: str, source: str = "unknown") -> list[dict]:
     
     return facts[:20]  # Cap per message
 
+
+def _detect_instruction(content: str) -> bool:
+    """Detect if content contains a user instruction about response format."""
+    import re
+    q = content.lower()
+    patterns = [
+        r'\balways\b.*\bwhen\b',
+        r'\bnever\b.*\bwhen\b',
+        r'\bmake sure\b.*\bformat\b',
+        r'\bformat\b.*\bas\b',
+        r'\binclude\b.*\bwhen\b',
+        r'\buse\b.*\bformat\b',
+        r'\bprovide\b.*\bwith\b.*\bevery\b',
+        r'\balways\b.*\binclude\b',
+        r'\balways\b.*\bformat\b',
+        r'\balways\b.*\bprovide\b',
+        r'\balways\b.*\buse\b',
+    ]
+    return any(re.search(p, q) for p in patterns)
+
+
+def _detect_preference(content: str) -> bool:
+    """Detect if content contains a user preference."""
+    import re
+    q = content.lower()
+    patterns = [
+        r'\bi prefer\b',
+        r'\bi like to keep\b',
+        r'\bi want .* to be\b',
+        r'\bmy preference\b',
+        r'\bi favor\b',
+        r'\bi\'d rather\b',
+        r'\bkeep (?:it |things )?(?:simple|minimal|lightweight)\b',
+        r'\bi prioritize\b',
+        r'\bi value\b.*\bover\b',
+    ]
+    return any(re.search(p, q) for p in patterns)
+
+
 def ingest_conversation(beam: BeamMemory, messages: list[dict]) -> dict:
     """Ingest conversation messages into edumem BEAM tiers.
     Also builds an in-memory facts index for fact-boosted retrieval."""
@@ -560,6 +599,13 @@ def ingest_conversation(beam: BeamMemory, messages: list[dict]) -> dict:
             # Prepend message index for EO (Event Ordering) ability
             # so the LLM can sort events chronologically by raw sequence.
             content = f"[MSGIDX:{batch_start + i}] {content}"
+
+            # Detect and tag instructions and preferences for IF/PF abilities
+            if _detect_instruction(raw_content):
+                content = f"{content} [INSTRUCTION]"
+            if _detect_preference(raw_content):
+                content = f"{content} [PREFERENCE]"
+
             batch_items.append({
                 "content": content,
                 "source": f"beam_{msg.get('role', 'unknown')}",
@@ -920,6 +966,11 @@ def _multi_strategy_recall(beam: BeamMemory, question: str, top_k: int = DEFAULT
     if is_ordering_query(question):
         top_k = top_k * 3
 
+    # MR: Raise candidate depth for aggregation queries
+    # Aggregation questions need broader retrieval to find items across multiple sessions
+    if is_aggregation_query(question):
+        top_k = top_k * 3
+
     # Detect temporal questions by ability type or keywords
     temporal_keywords = ['when', 'date', 'deadline', 'sprint', 'day', 'week', 'month',
                          'april', 'march', 'february', 'january', 'may', 'june', 'july',
@@ -989,6 +1040,26 @@ def _multi_strategy_recall(beam: BeamMemory, question: str, top_k: int = DEFAULT
             except Exception:
                 pass
 
+        # 2d: Retrieve superseded facts for contradiction resolution (CR ability)
+        # When a query might involve contradictions, also fetch facts that were
+        # superseded by the write-time conflict resolver. This helps find BOTH
+        # sides of a contradiction (e.g., "never used Flask" vs "implemented Flask").
+        _cr_terms = re.findall(r'\b[a-z]{4,}\b', question.lower())
+        _cr_stop = {'have', 'been', 'does', 'ever', 'that', 'this', 'what', 'which', 'about', 'your', 'with'}
+        _cr_terms = [t for t in _cr_terms if t not in _cr_stop][:5]
+        for term in _cr_terms:
+            try:
+                superseded_rows = beam.conn.execute(
+                    "SELECT id, content FROM working_memory "
+                    "WHERE content LIKE ? AND superseded_by IS NOT NULL "
+                    "LIMIT 10",
+                    (f"%{term}%",)
+                ).fetchall()
+                for row in superseded_rows:
+                    _add_unique([{"id": row[0], "content": row[1], "score": 0.6, "source": "superseded_recall"}])
+            except Exception:
+                pass
+
     # Strategy 3: Key entity/term searches
     terms = _extract_search_terms(question)
     for term in terms[:5]:
@@ -1041,6 +1112,32 @@ def _multi_strategy_recall(beam: BeamMemory, question: str, top_k: int = DEFAULT
         _hop_entities = {e for e in _hop_entities if e.lower() not in q_lower_hop and len(e) > 3}
         for entity in list(_hop_entities)[:5]:
             _add_unique(_recall_safe(beam, entity, max(5, top_k // 3)))
+
+    # Strategy 6: Instruction and Preference retrieval for IF/PF abilities
+    try:
+        for tag in ["INSTRUCTION", "PREFERENCE"]:
+            tag_rows = beam.conn.execute(
+                "SELECT id, content FROM working_memory "
+                "WHERE content LIKE ? AND superseded_by IS NULL "
+                "LIMIT 10",
+                (f"%[{tag}]%",)
+            ).fetchall()
+            for row in tag_rows:
+                _add_unique([{"content": row["content"], "score": 0.8, "source": f"{tag.lower()}_recall"}])
+    except Exception:
+        pass
+
+    # Strategy: Multi-query expansion for aggregation (MR ability)
+    if is_aggregation_query(question):
+        import re
+        # Extract key noun phrases from the question for broader retrieval
+        _mr_terms = re.findall(r'\b[a-z]{4,}\b', question.lower())
+        _mr_stop = {'have', 'been', 'want', 'many', 'much', 'different', 'across',
+                     'sessions', 'what', 'which', 'does', 'were', 'that', 'this',
+                     'from', 'with', 'about', 'into', 'your', 'trying', 'implement'}
+        _mr_terms = [t for t in _mr_terms if t not in _mr_stop][:5]
+        for term in _mr_terms:
+            _add_unique(_recall_safe(beam, term, top_k))
 
     # Sort by score and return top-k
     all_memories.sort(key=lambda x: x.get("score", 0), reverse=True)
@@ -2247,13 +2344,22 @@ Follow this format strictly:
     if _cr_context:
         _cr_prefix_ret = f"\n\n{_cr_context}\n\n"
 
+    # Inject user instructions and preferences for IF/PF
+    _if_pf_prefix = ""
+    _instructions = [m.get("content", "") for m in memories if "[INSTRUCTION]" in m.get("content", "")]
+    _preferences = [m.get("content", "") for m in memories if "[PREFERENCE]" in m.get("content", "")]
+    if _instructions:
+        _if_pf_prefix += "\nUSER INSTRUCTIONS (follow these when answering):\n" + "\n".join(f"- {inst}" for inst in _instructions) + "\n"
+    if _preferences:
+        _if_pf_prefix += "\nUSER PREFERENCES (respect these in your answer):\n" + "\n".join(f"- {pref}" for pref in _preferences) + "\n"
+
     # All queries use build_system_prompt() dynamically, which appends
     # light format modifiers to an always-on base prompt for EO/TR queries.
     _prompt = build_system_prompt(question)
     _temporal_cheat = _inject_temporal_cheatsheet(memories, question)
     messages = [
         {"role": "system", "content": _prompt},
-        {"role": "user", "content": f"{_temporal_cheat}{_cr_prefix_ret}{context}\n\nQUESTION: {question}\n\nANSWER:"},
+        {"role": "user", "content": f"{_if_pf_prefix}{_temporal_cheat}{_cr_prefix_ret}{context}\n\nQUESTION: {question}\n\nANSWER:"},
     ]
 
     ans = llm.chat(messages, temperature=0.1, max_tokens=2048)
