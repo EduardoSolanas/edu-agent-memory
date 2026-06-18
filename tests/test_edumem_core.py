@@ -1112,3 +1112,504 @@ class TestFIX3_NegationRetrievalCapIncrease:
             if db_path.exists():
                 try: db_path.unlink()
                 except PermissionError: pass
+
+
+class TestTemporalCheatsheet:
+    """Test suite for temporal cheatsheet injection in TR questions."""
+
+    def test_cheatsheet_extracts_dates_from_memories(self):
+        """Verify that _inject_temporal_cheatsheet extracts and sorts ISO dates from memory content."""
+        from tools.evaluate_beam_end_to_end import _inject_temporal_cheatsheet
+
+        memories = [
+            {"content": "We started work on 2024-01-15 with the sprint kickoff meeting."},
+            {"content": "The final demo was delivered on 2024-03-20 to the client."},
+            {"content": "Initial planning happened on 2024-01-10 with the team."},
+        ]
+        question = "How long between the start and final demo?"
+
+        cheatsheet = _inject_temporal_cheatsheet(memories, question)
+
+        # Should contain the temporal reference marker
+        assert "[TEMPORAL REFERENCE]" in cheatsheet
+        assert "[END TEMPORAL REFERENCE]" in cheatsheet
+
+        # Should contain all three dates in chronological order
+        assert "2024-01-10" in cheatsheet
+        assert "2024-01-15" in cheatsheet
+        assert "2024-03-20" in cheatsheet
+
+        # Should contain timedelta information
+        assert "days" in cheatsheet
+
+    def test_cheatsheet_empty_for_non_temporal(self):
+        """Verify that _inject_temporal_cheatsheet returns empty string for non-temporal questions."""
+        from tools.evaluate_beam_end_to_end import _inject_temporal_cheatsheet
+
+        memories = [
+            {"content": "My name is Alice and I work at TechCorp."},
+            {"content": "I have 5 years of experience with Python."},
+        ]
+        question = "What is my name?"
+
+        cheatsheet = _inject_temporal_cheatsheet(memories, question)
+
+        # Should return empty string
+        assert cheatsheet == ""
+
+    def test_cheatsheet_empty_when_no_dates(self):
+        """Verify that _inject_temporal_cheatsheet returns empty string when no ISO dates found."""
+        from tools.evaluate_beam_end_to_end import _inject_temporal_cheatsheet
+
+        memories = [
+            {"content": "We worked on the project last month."},
+            {"content": "The deadline was around mid-summer."},
+        ]
+        question = "How long did the project take?"
+
+        cheatsheet = _inject_temporal_cheatsheet(memories, question)
+
+        # Should return empty string (no ISO dates)
+        assert cheatsheet == ""
+
+    def test_cheatsheet_computes_correct_delta(self):
+        """Verify that _inject_temporal_cheatsheet correctly computes timedeltas (including leap years)."""
+        from tools.evaluate_beam_end_to_end import _inject_temporal_cheatsheet
+
+        # Use 2024 which is a leap year
+        memories = [
+            {"content": "The sprint started on 2024-01-15."},
+            {"content": "The final deliverable was on 2024-03-20."},
+        ]
+        question = "How many days between the sprint start and final deliverable?"
+
+        cheatsheet = _inject_temporal_cheatsheet(memories, question)
+
+        # Jan 15 -> Mar 20 in leap year 2024:
+        # Remaining Jan: 31-15 = 16 days
+        # Feb: 29 days (leap year)
+        # Mar: 20 days
+        # Total: 16 + 29 + 20 = 65 days
+        assert "65 days" in cheatsheet
+
+    def test_cheatsheet_context_snippet(self):
+        """Verify that cheatsheet includes event context snippets around dates."""
+        from tools.evaluate_beam_end_to_end import _inject_temporal_cheatsheet
+
+        memories = [
+            {"content": "We had the sprint kickoff on 2024-02-01 at 9am."},
+        ]
+        question = "How long between the start and now?"
+
+        cheatsheet = _inject_temporal_cheatsheet(memories, question)
+
+        # Should contain the date
+        assert "2024-02-01" in cheatsheet
+        # Should contain a context snippet (around 30 chars)
+        assert "sprint kickoff" in cheatsheet or "kickoff" in cheatsheet
+
+
+class MockLLMClient:
+    """Mock LLM client for testing conflict resolution."""
+    def __init__(self, response="UPDATE"):
+        self._response = response
+
+    def chat(self, messages, **kwargs):
+        """Return the configured response."""
+        return self._response
+
+
+class TestWriteTimeConflictResolution:
+    """Test write-time conflict resolution for CR and KU."""
+
+    def test_update_decision_supersedes_old_fact(self):
+        """When LLM decides UPDATE, the old fact should be superseded."""
+        from edumem.core.veracity_consolidation import VeracityConsolidator
+
+        tmpdir = Path(tempfile.mkdtemp())
+        try:
+            db_path = tmpdir / "test.db"
+            consolidator = VeracityConsolidator(db_path=db_path)
+            mock_llm = MockLLMClient(response="UPDATE")
+
+            # First fact
+            consolidator.consolidate_fact(
+                "user", "database", "PostgreSQL",
+                veracity="stated", source="mem1",
+                llm_client=mock_llm
+            )
+
+            # Second fact (conflict detected)
+            consolidator.consolidate_fact(
+                "user", "database", "MySQL",
+                veracity="stated", source="mem2",
+                llm_client=mock_llm
+            )
+
+            # Query: old fact should be superseded
+            cursor = consolidator.conn.cursor()
+            cursor.execute("""
+                SELECT id, object, superseded_by FROM consolidated_facts
+                WHERE subject = 'user' AND predicate = 'database'
+                ORDER BY first_seen
+            """)
+            facts = cursor.fetchall()
+
+            assert len(facts) == 2
+            assert facts[0]["object"] == "PostgreSQL"
+            assert facts[0]["superseded_by"] is not None
+            assert facts[1]["object"] == "MySQL"
+            assert facts[1]["superseded_by"] is None
+        finally:
+            consolidator.conn.close()
+            import shutil
+            try:
+                shutil.rmtree(tmpdir)
+            except PermissionError:
+                pass  # Windows file lock; ignore
+
+    def test_add_decision_keeps_both_visible(self):
+        """When LLM decides ADD, both facts should remain visible (no supersession)."""
+        from edumem.core.veracity_consolidation import VeracityConsolidator
+
+        tmpdir = Path(tempfile.mkdtemp())
+        try:
+            db_path = tmpdir / "test.db"
+            consolidator = VeracityConsolidator(db_path=db_path)
+            mock_llm = MockLLMClient(response="ADD")
+
+            # First fact
+            consolidator.consolidate_fact(
+                "user", "languages", "Python",
+                veracity="stated", source="mem1",
+                llm_client=mock_llm
+            )
+
+            # Second fact (conflict detected)
+            consolidator.consolidate_fact(
+                "user", "languages", "Rust",
+                veracity="stated", source="mem2",
+                llm_client=mock_llm
+            )
+
+            # Query: both facts should have no supersession
+            cursor = consolidator.conn.cursor()
+            cursor.execute("""
+                SELECT id, object, superseded_by FROM consolidated_facts
+                WHERE subject = 'user' AND predicate = 'languages'
+                ORDER BY first_seen
+            """)
+            facts = cursor.fetchall()
+
+            assert len(facts) == 2
+            assert facts[0]["object"] == "Python"
+            assert facts[0]["superseded_by"] is None
+            assert facts[1]["object"] == "Rust"
+            assert facts[1]["superseded_by"] is None
+        finally:
+            consolidator.conn.close()
+            import shutil
+            try:
+                shutil.rmtree(tmpdir)
+            except PermissionError:
+                pass  # Windows file lock; ignore
+
+    def test_no_llm_defaults_to_add(self):
+        """When no LLM provided, both facts should remain visible (backward compat)."""
+        from edumem.core.veracity_consolidation import VeracityConsolidator
+
+        tmpdir = Path(tempfile.mkdtemp())
+        try:
+            db_path = tmpdir / "test.db"
+            consolidator = VeracityConsolidator(db_path=db_path)
+
+            # First fact (no LLM)
+            consolidator.consolidate_fact(
+                "user", "role", "Engineer",
+                veracity="stated", source="mem1"
+            )
+
+            # Second fact (conflict, no LLM)
+            consolidator.consolidate_fact(
+                "user", "role", "Manager",
+                veracity="stated", source="mem2"
+            )
+
+            # Query: both facts should have no supersession
+            cursor = consolidator.conn.cursor()
+            cursor.execute("""
+                SELECT id, object, superseded_by FROM consolidated_facts
+                WHERE subject = 'user' AND predicate = 'role'
+                ORDER BY first_seen
+            """)
+            facts = cursor.fetchall()
+
+            assert len(facts) == 2
+            assert facts[0]["superseded_by"] is None
+            assert facts[1]["superseded_by"] is None
+        finally:
+            consolidator.conn.close()
+            import shutil
+            try:
+                shutil.rmtree(tmpdir)
+            except PermissionError:
+                pass  # Windows file lock; ignore
+
+    def test_working_memory_supersession_propagates(self):
+        """Supersession set on consolidated_facts should propagate to working_memory."""
+        from edumem.core.veracity_consolidation import VeracityConsolidator
+
+        tmpdir = Path(tempfile.mkdtemp())
+        try:
+            db_path = tmpdir / "test.db"
+            consolidator = VeracityConsolidator(db_path=db_path)
+            mock_llm = MockLLMClient(response="UPDATE")
+
+            # Create dummy working_memory rows first
+            cursor = consolidator.conn.cursor()
+            mem1_id = "mem_1"
+            mem2_id = "mem_2"
+            now = datetime.now().isoformat()
+
+            # Ensure working_memory table exists (from beam.py schema)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS working_memory (
+                    id TEXT PRIMARY KEY,
+                    content TEXT,
+                    superseded_by TEXT
+                )
+            """)
+
+            cursor.execute(
+                "INSERT INTO working_memory (id, content) VALUES (?, ?)",
+                (mem1_id, "I use PostgreSQL")
+            )
+            cursor.execute(
+                "INSERT INTO working_memory (id, content) VALUES (?, ?)",
+                (mem2_id, "I switched to MySQL")
+            )
+            consolidator.conn.commit()
+
+            # First fact
+            consolidator.consolidate_fact(
+                "user", "database", "PostgreSQL",
+                veracity="stated", source=mem1_id,
+                llm_client=mock_llm
+            )
+
+            # Second fact (conflict)
+            consolidator.consolidate_fact(
+                "user", "database", "MySQL",
+                veracity="stated", source=mem2_id,
+                llm_client=mock_llm
+            )
+
+            # Check working_memory supersession
+            cursor.execute("""
+                SELECT id, superseded_by FROM working_memory
+                WHERE id = ?
+            """, (mem1_id,))
+            wm_row = cursor.fetchone()
+
+            assert wm_row is not None
+            assert wm_row["superseded_by"] is not None
+        finally:
+            consolidator.conn.close()
+            import shutil
+            try:
+                shutil.rmtree(tmpdir)
+            except PermissionError:
+                pass  # Windows file lock; ignore
+
+    def test_delete_decision_supersedes_old_fact(self):
+        """When LLM decides DELETE, the old fact should be superseded."""
+        from edumem.core.veracity_consolidation import VeracityConsolidator
+
+        tmpdir = Path(tempfile.mkdtemp())
+        try:
+            db_path = tmpdir / "test.db"
+            consolidator = VeracityConsolidator(db_path=db_path)
+            mock_llm = MockLLMClient(response="DELETE")
+
+            # First fact
+            consolidator.consolidate_fact(
+                "user", "status", "junior",
+                veracity="stated", source="mem1",
+                llm_client=mock_llm
+            )
+
+            # Second fact (DELETE decision)
+            consolidator.consolidate_fact(
+                "user", "status", "senior",
+                veracity="stated", source="mem2",
+                llm_client=mock_llm
+            )
+
+            # Query: old fact should be superseded
+            cursor = consolidator.conn.cursor()
+            cursor.execute("""
+                SELECT id, object, superseded_by FROM consolidated_facts
+                WHERE subject = 'user' AND predicate = 'status'
+                ORDER BY first_seen
+            """)
+            facts = cursor.fetchall()
+
+            assert len(facts) == 2
+            assert facts[0]["object"] == "junior"
+            assert facts[0]["superseded_by"] is not None
+            assert facts[1]["object"] == "senior"
+            assert facts[1]["superseded_by"] is None
+        finally:
+            consolidator.conn.close()
+            import shutil
+            try:
+                shutil.rmtree(tmpdir)
+            except PermissionError:
+                pass  # Windows file lock; ignore
+
+    def test_noop_decision_keeps_both_no_duplicate(self):
+        """When LLM decides NOOP, both facts should remain visible (similar to ADD)."""
+        from edumem.core.veracity_consolidation import VeracityConsolidator
+
+        tmpdir = Path(tempfile.mkdtemp())
+        try:
+            db_path = tmpdir / "test.db"
+            consolidator = VeracityConsolidator(db_path=db_path)
+            mock_llm = MockLLMClient(response="NOOP")
+
+            # First fact
+            consolidator.consolidate_fact(
+                "user", "food", "likes cheese pizza",
+                veracity="stated", source="mem1",
+                llm_client=mock_llm
+            )
+
+            # Second fact (conflict detected, but similar info)
+            consolidator.consolidate_fact(
+                "user", "food", "loves cheese pizza",
+                veracity="stated", source="mem2",
+                llm_client=mock_llm
+            )
+
+            # Query: both facts should have no supersession
+            cursor = consolidator.conn.cursor()
+            cursor.execute("""
+                SELECT id, object, superseded_by FROM consolidated_facts
+                WHERE subject = 'user' AND predicate = 'food'
+                ORDER BY first_seen
+            """)
+            facts = cursor.fetchall()
+
+            assert len(facts) == 2
+            assert facts[0]["object"] == "likes cheese pizza"
+            assert facts[0]["superseded_by"] is None
+            assert facts[1]["object"] == "loves cheese pizza"
+            assert facts[1]["superseded_by"] is None
+        finally:
+            consolidator.conn.close()
+            import shutil
+            try:
+                shutil.rmtree(tmpdir)
+            except PermissionError:
+                pass  # Windows file lock; ignore
+
+    def test_chained_updates_only_latest_visible(self):
+        """When multiple UPDATE decisions occur, only the latest fact is current."""
+        from edumem.core.veracity_consolidation import VeracityConsolidator
+
+        tmpdir = Path(tempfile.mkdtemp())
+        try:
+            db_path = tmpdir / "test.db"
+            consolidator = VeracityConsolidator(db_path=db_path)
+            mock_llm = MockLLMClient(response="UPDATE")
+
+            # First fact
+            consolidator.consolidate_fact(
+                "user", "city", "NYC",
+                veracity="stated", source="mem1",
+                llm_client=mock_llm
+            )
+
+            # Second fact (UPDATE: NYC -> London)
+            consolidator.consolidate_fact(
+                "user", "city", "London",
+                veracity="stated", source="mem2",
+                llm_client=mock_llm
+            )
+
+            # Third fact (UPDATE: London -> Tokyo)
+            consolidator.consolidate_fact(
+                "user", "city", "Tokyo",
+                veracity="stated", source="mem3",
+                llm_client=mock_llm
+            )
+
+            # Query: first two should be superseded, only Tokyo should be current
+            cursor = consolidator.conn.cursor()
+            cursor.execute("""
+                SELECT id, object, superseded_by FROM consolidated_facts
+                WHERE subject = 'user' AND predicate = 'city'
+                ORDER BY first_seen
+            """)
+            facts = cursor.fetchall()
+
+            assert len(facts) == 3
+            assert facts[0]["object"] == "NYC"
+            assert facts[0]["superseded_by"] is not None
+            assert facts[1]["object"] == "London"
+            assert facts[1]["superseded_by"] is not None
+            assert facts[2]["object"] == "Tokyo"
+            assert facts[2]["superseded_by"] is None
+        finally:
+            consolidator.conn.close()
+            import shutil
+            try:
+                shutil.rmtree(tmpdir)
+            except PermissionError:
+                pass  # Windows file lock; ignore
+
+    def test_llm_garbage_response_defaults_to_add(self):
+        """When LLM returns garbage response, default to ADD (safe fallback)."""
+        from edumem.core.veracity_consolidation import VeracityConsolidator
+
+        tmpdir = Path(tempfile.mkdtemp())
+        try:
+            db_path = tmpdir / "test.db"
+            consolidator = VeracityConsolidator(db_path=db_path)
+            mock_llm = MockLLMClient(response="hmm maybe replace?")
+
+            # First fact
+            consolidator.consolidate_fact(
+                "user", "editor", "vim",
+                veracity="stated", source="mem1",
+                llm_client=mock_llm
+            )
+
+            # Second fact (conflict, but LLM response is garbage)
+            consolidator.consolidate_fact(
+                "user", "editor", "emacs",
+                veracity="stated", source="mem2",
+                llm_client=mock_llm
+            )
+
+            # Query: both facts should remain visible (ADD behavior)
+            cursor = consolidator.conn.cursor()
+            cursor.execute("""
+                SELECT id, object, superseded_by FROM consolidated_facts
+                WHERE subject = 'user' AND predicate = 'editor'
+                ORDER BY first_seen
+            """)
+            facts = cursor.fetchall()
+
+            assert len(facts) == 2
+            assert facts[0]["object"] == "vim"
+            assert facts[0]["superseded_by"] is None
+            assert facts[1]["object"] == "emacs"
+            assert facts[1]["superseded_by"] is None
+        finally:
+            consolidator.conn.close()
+            import shutil
+            try:
+                shutil.rmtree(tmpdir)
+            except PermissionError:
+                pass  # Windows file lock; ignore

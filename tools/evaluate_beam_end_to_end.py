@@ -1571,6 +1571,95 @@ def _summarize_recall_memories(memories: list) -> dict:
     }
 
 
+def _inject_temporal_cheatsheet(memories: list, question: str) -> str:
+    """Extract ISO dates from recalled memories and inject a temporal cheat sheet.
+
+    Pure-recall legal: reads only from recalled memories, not raw conversation_messages.
+
+    Logic:
+    1. Only activate if is_temporal_query(question)
+    2. Extract ALL ISO dates from memory content with surrounding context
+    3. Parse, sort chronologically
+    4. Compute pairwise timedeltas between consecutive events
+    5. Return a formatted cheat sheet string with dates and deltas
+
+    Returns: str -- cheat sheet markup (empty string if no dates or not temporal)
+    """
+    import re
+
+    # Only for temporal queries
+    if not is_temporal_query(question):
+        return ""
+
+    # Extract all ISO dates from memories
+    date_pattern = r'\d{4}-\d{2}-\d{2}'
+    date_events = []  # list of (date_str, context_snippet)
+
+    for mem in memories:
+        content = mem.get("content", "")
+        if not content:
+            continue
+
+        # Find all ISO dates in this memory
+        for match in re.finditer(date_pattern, content):
+            date_str = match.group(0)
+
+            # Extract context snippet (~30 chars around the date)
+            start = max(0, match.start() - 15)
+            end = min(len(content), match.end() + 15)
+            context = content[start:end].strip()
+
+            date_events.append((date_str, context))
+
+    # If no dates found, return empty
+    if not date_events:
+        return ""
+
+    # Parse dates and sort chronologically
+    date_objs = []
+    for date_str, context in date_events:
+        try:
+            dt = datetime.strptime(date_str, "%Y-%m-%d")
+            date_objs.append((dt, date_str, context))
+        except ValueError:
+            pass  # Skip invalid dates
+
+    if not date_objs:
+        return ""
+
+    # Sort by date
+    date_objs.sort(key=lambda x: x[0])
+
+    # Build cheat sheet
+    lines = ["[TEMPORAL REFERENCE]"]
+
+    # Add each event with date
+    for dt, date_str, context in date_objs:
+        lines.append(f"- Event: \"{context}\" ({date_str})")
+
+    # Compute pairwise deltas between consecutive events
+    if len(date_objs) >= 2:
+        lines.append("")
+        for i in range(len(date_objs) - 1):
+            dt1, date1, ctx1 = date_objs[i]
+            dt2, date2, ctx2 = date_objs[i + 1]
+            delta = dt2 - dt1
+            days = delta.days
+
+            # Compute months and days for readability
+            months = days // 30
+            remainder = days % 30
+
+            lines.append(
+                f"- Delta: {date1} → {date2} = {days} days "
+                f"({months} months, {remainder} days)"
+            )
+
+    lines.append("[END TEMPORAL REFERENCE]")
+
+    return "\n".join(lines)
+
+
 def _apply_rerank_scores(memories: list, scores: list, top_n: int) -> list:
     """Merge cross-encoder scores into memories and tier-sort.
 
@@ -2047,6 +2136,9 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
             if len(pass2_ctx) > _pass2_limit:
                 pass2_ctx = pass2_ctx[:_pass2_limit] + "...[truncated]"
             
+            # Inject temporal cheatsheet for TR/EO questions
+            _pass2_temporal_cheat = _inject_temporal_cheatsheet(all_mems, question)
+
             # Switch to Calculator prompt ONLY for DURATION questions.
             # Ordering (EO) questions must use the ordering prompt below — routing
             # them to the calculator made them output a number, killing tau-b.
@@ -2060,14 +2152,14 @@ Follow this format strictly:
 3. FINAL ANSWER: [Provide only the number/duration]"""
                 pass2_messages = [
                     {"role": "system", "content": calc_prompt},
-                    {"role": "user", "content": pass2_ctx + "\n\nQUESTION: " + question + "\n\nANSWER:"},
+                    {"role": "user", "content": _pass2_temporal_cheat + pass2_ctx + "\n\nQUESTION: " + question + "\n\nANSWER:"},
                 ]
             else:
                 # CR questions need contradiction-first prompt even in Pass 2
                 _pass2_prompt = build_system_prompt(question)
                 pass2_messages = [
                     {"role": "system", "content": _pass2_prompt},
-                    {"role": "user", "content": pass2_ctx + "\n\nQUESTION: " + question + "\n\nANSWER:"},
+                    {"role": "user", "content": _pass2_temporal_cheat + pass2_ctx + "\n\nQUESTION: " + question + "\n\nANSWER:"},
                 ]
             return _ret(llm.chat(pass2_messages, temperature=0.1, max_tokens=8192), all_mems)
 
@@ -2158,9 +2250,10 @@ Follow this format strictly:
     # All queries use build_system_prompt() dynamically, which appends
     # light format modifiers to an always-on base prompt for EO/TR queries.
     _prompt = build_system_prompt(question)
+    _temporal_cheat = _inject_temporal_cheatsheet(memories, question)
     messages = [
         {"role": "system", "content": _prompt},
-        {"role": "user", "content": f"{_cr_prefix_ret}{context}\n\nQUESTION: {question}\n\nANSWER:"},
+        {"role": "user", "content": f"{_temporal_cheat}{_cr_prefix_ret}{context}\n\nQUESTION: {question}\n\nANSWER:"},
     ]
 
     ans = llm.chat(messages, temperature=0.1, max_tokens=2048)
@@ -2786,7 +2879,8 @@ def main():
                 db_path = Path(tmpdir) / f"beam_{scale}_{conv['id']}.db"
                 init_beam(db_path)
                 beam = BeamMemory(session_id=f"beam_{scale}_{conv['id']}",
-                                   db_path=db_path, use_cloud=args.use_cloud)
+                                   db_path=db_path, use_cloud=args.use_cloud,
+                                   llm_client=llm)
 
                 # Ingest (includes per-batch consolidation via beam.sleep())
                 os.environ["BEAM_CURRENT_SCALE"] = scale

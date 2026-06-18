@@ -35,6 +35,62 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
+def _llm_resolve_conflict(llm_client, subject: str, predicate: str,
+                          old_object: str, new_object: str) -> str:
+    """Ask an LLM whether a new fact updates, adds to, or contradicts an old one.
+
+    Returns one of: "UPDATE", "ADD", "DELETE", "NOOP"
+    - UPDATE: new value replaces old (KU case: "switched from X to Y")
+    - ADD: both are valid simultaneously (e.g., "uses Python AND Rust")
+    - DELETE: new fact invalidates old entirely
+    - NOOP: no meaningful conflict
+
+    Args:
+        llm_client: LLM client with a chat() method, or None
+        subject: Fact subject
+        predicate: Fact predicate
+        old_object: Previous object value
+        new_object: New object value
+
+    Returns:
+        str: One of UPDATE, ADD, DELETE, NOOP
+    """
+    if llm_client is None:
+        return "ADD"  # Backward compat: no LLM = keep both visible
+
+    prompt = (
+        f"You are a memory manager deciding how a new fact affects an existing one.\n\n"
+        f"Existing memory: \"{subject} {predicate} {old_object}\"\n"
+        f"New fact: \"{subject} {predicate} {new_object}\"\n\n"
+        f"Operations:\n"
+        f"- UPDATE: The new fact replaces the old (the value changed). "
+        f"Example: 'likes cheese pizza' → 'likes chicken pizza' = UPDATE.\n"
+        f"- ADD: Both are valid simultaneously. "
+        f"Example: 'uses Python' and 'uses Rust' = ADD (uses both).\n"
+        f"- DELETE: The new fact directly contradicts and invalidates the old. "
+        f"Example: 'loves hiking' → 'dislikes hiking' = DELETE.\n"
+        f"- NOOP: They convey the same information. "
+        f"Example: 'likes cheese pizza' and 'loves cheese pizza' = NOOP.\n\n"
+        f"Reply with exactly one word: UPDATE, ADD, DELETE, or NOOP."
+    )
+
+    try:
+        response = llm_client.chat([{"role": "user", "content": prompt}],
+                                   temperature=0.0, max_tokens=10)
+        # Parse response: look for UPDATE/ADD/DELETE/NOOP (case-insensitive)
+        response_text = str(response).upper()
+        for decision in ("UPDATE", "DELETE", "NOOP"):
+            if decision in response_text:
+                return decision
+        if "ADD" in response_text:
+            return "ADD"
+        # Unparseable: default to ADD (safe, keeps both visible)
+        return "ADD"
+    except Exception:
+        # LLM call failed: default to ADD (backward compat)
+        return "ADD"
+
+
 def compute_fact_id(subject: str, predicate: str, object: str) -> str:
     """Deterministic ID for a (subject, predicate, object) tuple.
 
@@ -443,7 +499,8 @@ class VeracityConsolidator:
         return min(current_confidence + increment, 1.0)
     
     def consolidate_fact(self, subject: str, predicate: str, object: str,
-                        veracity: str = "unknown", source: str = None) -> ConsolidatedFact:
+                        veracity: str = "unknown", source: str = None,
+                        llm_client=None) -> ConsolidatedFact:
         """
         Add or update a fact in consolidation.
 
@@ -545,11 +602,37 @@ class VeracityConsolidator:
                 """, (fact_id, subject, predicate, object, base_confidence, 1,
                       now, now, json.dumps(sources), veracity))
 
-                # Record conflicts. Pass `commit=False` so the helper's
-                # internal commit doesn't end our `_serialized_write`
-                # transaction mid-loop -- see _record_conflict docstring
-                # for the atomicity rationale.
+                # Write-time conflict resolution: LLM decides whether to supersede or keep both
                 for conflict in conflicts:
+                    decision = _llm_resolve_conflict(
+                        llm_client, subject, predicate,
+                        conflict["object"], object  # old_object, new_object
+                    )
+                    if decision in ("UPDATE", "DELETE"):
+                        # Supersede the old fact immediately (within current transaction)
+                        cursor.execute(
+                            """
+                            UPDATE consolidated_facts
+                            SET superseded_by = ?, updated_at = ?
+                            WHERE id = ?
+                            """,
+                            (fact_id, now, conflict["id"]),
+                        )
+                        # Propagate supersession to working_memory source rows
+                        try:
+                            sources_json = conflict["sources_json"] or "[]"
+                            old_sources = json.loads(sources_json)
+                            for old_source_id in old_sources:
+                                try:
+                                    cursor.execute(
+                                        "UPDATE working_memory SET superseded_by = ? WHERE id = ?",
+                                        (fact_id, old_source_id)
+                                    )
+                                except Exception:
+                                    pass  # working_memory might not exist in test contexts
+                        except Exception:
+                            pass
+                    # ADD/NOOP: record conflict but don't supersede (both stay visible)
                     self._record_conflict(
                         fact_id, conflict["id"], "contradiction",
                         commit=False,

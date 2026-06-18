@@ -155,7 +155,7 @@ TRUST_TIER_MAP = {
     "cli":           "STATED",       # CLI direct user input
     "mcp":           "EXTERNAL_WRITE",  # External MCP tool calls
     "import":        "IMPORTED",     # Bulk import from file
-    "mem0":          "IMPORTED",     # External service import
+    "m0":            "IMPORTED",     # External service import
     "honcho_import": "IMPORTED",     # Honcho data migration
     "honcho_summary":"IMPORTED",     # Honcho auto-summary
     "consolidation": "DERIVED",      # System sleep/summarize output
@@ -2191,7 +2191,8 @@ class BeamMemory:
     def __init__(self, session_id: str = "default", db_path: Path = None,
                  author_id: str = None, author_type: str = None,
                  channel_id: str = None, use_cloud: bool = False,
-                 event_emitter: "Optional[Callable[[Any], None]]" = None):
+                 event_emitter: "Optional[Callable[[Any], None]]" = None,
+                 llm_client=None):
         self.session_id = session_id
         self.author_id = author_id
         self.author_type = author_type
@@ -2212,6 +2213,7 @@ class BeamMemory:
         self._extraction_client = None  # Lazy-loaded ExtractionClient
         self._extraction_buffer = []  # Buffer for batch extraction
         self._event_emitter = event_emitter  # Streaming event callback
+        self._llm_client = llm_client  # LLM client for write-time conflict resolution
         self.conn = _get_connection(self.db_path)
         init_beam(self.db_path)
 
@@ -3003,7 +3005,8 @@ class BeamMemory:
                         predicate=fact.predicate,
                         object=fact.object,
                         veracity=veracity,
-                        source=memory_id
+                        source=memory_id,
+                        llm_client=self._llm_client
                     )
             except Exception:
                 pass  # Veracity failures are non-blocking
