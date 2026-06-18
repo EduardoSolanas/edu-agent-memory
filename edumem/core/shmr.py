@@ -7,8 +7,8 @@ continuous local memory orchestration inside edumem's BEAM architecture.
 Core idea: related memories "echo" each other in the background, negotiating
 contradictions, surfacing hidden patterns, and converging into stable beliefs.
 
-This is edumem's signature reasoning layer -- no Honcho dreams, no Hindsight
-reflections, no Mem0 static graphs. Memories actively resonate and self-correct.
+This is edumem's signature reasoning layer -- no static graphs, no passive
+reflections. Memories actively resonate and self-correct.
 """
 
 import os

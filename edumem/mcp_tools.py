@@ -722,27 +722,7 @@ def _handle_import(arguments: Dict[str, Any]) -> Dict[str, Any]:
     mem = _create_instance(author_id=arguments.get("author_id"), author_type=arguments.get("author_type"), channel_id=arguments.get("channel_id"), bank=bank)
 
     if provider:
-        api_key = arguments.get("api_key", "").strip()
-        user_id = arguments.get("user_id", "").strip() or None
-        agent_id = arguments.get("agent_id", "").strip() or None
-        base_url = arguments.get("base_url", "").strip() or None
-        channel_id = arguments.get("channel_id")
-        if not api_key:
-            env_key = f"{provider.upper()}_API_KEY"
-            api_key = os.environ.get(env_key, "")
-        if not api_key:
-            return {"error": f"api_key required for {provider} import. Set {provider.upper()}_API_KEY env var or pass api_key parameter."}
-        from edumem.core.importers import import_from_provider
-        result = import_from_provider(
-            provider, mem,
-            api_key=api_key,
-            user_id=user_id,
-            agent_id=agent_id,
-            base_url=base_url,
-            dry_run=dry_run,
-            channel_id=channel_id,
-        )
-        return _serialize(result.to_dict() if hasattr(result, "to_dict") else result)
+        return {"error": "Cross-provider import is not supported. Use input_path for file-based import."}
 
     if not input_path:
         return {"error": "Either input_path (for file import) or provider (for cross-provider import) is required"}

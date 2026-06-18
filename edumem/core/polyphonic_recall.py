@@ -179,7 +179,7 @@ class PolyphonicRecallEngine:
         empty vector voice and a 3-voice polyphonic engine.
 
         Returning to a single source of truth across the recall stack
-        matches the cross-system convergence pattern (Hindsight, mem0,
+        matches the cross-system convergence pattern (Hindsight,
         Zep, Cognee, Letta all use one dense store shared by every
         retrieval path) and makes polyphonic-vs-linear comparisons
         apples-to-apples for the BEAM-recovery experiment.

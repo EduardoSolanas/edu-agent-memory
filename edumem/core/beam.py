@@ -155,7 +155,6 @@ TRUST_TIER_MAP = {
     "cli":           "STATED",       # CLI direct user input
     "mcp":           "EXTERNAL_WRITE",  # External MCP tool calls
     "import":        "IMPORTED",     # Bulk import from file
-    "m0":            "IMPORTED",     # External service import
     "honcho_import": "IMPORTED",     # Honcho data migration
     "honcho_summary":"IMPORTED",     # Honcho auto-summary
     "consolidation": "DERIVED",      # System sleep/summarize output
