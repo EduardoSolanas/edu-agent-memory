@@ -1,0 +1,56 @@
+{
+  "conv-1:q0": {
+    "qid": "conv-1:q0",
+    "judge_model": "judge-model-v2",
+    "judge_time_ms": 12.3,
+    "judgment": {
+      "scores": [1.0, 0.4],
+      "overall_score": 0.7,
+      "official_score": 0.5,
+      "partial_credit_score": 0.7,
+      "scoring_mode": "official",
+      "parse_status": "ok",
+      "judge_status": "ok",
+      "judge_failure_class": null,
+      "judge_failure_message": "",
+      "finish_reason": "stop",
+      "response_had_content": true,
+      "retry_count": 0,
+      "raw_response": "{\"scores\":[1.0,0.4]}",
+      "raw_result": {
+        "scores": [1.0, 0.4],
+        "overall_score": 0.7
+      },
+      "assessment": "fresh assessment",
+      "brief_assessment": "fresh brief",
+      "nuggets": ["salads"]
+    }
+  },
+  "conv-1:q1": {
+    "qid": "conv-1:q1",
+    "judge_model": "judge-model-v2",
+    "judge_time_ms": 9.7,
+    "judgment": {
+      "scores": [0.2],
+      "overall_score": 0.2,
+      "official_score": 0.0,
+      "partial_credit_score": 0.2,
+      "scoring_mode": "official",
+      "parse_status": "ok",
+      "judge_status": "ok",
+      "judge_failure_class": null,
+      "judge_failure_message": "",
+      "finish_reason": "stop",
+      "response_had_content": true,
+      "retry_count": 0,
+      "raw_response": "{\"scores\":[0.2]}",
+      "raw_result": {
+        "scores": [0.2],
+        "overall_score": 0.2
+      },
+      "assessment": "fresh assessment",
+      "brief_assessment": "fresh brief",
+      "nuggets": ["tea"]
+    }
+  }
+}

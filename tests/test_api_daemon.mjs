@@ -1,30 +1,211 @@
+import { createServer } from 'node:http';
+import { spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert';
-import { spawn } from 'child_process';
 
 const PORT = 6339;
 const BASE_URL = `http://127.0.0.1:${PORT}`;
+const EMBEDDING_DIMENSION = 768;
+
+let daemonProcess;
+let qdrantServer;
+let embeddingServer;
+let qdrantUrl;
+let embeddingUrl;
+let uniqueFactText;
+let uniqueId;
+
+const collections = new Map();
+
+function readJsonBody(req) {
+  return new Promise((resolve, reject) => {
+    let body = '';
+    req.on('data', (chunk) => {
+      body += chunk;
+    });
+    req.on('end', () => {
+      if (!body) {
+        resolve({});
+        return;
+      }
+      try {
+        resolve(JSON.parse(body));
+      } catch (err) {
+        reject(err);
+      }
+    });
+    req.on('error', reject);
+  });
+}
+
+function getPathValue(object, path) {
+  return path.split('.').reduce((value, segment) => (value == null ? value : value[segment]), object);
+}
+
+function matchesFilter(point, must = []) {
+  return must.every((rule) => {
+    if (!rule || typeof rule !== 'object') {
+      return true;
+    }
+    const value = getPathValue(point.payload ?? {}, rule.key ?? '');
+    if (!rule.match || !Object.prototype.hasOwnProperty.call(rule.match, 'value')) {
+      return true;
+    }
+    return value === rule.match.value;
+  });
+}
+
+function getCollection(name) {
+  if (!collections.has(name)) {
+    collections.set(name, []);
+  }
+  return collections.get(name);
+}
+
+function buildEmbedding() {
+  const vector = new Array(EMBEDDING_DIMENSION).fill(0);
+  vector[0] = 1;
+  return vector;
+}
+
+async function startServer(handler) {
+  const server = createServer(handler);
+  await new Promise((resolve) => {
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const address = server.address();
+  if (!address || typeof address === 'string') {
+    throw new Error('Failed to bind test server.');
+  }
+  return { server, port: address.port };
+}
+
+function closeServer(server) {
+  if (!server) {
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => server.close(resolve));
+}
+
+async function startQdrantStub() {
+  return startServer(async (req, res) => {
+    const pathname = new URL(req.url, 'http://127.0.0.1').pathname;
+    const collectionMatch = pathname.match(/^\/collections\/([^/]+)$/);
+    const pointsMatch = pathname.match(/^\/collections\/([^/]+)\/points$/);
+    const searchMatch = pathname.match(/^\/collections\/([^/]+)\/points\/search$/);
+
+    if (req.method === 'GET' && collectionMatch) {
+      const collectionName = collectionMatch[1];
+      getCollection(collectionName);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ result: { status: 'ok', name: collectionName } }));
+      return;
+    }
+
+    if (req.method === 'PUT' && collectionMatch) {
+      const collectionName = collectionMatch[1];
+      getCollection(collectionName);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ result: { status: 'ok', name: collectionName } }));
+      return;
+    }
+
+    if (req.method === 'PUT' && pointsMatch) {
+      const collectionName = pointsMatch[1];
+      const body = await readJsonBody(req);
+      const points = Array.isArray(body.points) ? body.points : [];
+      const collection = getCollection(collectionName);
+      for (const point of points) {
+        collection.push({
+          id: point.id ?? randomUUID(),
+          vector: Array.isArray(point.vector) ? point.vector : buildEmbedding(),
+          payload: point.payload ?? {}
+        });
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ result: { status: 'ok', points: points.length } }));
+      return;
+    }
+
+    if (req.method === 'POST' && searchMatch) {
+      const collectionName = searchMatch[1];
+      const body = await readJsonBody(req);
+      const must = Array.isArray(body.filter?.must) ? body.filter.must : [];
+      const collection = getCollection(collectionName);
+      const matches = collection
+        .filter((point) => matchesFilter(point, must))
+        .map((point, index) => ({
+          id: point.id,
+          payload: point.payload,
+          score: 1 - index * 0.001
+        }));
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ result: matches.slice(0, body.limit ?? matches.length) }));
+      return;
+    }
+
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Not found' }));
+  });
+}
+
+async function startEmbeddingStub() {
+  return startServer(async (req, res) => {
+    const pathname = new URL(req.url, 'http://127.0.0.1').pathname;
+    if (req.method === 'POST' && pathname === '/v1/embeddings') {
+      await readJsonBody(req);
+      const embedding = buildEmbedding();
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        object: 'list',
+        data: [
+          {
+            object: 'embedding',
+            embedding,
+            index: 0
+          }
+        ],
+        model: 'stub-openvino-embedding',
+        usage: {
+          prompt_tokens: 0,
+          total_tokens: 0
+        }
+      }));
+      return;
+    }
+
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Not found' }));
+  });
+}
 
 describe('api-daemon Integration Tests', () => {
-  let daemonProcess;
-  let uniqueFactText;
-  let uniqueId;
-
   before(async () => {
     uniqueId = Date.now();
-    // Use a completely novel, non-overlapping semantic topic to prevent deduplication/merging
     uniqueFactText = `TDD story ${uniqueId}: a brilliant blue giraffe flew over the orange fence on port ${PORT}`;
-    
+
+    const qdrant = await startQdrantStub();
+    const embedding = await startEmbeddingStub();
+    qdrantServer = qdrant.server;
+    embeddingServer = embedding.server;
+    qdrantUrl = `http://127.0.0.1:${qdrant.port}`;
+    embeddingUrl = `http://127.0.0.1:${embedding.port}/v1/embeddings`;
+
     console.log('[Test Setup] Launching api-daemon on test port', PORT);
-    
-    // Launch api-daemon as a background subprocess, overriding PORT via env
-    daemonProcess = spawn('node', ['bin/api-daemon.mjs'], {
-      cwd: '/opt/edumem',
-      env: { ...process.env, PORT: PORT.toString() },
+
+    daemonProcess = spawn(process.execPath, ['bin/api-daemon.mjs'], {
+      cwd: process.cwd(),
+      env: {
+        ...process.env,
+        PORT: PORT.toString(),
+        VECTOR_DB_URL: qdrantUrl,
+        EMBEDDING_URL: embeddingUrl
+      },
       stdio: 'pipe'
     });
 
-    // Capture logs for debugging
     daemonProcess.stdout.on('data', (data) => {
       console.log(`[Daemon Stdout] ${data.toString().trim()}`);
     });
@@ -32,7 +213,6 @@ describe('api-daemon Integration Tests', () => {
       console.error(`[Daemon Stderr] ${data.toString().trim()}`);
     });
 
-    // Wait for the server to spin up and become healthy (poll /health)
     let healthy = false;
     for (let i = 0; i < 20; i++) {
       try {
@@ -47,7 +227,7 @@ describe('api-daemon Integration Tests', () => {
       } catch (err) {
         // Ignored during startup poll
       }
-      await new Promise(resolve => setTimeout(resolve, 500));
+      await new Promise((resolve) => setTimeout(resolve, 500));
     }
 
     if (!healthy) {
@@ -56,11 +236,13 @@ describe('api-daemon Integration Tests', () => {
     console.log('[Test Setup] api-daemon is ready and healthy!');
   });
 
-  after(() => {
+  after(async () => {
     if (daemonProcess) {
       console.log('[Test Teardown] Killing api-daemon process...');
       daemonProcess.kill('SIGTERM');
     }
+    await closeServer(qdrantServer);
+    await closeServer(embeddingServer);
   });
 
   test('GET /health returns 200 and healthy status payload', async () => {
@@ -88,8 +270,7 @@ describe('api-daemon Integration Tests', () => {
   });
 
   test('POST /v1/default/banks/testbank/memories/recall retrieves stored fact', async () => {
-    // Wait a brief moment to ensure write-index synchronization completes in Qdrant
-    await new Promise(resolve => setTimeout(resolve, 1500));
+    await new Promise((resolve) => setTimeout(resolve, 1500));
 
     const res = await fetch(`${BASE_URL}/v1/default/banks/testbank/memories/recall`, {
       method: 'POST',
@@ -103,9 +284,8 @@ describe('api-daemon Integration Tests', () => {
     const body = await res.json();
     assert.ok(Array.isArray(body.results));
     assert.ok(body.results.length > 0, 'Should return search results');
-    
-    // Find the stored fact in the returned results
-    const found = body.results.some(r => r.text.includes(uniqueId.toString()));
+
+    const found = body.results.some((r) => r.text.includes(uniqueId.toString()));
     assert.ok(found, `Should find the stored TDD test fact containing ${uniqueId} in search results`);
     assert.ok(body.results[0].score > 0.1, 'Matches should have valid confidence scores');
   });

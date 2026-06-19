@@ -14,7 +14,11 @@ from edumem.core.beam import (
     _fts_query_terms,
     clean_and_format_sequence,
     parse_relative_date,
-    generate_derived_temporal_facts
+    generate_derived_temporal_facts,
+    _wm_vector_only_hit_meets_floor,
+    _get_embedding_batch_size,
+    _get_embedding_batch_total_chars,
+    _iter_embedding_chunks,
 )
 from edumem.core.polyphonic_recall import PolyphonicRecallEngine, RecallResult
 
@@ -93,6 +97,82 @@ class TestEdumemCore:
         # Difference in days (10 days)
         assert "10 days before" in fact["content"]
         assert "2024-01-01 → 2024-01-11" in fact["content"]
+
+    def test_embedding_batch_size_default_and_override(self, monkeypatch):
+        monkeypatch.delenv("EDUMEM_EMBEDDING_BATCH_SIZE", raising=False)
+        assert _get_embedding_batch_size() == 8
+
+        monkeypatch.setenv("EDUMEM_EMBEDDING_BATCH_SIZE", "16")
+        assert _get_embedding_batch_size() == 16
+
+        monkeypatch.setenv("EDUMEM_EMBEDDING_BATCH_SIZE", "0")
+        assert _get_embedding_batch_size() == 8
+
+    def test_embedding_batch_total_chars_default_and_override(self, monkeypatch):
+        monkeypatch.delenv("EDUMEM_EMBEDDING_BATCH_TOTAL_CHARS", raising=False)
+        monkeypatch.delenv("EDUMEM_EMBEDDING_BATCH_CHAR_BUDGET", raising=False)
+        assert _get_embedding_batch_total_chars() == 6000
+
+        monkeypatch.setenv("EDUMEM_EMBEDDING_BATCH_TOTAL_CHARS", "4096")
+        assert _get_embedding_batch_total_chars() == 4096
+
+        monkeypatch.delenv("EDUMEM_EMBEDDING_BATCH_TOTAL_CHARS", raising=False)
+        monkeypatch.setenv("EDUMEM_EMBEDDING_BATCH_CHAR_BUDGET", "2048")
+        assert _get_embedding_batch_total_chars() == 2048
+
+        monkeypatch.setenv("EDUMEM_EMBEDDING_BATCH_CHAR_BUDGET", "0")
+        assert _get_embedding_batch_total_chars() == 6000
+
+    def test_embedding_chunk_helper_preserves_id_alignment(self):
+        items = [
+            {"content": "alpha"},
+            {"content": "bravo"},
+            {"content": "charlie"},
+            {"content": "delta"},
+            {"content": "echo"},
+        ]
+        ids = [
+            "id-0",
+            "id-1",
+            "id-2",
+            "id-3",
+            "id-4",
+        ]
+
+        chunks = list(_iter_embedding_chunks(items, ids, batch_size=2))
+
+        assert chunks == [
+            (0, 2, ["id-0", "id-1"], ["alpha", "bravo"]),
+            (2, 4, ["id-2", "id-3"], ["charlie", "delta"]),
+            (4, 5, ["id-4"], ["echo"]),
+        ]
+
+    def test_embedding_chunk_helper_caps_batches_at_eight_items(self):
+        items = [{"content": f"item-{i}"} for i in range(9)]
+        ids = [f"id-{i}" for i in range(9)]
+
+        chunks = list(_iter_embedding_chunks(items, ids, batch_size=8, total_chars=1000))
+
+        assert chunks == [
+            (0, 8, [f"id-{i}" for i in range(8)], [f"item-{i}" for i in range(8)]),
+            (8, 9, ["id-8"], ["item-8"]),
+        ]
+
+    def test_embedding_chunk_helper_respects_char_budget_and_isolates_oversized_messages(self):
+        items = [
+            {"content": "short-a"},
+            {"content": "short-b"},
+            {"content": "l" * 4000},
+            {"content": "x" * 7000},
+        ]
+        ids = ["id-short-a", "id-short-b", "id-long", "id-oversized"]
+
+        chunks = list(_iter_embedding_chunks(items, ids, batch_size=8, total_chars=5000))
+
+        assert chunks == [
+            (0, 3, ["id-short-a", "id-short-b", "id-long"], ["short-a", "short-b", "l" * 4000]),
+            (3, 4, ["id-oversized"], ["x" * 7000]),
+        ]
 
     def test_beam_memory_bi_temporal_grounding(self):
         """Verify bi-temporal database columns (occurred_at, recorded_at) and relative date resolution."""
@@ -268,6 +348,443 @@ class TestEdumemCore:
         finally:
             if db_path.exists():
                 db_path.unlink()
+
+
+class TestBeamCoreFixes:
+    def test_vector_only_floor_gate(self):
+        assert _wm_vector_only_hit_meets_floor(0.60)
+        assert _wm_vector_only_hit_meets_floor(0.91)
+        assert not _wm_vector_only_hit_meets_floor(0.59)
+
+    def test_structured_extraction_dedupes_synthetic_metadata_and_repeat_calls(self):
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
+            db_path = Path(tmp.name)
+        beam = None
+        try:
+            beam = BeamMemory(db_path=db_path)
+            memory_id = "mem_fix04"
+            content = (
+                "On 2024-03-15 My App deployed 3 features. "
+                "Always format code with syntax highlighting. "
+                "I prefer simple dependencies. "
+                "[DATES: 2024-03-15] datetokens: datetok20240315 [MSGIDX:42]"
+            )
+
+            first = beam.extract_and_store_facts(
+                content,
+                message_idx=42,
+                source_memory_id=memory_id,
+                source="beam_user",
+            )
+            second = beam.extract_and_store_facts(
+                content,
+                message_idx=42,
+                source_memory_id=memory_id,
+                source="beam_user",
+            )
+
+            assert first["metric"] == 1
+            assert first["date"] == 1
+            assert first["timeline"] == 1
+            assert first["instruction"] == 1
+            assert first["preference"] == 1
+            assert second["metric"] == 0
+            assert second["date"] == 0
+            assert second["timeline"] == 0
+            assert second.get("instruction", 0) == 0
+            assert second.get("preference", 0) == 0
+
+            assert beam.conn.execute(
+                "SELECT COUNT(*) FROM memoria_facts WHERE source_memory_id = ? AND fact_type = 'metric'",
+                (memory_id,),
+            ).fetchone()[0] == 1
+            assert beam.conn.execute(
+                "SELECT COUNT(*) FROM memoria_facts WHERE source_memory_id = ? AND fact_type = 'date'",
+                (memory_id,),
+            ).fetchone()[0] == 1
+            assert beam.conn.execute(
+                "SELECT COUNT(*) FROM memoria_timelines WHERE source_memory_id = ?",
+                (memory_id,),
+            ).fetchone()[0] == 1
+            assert beam.conn.execute(
+                "SELECT COUNT(*) FROM memoria_instructions WHERE source_memory_id = ?",
+                (memory_id,),
+            ).fetchone()[0] == 1
+            assert beam.conn.execute(
+                "SELECT COUNT(*) FROM memoria_preferences WHERE source_memory_id = ?",
+                (memory_id,),
+            ).fetchone()[0] == 1
+        finally:
+            if beam is not None:
+                beam.conn.close()
+            if db_path.exists():
+                try:
+                    db_path.unlink()
+                except PermissionError:
+                    pass
+
+    def test_structured_dedupe_is_scoped_to_session(self):
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
+            db_path = Path(tmp.name)
+        beam_a = None
+        beam_b = None
+        try:
+            beam_a = BeamMemory(session_id="session_a", db_path=db_path)
+            beam_b = BeamMemory(session_id="session_b", db_path=db_path)
+            content = (
+                "On 2024-03-15 Project uses PostgreSQL v16.1 and deployed 3 features. "
+                "Always format code with syntax highlighting. "
+                "I prefer simple dependencies. I never use tabs."
+            )
+
+            first = beam_a.extract_and_store_facts(
+                content,
+                message_idx=42,
+                source_memory_id="shared_mem",
+                source="beam_user",
+            )
+            second = beam_b.extract_and_store_facts(
+                content,
+                message_idx=42,
+                source_memory_id="shared_mem",
+                source="beam_user",
+            )
+
+            assert first == second
+            assert beam_a.conn.execute(
+                "SELECT COUNT(*) FROM memoria_facts WHERE session_id = ?",
+                (beam_a.session_id,),
+            ).fetchone()[0] == first["metric"] + first["date"] + first["version"] + first["sequence"]
+            assert beam_b.conn.execute(
+                "SELECT COUNT(*) FROM memoria_facts WHERE session_id = ?",
+                (beam_b.session_id,),
+            ).fetchone()[0] == second["metric"] + second["date"] + second["version"] + second["sequence"]
+
+            assert beam_a.conn.execute(
+                "SELECT COUNT(*) FROM memoria_timelines WHERE session_id = ?",
+                (beam_a.session_id,),
+            ).fetchone()[0] == first["timeline"]
+            assert beam_b.conn.execute(
+                "SELECT COUNT(*) FROM memoria_timelines WHERE session_id = ?",
+                (beam_b.session_id,),
+            ).fetchone()[0] == second["timeline"]
+
+            assert beam_a.conn.execute(
+                "SELECT COUNT(*) FROM memoria_kg WHERE session_id = ?",
+                (beam_a.session_id,),
+            ).fetchone()[0] == first["negation"] + first["decision"]
+            assert beam_b.conn.execute(
+                "SELECT COUNT(*) FROM memoria_kg WHERE session_id = ?",
+                (beam_b.session_id,),
+            ).fetchone()[0] == second["negation"] + second["decision"]
+
+            assert beam_a.conn.execute(
+                "SELECT COUNT(*) FROM memoria_instructions WHERE session_id = ?",
+                (beam_a.session_id,),
+            ).fetchone()[0] == first["instruction"]
+            assert beam_b.conn.execute(
+                "SELECT COUNT(*) FROM memoria_instructions WHERE session_id = ?",
+                (beam_b.session_id,),
+            ).fetchone()[0] == second["instruction"]
+
+            assert beam_a.conn.execute(
+                "SELECT COUNT(*) FROM memoria_preferences WHERE session_id = ?",
+                (beam_a.session_id,),
+            ).fetchone()[0] == first["preference"]
+            assert beam_b.conn.execute(
+                "SELECT COUNT(*) FROM memoria_preferences WHERE session_id = ?",
+                (beam_b.session_id,),
+            ).fetchone()[0] == second["preference"]
+        finally:
+            if beam_a is not None:
+                beam_a.conn.close()
+            if beam_b is not None:
+                beam_b.conn.close()
+            if db_path.exists():
+                try:
+                    db_path.unlink()
+                except PermissionError:
+                    pass
+
+    def test_msgidx_propagates_into_structured_rows(self):
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
+            db_path = Path(tmp.name)
+        beam = None
+        try:
+            beam = BeamMemory(db_path=db_path)
+            batch = [
+                {
+                    "content": (
+                        "On 2024-03-15 My App deployed 3 features. "
+                        "Always format code with syntax highlighting. "
+                        "I prefer simple dependencies. [MSGIDX:0]"
+                    ),
+                    "source": "beam_user",
+                    "message_index": 0,
+                },
+                {
+                    "content": (
+                        "On 2024-03-16 My App deployed 4 features. "
+                        "Always format code with syntax highlighting. "
+                        "I prefer simple dependencies. [MSGIDX:1]"
+                    ),
+                    "source": "beam_user",
+                    "message_index": 1,
+                },
+            ]
+
+            ids = beam.remember_batch(batch)
+            assert len(ids) == 2
+
+            def structured_indices(memory_id: str) -> set[int]:
+                indices = set()
+                for table in (
+                    "memoria_facts",
+                    "memoria_timelines",
+                    "memoria_instructions",
+                    "memoria_preferences",
+                ):
+                    rows = beam.conn.execute(
+                        f"SELECT message_idx FROM {table} WHERE source_memory_id = ? AND message_idx IS NOT NULL",
+                        (memory_id,),
+                    ).fetchall()
+                    indices.update(row["message_idx"] for row in rows)
+                return indices
+
+            assert structured_indices(ids[0]) == {0}
+            assert structured_indices(ids[1]) == {1}
+        finally:
+            if beam is not None:
+                beam.conn.close()
+            if db_path.exists():
+                try:
+                    db_path.unlink()
+                except PermissionError:
+                    pass
+
+    def test_user_authored_instructions_and_preferences_only(self):
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
+            db_path = Path(tmp.name)
+        beam = None
+        try:
+            beam = BeamMemory(db_path=db_path)
+            ids = beam.remember_batch([
+                {
+                    "content": "The API latency is 12ms on 2024-03-15.",
+                    "source": "beam_assistant",
+                    "message_index": 0,
+                },
+                {
+                    "content": "Always format code with syntax highlighting. I prefer simple dependencies.",
+                    "source": "beam_user",
+                    "message_index": 1,
+                },
+            ])
+            assistant_id, user_id = ids
+
+            assert beam.conn.execute(
+                "SELECT COUNT(*) FROM memoria_instructions WHERE source_memory_id = ?",
+                (assistant_id,),
+            ).fetchone()[0] == 0
+            assert beam.conn.execute(
+                "SELECT COUNT(*) FROM memoria_preferences WHERE source_memory_id = ?",
+                (assistant_id,),
+            ).fetchone()[0] == 0
+            assert beam.conn.execute(
+                "SELECT COUNT(*) FROM memoria_facts WHERE source_memory_id = ? AND fact_type = 'metric'",
+                (assistant_id,),
+            ).fetchone()[0] == 1
+            assert beam.conn.execute(
+                "SELECT COUNT(*) FROM memoria_facts WHERE source_memory_id = ? AND fact_type = 'date'",
+                (assistant_id,),
+            ).fetchone()[0] == 1
+
+            assert beam.conn.execute(
+                "SELECT COUNT(*) FROM memoria_instructions WHERE source_memory_id = ?",
+                (user_id,),
+            ).fetchone()[0] == 1
+            assert beam.conn.execute(
+                "SELECT COUNT(*) FROM memoria_preferences WHERE source_memory_id = ?",
+                (user_id,),
+            ).fetchone()[0] == 1
+        finally:
+            if beam is not None:
+                beam.conn.close()
+            if db_path.exists():
+                try:
+                    db_path.unlink()
+                except PermissionError:
+                    pass
+
+    def test_vector_only_recall_smoke_with_embeddings(self):
+        from edumem.core import embeddings as _embeddings
+        import importlib
+
+        endpoint = os.environ.get("EDUMEM_TEST_INFERENCE_URL")
+        if not endpoint:
+            pytest.skip("EDUMEM_TEST_INFERENCE_URL not set")
+
+        saved_api_url = os.environ.get("EDUMEM_EMBEDDING_API_URL")
+        saved_no_embeddings = os.environ.get("EDUMEM_NO_EMBEDDINGS")
+        saved_model = os.environ.get("EDUMEM_EMBEDDING_MODEL")
+        try:
+            os.environ["EDUMEM_EMBEDDING_API_URL"] = endpoint
+            os.environ.pop("EDUMEM_NO_EMBEDDINGS", None)
+            test_model = os.environ.get("EDUMEM_TEST_INFERENCE_MODEL")
+            if test_model:
+                os.environ["EDUMEM_EMBEDDING_MODEL"] = test_model
+            importlib.reload(_embeddings)
+
+            with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
+                db_path = Path(tmp.name)
+            beam = None
+            try:
+                beam = BeamMemory(db_path=db_path)
+                strong = "A physician examines a patient in the clinic."
+                weak = "A bicycle is leaning against a wall in the garage."
+                beam.remember_batch([
+                    {
+                        "content": strong,
+                        "source": "beam_user",
+                        "message_index": 0,
+                    },
+                    {
+                        "content": weak,
+                        "source": "beam_user",
+                        "message_index": 1,
+                    },
+                ])
+
+                results = beam.recall(
+                    "A doctor checks a sick person at the hospital.",
+                    top_k=10,
+                )
+                assert any(strong in row["content"] for row in results)
+                assert not any(weak in row["content"] for row in results)
+            finally:
+                if beam is not None:
+                    beam.conn.close()
+                if db_path.exists():
+                    try:
+                        db_path.unlink()
+                    except PermissionError:
+                        pass
+        finally:
+            if saved_api_url is None:
+                os.environ.pop("EDUMEM_EMBEDDING_API_URL", None)
+            else:
+                os.environ["EDUMEM_EMBEDDING_API_URL"] = saved_api_url
+            if saved_no_embeddings is None:
+                os.environ.pop("EDUMEM_NO_EMBEDDINGS", None)
+            else:
+                os.environ["EDUMEM_NO_EMBEDDINGS"] = saved_no_embeddings
+            if saved_model is None:
+                os.environ.pop("EDUMEM_EMBEDDING_MODEL", None)
+            else:
+                os.environ["EDUMEM_EMBEDDING_MODEL"] = saved_model
+            importlib.reload(_embeddings)
+
+    def test_ingest_diagnostics_and_supersession_deltas(self):
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
+            db_path = Path(tmp.name)
+        beam = None
+        try:
+            beam = BeamMemory(db_path=db_path)
+
+            first_ids = beam.remember_batch([
+                {
+                    "content": (
+                        "I prefer simple dependencies. "
+                        "Always format code with syntax highlighting."
+                    ),
+                    "source": "beam_user",
+                    "message_index": 0,
+                },
+                {
+                    "content": (
+                        "Project uses PostgreSQL v16.1 and deployed on 2024-03-15."
+                    ),
+                    "source": "beam_assistant",
+                    "message_index": 1,
+                }
+            ])
+
+            batch1 = beam._last_ingest_diagnostics_batch
+            assert batch1 is not None
+            assert len(batch1["rows"]) == 2
+            assert batch1["rows"][0]["source_role"] == "user"
+            assert batch1["rows"][0]["message_idx"] == 0
+            assert batch1["rows"][0]["graph_facts_delta"] == 0
+            assert batch1["rows"][0]["consolidated_delta"] == 0
+            assert batch1["rows"][0]["superseded_delta"] == 0
+            assert batch1["rows"][1]["source_role"] == "assistant"
+            assert batch1["rows"][1]["message_idx"] == 1
+            assert batch1["rows"][1]["graph_facts_delta"] >= 1
+            assert batch1["rows"][1]["consolidated_delta"] >= 1
+            assert batch1["rows"][1]["superseded_delta"] == 0
+            assert batch1["totals"]["graph_facts_delta"] == batch1["rows"][0]["graph_facts_delta"] + batch1["rows"][1]["graph_facts_delta"]
+            assert batch1["totals"]["consolidated_delta"] == batch1["rows"][0]["consolidated_delta"] + batch1["rows"][1]["consolidated_delta"]
+            assert batch1["totals"]["superseded_delta"] == 0
+            assert beam._last_ingest_diagnostics["message_idx"] == 1
+            assert beam._last_ingest_diagnostics["source_role"] == "assistant"
+
+            assert beam.conn.execute(
+                "SELECT COUNT(*) FROM facts"
+            ).fetchone()[0] == 1
+            assert beam.conn.execute(
+                "SELECT COUNT(*) FROM consolidated_facts"
+            ).fetchone()[0] == 1
+            assert beam.conn.execute(
+                "SELECT COUNT(*) FROM consolidated_facts WHERE superseded_by IS NOT NULL"
+            ).fetchone()[0] == 0
+            assert beam.conn.execute(
+                "SELECT COUNT(*) FROM conflicts"
+            ).fetchone()[0] == 0
+
+            second_ids = beam.remember_batch([
+                {
+                    "content": "Project uses MySQL v8.0 and deployed on 2024-03-16.",
+                    "source": "beam_assistant",
+                    "message_index": 2,
+                }
+            ])
+
+            batch2 = beam._last_ingest_diagnostics_batch
+            assert batch2 is not None
+            assert len(batch2["rows"]) == 1
+            assert batch2["rows"][0]["source_role"] == "assistant"
+            assert batch2["rows"][0]["message_idx"] == 2
+            assert batch2["rows"][0]["graph_facts_delta"] >= 1
+            assert batch2["rows"][0]["consolidated_delta"] >= 1
+            assert batch2["rows"][0]["superseded_delta"] == 0
+
+            conflict = beam.conn.execute(
+                "SELECT id, fact_a_id, fact_b_id FROM conflicts ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            assert conflict is not None
+            fact_rows = beam.conn.execute(
+                "SELECT id, object FROM consolidated_facts WHERE subject = ? AND predicate = ? ORDER BY first_seen",
+                ("Project", "uses"),
+            ).fetchall()
+            assert len(fact_rows) >= 2
+            winning_id = next(row["id"] for row in fact_rows if row["object"] == "MySQL")
+
+            before_superseded = beam.conn.execute(
+                "SELECT COUNT(*) FROM consolidated_facts WHERE superseded_by IS NOT NULL"
+            ).fetchone()[0]
+            beam.veracity_consolidator.resolve_conflict(conflict["id"], winning_id)
+            after_superseded = beam.conn.execute(
+                "SELECT COUNT(*) FROM consolidated_facts WHERE superseded_by IS NOT NULL"
+            ).fetchone()[0]
+            assert after_superseded == before_superseded + 1
+        finally:
+            if beam is not None:
+                beam.conn.close()
+            if db_path.exists():
+                try:
+                    db_path.unlink()
+                except PermissionError:
+                    pass
 
 
 class TestNegationTagging:

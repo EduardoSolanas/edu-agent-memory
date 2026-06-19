@@ -15,10 +15,10 @@ if not os.path.exists(PROJECT_ROOT):
 VENV_DIR = os.path.join(PROJECT_ROOT, ".venv")
 MODELS_DIR = os.path.join(PROJECT_ROOT, "models")
 
-GTE_MODEL = "Alibaba-NLP/gte-modernbert-base"
+GTE_MODEL = "sentence-transformers/all-mpnet-base-v2"
 GTE_DIR = os.path.join(MODELS_DIR, "gte-modernbert-ov")
 
-ETTIN_MODEL = "cross-encoder/ettin-reranker-17m-v1"
+ETTIN_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 ETTIN_DIR = os.path.join(MODELS_DIR, "ettin-17m-ov")
 
 def load_hf_token():
@@ -96,6 +96,17 @@ def install_optimum():
     # Fallback to assuming we can run 'optimum-cli' from PATH or venv
     return venv_optimum_cli
 
+def _build_export_command(optimum_cli, model_name, task, out_dir):
+    cmd = [
+        optimum_cli,
+        "export", "openvino",
+        "--model", model_name,
+        "--task", task,
+        "--weight-format", "fp16",
+    ]
+    cmd.append(out_dir)
+    return cmd
+
 def run_export(optimum_cli, model_name, task, out_dir, hf_token):
     print(f"Exporting model {model_name} (Task: {task}) to {out_dir}...")
     
@@ -109,14 +120,7 @@ def run_export(optimum_cli, model_name, task, out_dir, hf_token):
         # Also set HUGGING_FACE_HUB_TOKEN just in case
         env["HUGGING_FACE_HUB_TOKEN"] = hf_token
         
-    cmd = [
-        optimum_cli,
-        "export", "openvino",
-        "--model", model_name,
-        "--task", task,
-        "--weight-format", "fp16",
-        out_dir
-    ]
+    cmd = _build_export_command(optimum_cli, model_name, task, out_dir)
     
     print(f"Executing: {' '.join(cmd)}")
     try:
@@ -165,7 +169,13 @@ def main():
         if os.path.exists(GTE_DIR):
             print(f"Removing existing directory: {GTE_DIR}")
             shutil.rmtree(GTE_DIR, ignore_errors=True)
-        run_export(optimum_cli, GTE_MODEL, "feature-extraction", GTE_DIR, hf_token)
+        run_export(
+            optimum_cli,
+            GTE_MODEL,
+            "feature-extraction",
+            GTE_DIR,
+            hf_token,
+        )
     else:
         print(f"Skipping GTE ModernBERT export (already exists at {GTE_DIR})")
         

@@ -9,32 +9,41 @@ This repository contains **edumem** (our Node.js `api-daemon` runtime service), 
 To standardize execution and eliminate virtualized hardware mapping overhead, the entire memory subsystem is packaged into a **single, unified, self-contained Docker image**. 
 
 ### **⚙️ Model Preparation (Crucial First Step)**
-Before you can build the Docker image or run the cognitive memory pipeline on a fresh clone, you **must** download and prepare the required OpenVINO models. 
+The image now builds the OpenVINO embedding and reranker models inside the container. You do not need to pre-run `bin/prepare_models.py` on the host.
 
-An automated, non-interactive Python script `bin/prepare_models.py` is provided to handle this cleanly. It will:
-1. Load your Hugging Face credentials (`HF_TOKEN`) from `/opt/edumem/.env` (or standard environment variables).
-2. Install `optimum-intel[openvino]` in the virtual environment if not already available.
-3. Skip exporting if the models are already prepared (unless `--force` is specified).
-4. Download and export the models to FP16 OpenVINO format:
-   - **GTE ModernBERT** (`Alibaba-NLP/gte-modernbert-base`) -> `models/gte-modernbert-ov`
-   - **Ettin Reranker** (`cross-encoder/ettin-reranker-17m-v1`) -> `models/ettin-17m-ov`
-
-To prepare the models, run:
-```bash
-python3 bin/prepare_models.py
+Build with your Hugging Face token if you need authenticated downloads. If the token is only in `.env`, load it into PowerShell first:
+```powershell
+$env:HF_TOKEN = ((Get-Content .env | Where-Object { $_ -match '^HF_TOKEN=' } | Select-Object -First 1) -replace '^HF_TOKEN=', '').Trim('"')
+podman build --build-arg HF_TOKEN=$env:HF_TOKEN -t edumem:latest .
 ```
 
-To force re-exporting of already prepared models, use:
+If you do not need a token, omit the `--build-arg HF_TOKEN=...` flag.
+
+The build exports these OpenVINO models inside the image:
+1. `sentence-transformers/all-mpnet-base-v2` -> `models/gte-modernbert-ov`
+2. `cross-encoder/ms-marco-MiniLM-L-6-v2` -> `models/ettin-17m-ov`
+
+If you still want to export them manually on the host, the script remains available:
 ```bash
+python3 bin/prepare_models.py
 python3 bin/prepare_models.py --force
 ```
 
 ### **🚀 Running the Stack**
-The entire cognitive memory platform runs as a single background container, exposing production-grade endpoints:
+The default runtime is CPU-safe. On Linux hosts with an Intel iGPU, you can add the `/dev/dri` mount back in.
 
 ```bash
-# Spin up the unified container with Intel GPU access
-docker run -d \
+podman run -d \
+  --name edumem-app \
+  -p 3002:3002 \
+  -p 6333:6333 \
+  -p 6336:6336 \
+  edumem:latest
+```
+
+Optional Intel GPU runtime on Linux:
+```bash
+podman run -d \
   --name edumem-app \
   -p 3002:3002 \
   -p 6333:6333 \

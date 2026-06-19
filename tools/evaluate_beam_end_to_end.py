@@ -38,6 +38,7 @@ import os
 import sys
 import tempfile
 import time
+from copy import deepcopy
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from functools import partial
@@ -128,6 +129,452 @@ def _context_value_match(question: str, context_facts: dict, min_score: float = 
     if best_value is not None and best_score >= min_score:
         return best_value, best_score
     return None, best_score
+
+
+def _extract_shared_date_spans(text: str) -> list[dict]:
+    """Extract named, ordinal, and ISO date spans from text.
+
+    The helper returns raw matched spans for tagging plus a parsed date
+    object only when the text contains an explicit year. Month/day forms
+    without a year are kept as raw spans so we do not invent a year.
+    """
+    import re
+
+    if not text:
+        return []
+
+    month_names = (
+        "january|february|march|april|may|june|july|august|"
+        "september|october|november|december|"
+        "jan|feb|mar|apr|jun|jul|aug|sep|oct|nov|dec"
+    )
+    spans: list[dict] = []
+    seen: set[tuple] = set()
+
+    def _add(raw: str, start: int, end: int, dt=None):
+        key = (start, end, raw.lower(), dt.isoformat() if dt else None)
+        if key in seen:
+            return
+        seen.add(key)
+        spans.append({
+            "raw": raw,
+            "start": start,
+            "end": end,
+            "date_obj": dt,
+            "iso": dt.strftime("%Y-%m-%d") if dt else None,
+        })
+
+    # Explicit ISO dates.
+    for m in re.finditer(r'\b(?P<year>\d{4})-(?P<month>\d{2})-(?P<day>\d{2})\b', text):
+        try:
+            dt = datetime(int(m.group("year")), int(m.group("month")), int(m.group("day")))
+        except ValueError:
+            continue
+        _add(m.group(0), m.start(), m.end(), dt)
+
+    # Month-name forms with an explicit year.
+    for m in re.finditer(
+        rf'\b(?P<month>{month_names})[a-z]*\s+'
+        rf'(?P<day>\d{{1,2}})(?:st|nd|rd|th)?'
+        rf'(?:,?\s*(?P<year>\d{{4}}))?\b',
+        text,
+        re.IGNORECASE,
+    ):
+        month = m.group("month")[:3].lower()
+        month_map = {
+            "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+            "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+        }
+        year = m.group("year")
+        try:
+            if year:
+                dt = datetime(int(year), month_map[month], int(m.group("day")))
+                _add(m.group(0), m.start(), m.end(), dt)
+            else:
+                _add(m.group(0), m.start(), m.end(), None)
+        except ValueError:
+            continue
+
+    # Day-first ordinal forms such as "15th of March, 2024" and
+    # "15 March". We keep the no-year form as raw text only.
+    for m in re.finditer(
+        rf'\b(?P<day>\d{{1,2}})(?:st|nd|rd|th)?(?:\s+of)?\s+'
+        rf'(?P<month>{month_names})[a-z]*'
+        rf'(?:,?\s*(?P<year>\d{{4}}))?\b',
+        text,
+        re.IGNORECASE,
+    ):
+        month = m.group("month")[:3].lower()
+        month_map = {
+            "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+            "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+        }
+        year = m.group("year")
+        try:
+            if year:
+                dt = datetime(int(year), month_map[month], int(m.group("day")))
+                _add(m.group(0), m.start(), m.end(), dt)
+            else:
+                _add(m.group(0), m.start(), m.end(), None)
+        except ValueError:
+            continue
+
+    return spans
+
+
+def _query_wants_if_pf(question: str) -> bool:
+    """Detect when a question likely needs instruction/preference memories."""
+    import re
+
+    q = (question or "").lower()
+    patterns = (
+        r'\binstruction(s)?\b',
+        r'\bformat\b',
+        r'\bfollow\b',
+        r'\bpreference(s)?\b',
+        r'\bprefer\b',
+        r'\blike\b.*\bkeep\b',
+        r'\bmust\b',
+        r'\bshould\b',
+        r'\balways\b',
+        r'\bnever\b',
+    )
+    return any(re.search(p, q) for p in patterns)
+
+
+def _select_conversations(conversations: list[dict], sample_size: int | None = None,
+                          start_index: int = 0, case_index: int | None = None) -> tuple[list[dict], list[str]]:
+    """Select a deterministic subset of conversations and return selected IDs."""
+    if case_index is not None:
+        if case_index < 0 or case_index >= len(conversations):
+            raise IndexError(f"case_index {case_index} out of range for {len(conversations)} conversations")
+        selected = [conversations[case_index]]
+        return selected, [conversations[case_index]["id"]]
+
+    if start_index < 0:
+        raise ValueError("start_index must be >= 0")
+
+    end_index = None if sample_size is None else start_index + sample_size
+    selected = conversations[start_index:end_index]
+    return selected, [conv["id"] for conv in selected]
+
+
+def _table_counts(conn, tables: list[str]) -> dict[str, int]:
+    """Return per-table row counts for delta-based ingestion diagnostics."""
+    counts = {}
+    cursor = conn.cursor()
+    for table in tables:
+        try:
+            counts[table] = int(cursor.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+        except Exception:
+            counts[table] = 0
+    return counts
+
+
+def _mean_float_score(scores: list) -> float:
+    """Return the arithmetic mean of numeric judge scores."""
+    numeric_scores = []
+    for item in scores:
+        try:
+            numeric_scores.append(float(item))
+        except (TypeError, ValueError):
+            numeric_scores.append(0.0)
+    return sum(numeric_scores) / len(numeric_scores) if numeric_scores else 0.0
+
+
+def _mean_int_score(scores: list) -> float:
+    """Return the official-compatible mean of integer-cast rubric scores."""
+    numeric_scores = []
+    for item in scores:
+        try:
+            numeric_scores.append(int(float(item)))
+        except (TypeError, ValueError):
+            numeric_scores.append(0)
+    return sum(numeric_scores) / len(numeric_scores) if numeric_scores else 0.0
+
+
+def _parse_judge_payload(raw: str) -> tuple[dict | list | None, str]:
+    """Parse judge JSON from pristine, fenced, or prose-wrapped content."""
+    if raw is None or not str(raw).strip():
+        return None, "parse_failure"
+    cleaned = _clean_judge_json(str(raw))
+    if not cleaned or not cleaned.strip():
+        return None, "parse_failure"
+    try:
+        return json.loads(cleaned), "ok"
+    except Exception:
+        return None, "parse_failure"
+
+
+def _summarize_judge_result(judgment: dict, fallback_reason: str | None = None) -> dict:
+    """Normalize judge metadata while preserving raw responses."""
+    scores = []
+    for item in judgment.get("scores", []):
+        try:
+            scores.append(float(item))
+        except (TypeError, ValueError):
+            scores.append(0.0)
+    partial_credit = _mean_float_score(scores)
+    official_score = judgment.get("official_score")
+    if official_score is None:
+        official_score = _mean_int_score(scores)
+    try:
+        official_score = float(official_score)
+    except (TypeError, ValueError):
+        official_score = 0.0
+    parse_status = judgment.get("parse_status", "ok")
+    if fallback_reason and parse_status == "ok":
+        parse_status = fallback_reason
+    return {
+        "scores": scores,
+        "official_score": official_score,
+        "partial_credit_score": partial_credit,
+        "scoring_mode": judgment.get("scoring_mode", "unknown"),
+        "parse_status": parse_status,
+        "judge_status": judgment.get("judge_status", "ok"),
+        "judge_failure_class": judgment.get("judge_failure_class"),
+        "finish_reason": judgment.get("finish_reason"),
+        "response_had_content": judgment.get("response_had_content"),
+        "retry_count": judgment.get("retry_count", 0),
+        "judge_api_error_class": judgment.get("judge_failure_class"),
+        "judge_failure_message": judgment.get("judge_failure_message", ""),
+        "judge_api_error_message": judgment.get("judge_failure_message", ""),
+        "raw_response": judgment.get("raw_response", ""),
+        "raw_result": judgment.get("raw_result"),
+        "assessment": judgment.get("assessment", ""),
+        "brief_assessment": judgment.get("brief_assessment", ""),
+        "nuggets": judgment.get("nuggets", []),
+    }
+
+
+_SENSITIVE_KEY_PARTS = ("KEY", "TOKEN", "SECRET")
+
+
+def _sanitize_sensitive_data(value):
+    """Redact sensitive values from nested JSON-like structures."""
+    if isinstance(value, dict):
+        sanitized = {}
+        for key, item in value.items():
+            key_text = str(key)
+            if any(part in key_text.upper() for part in _SENSITIVE_KEY_PARTS):
+                sanitized[key] = "***redacted***"
+            else:
+                sanitized[key] = _sanitize_sensitive_data(item)
+        return sanitized
+    if isinstance(value, list):
+        return [_sanitize_sensitive_data(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_sanitize_sensitive_data(item) for item in value)
+    return value
+
+
+def _write_json_sanitized(payload, fp, **dump_kwargs):
+    """Write sanitized JSON to an open file handle."""
+    return json.dump(_sanitize_sensitive_data(payload), fp, **dump_kwargs)
+
+
+def _json_dumps_sanitized(payload, **dump_kwargs):
+    """Serialize sanitized JSON for JSONL appends and similar writes."""
+    return json.dumps(_sanitize_sensitive_data(payload), **dump_kwargs)
+
+
+def _print_env_snapshot(env_snapshot: dict) -> dict:
+    """Print a sanitized environment snapshot and return the sanitized copy."""
+    sanitized = _sanitize_sensitive_data(env_snapshot)
+    print(f"\n  Env snapshot ({len(sanitized)} vars):")
+    for key in sorted(sanitized):
+        print(f"    {key}={sanitized[key]}")
+    return sanitized
+
+
+def _question_row_policy(question_row: dict) -> dict:
+    """Decide whether a probing row should be evaluated or explicitly skipped."""
+    question = question_row.get("question", "")
+    if question is None:
+        question = ""
+    if not isinstance(question, str):
+        question = str(question)
+
+    ideal_answer = question_row.get(
+        "ideal_answer",
+        question_row.get("ideal_response", question_row.get("answer", question_row.get("ideal_summary", ""))),
+    )
+    if ideal_answer is None:
+        ideal_answer = ""
+    if not isinstance(ideal_answer, str):
+        ideal_answer = str(ideal_answer)
+
+    rubric = question_row.get("rubric", [])
+    if not isinstance(rubric, list):
+        rubric = []
+
+    question_text = question.strip()
+    if not question_text:
+        return {
+            "should_evaluate": False,
+            "skip_reason": "missing_question",
+            "question": question,
+            "ideal_answer": ideal_answer,
+            "rubric": rubric,
+        }
+    if not rubric:
+        return {
+            "should_evaluate": False,
+            "skip_reason": "missing_rubric",
+            "question": question_text,
+            "ideal_answer": ideal_answer,
+            "rubric": rubric,
+        }
+    return {
+        "should_evaluate": True,
+        "skip_reason": None,
+        "question": question_text,
+        "ideal_answer": ideal_answer,
+        "rubric": rubric,
+    }
+
+
+def _build_skipped_question_result(
+    *,
+    qid: str,
+    ability: str,
+    question: str,
+    ideal_answer: str,
+    rubric: list,
+    skip_reason: str,
+) -> dict:
+    """Record an explicitly skipped question row for accounting."""
+    return {
+        "qid": qid,
+        "ability": ability,
+        "question": question[:200],
+        "question_full": question,
+        "ideal_answer": ideal_answer[:200],
+        "ideal_answer_full": ideal_answer,
+        "rubric": rubric,
+        "status": "skipped",
+        "skipped": True,
+        "skip_reason": skip_reason,
+        "score": None,
+        "official_score": None,
+        "partial_credit_score": None,
+        "parse_status": "skipped",
+        "judge_status": "skipped",
+        "judge_failure_class": None,
+        "judge_failure_message": "",
+        "judge_raw_response": "",
+        "judge_raw_result": None,
+        "judge_raw_payload": None,
+        "judge_finish_reason": None,
+        "judge_response_had_content": None,
+        "judge_retry_count": 0,
+        "assessment": "",
+        "judge_assessment": "",
+        "answer_model": None,
+        "judge_model": None,
+        "answer_time_ms": 0.0,
+        "judge_time_ms": 0.0,
+        "retrieval_diagnostics": {},
+        "answer_api_diagnostics": {},
+        "nuggets": [],
+        "recall_provenance": {},
+        "ai_answer": "",
+        "ai_answer_full": "",
+        "ai_answer_excerpt": "",
+    }
+
+
+def _is_skipped_question_result(question_result: dict) -> bool:
+    """Return True when a question row was explicitly skipped."""
+    return bool(question_result.get("skipped")) or question_result.get("status") == "skipped"
+
+
+def _iter_evaluated_question_rows(all_results: list[dict]):
+    """Yield only evaluated question rows from nested conversation results."""
+    for conv_result in all_results:
+        for question in conv_result.get("results", []):
+            if _is_skipped_question_result(question):
+                continue
+            yield question
+
+
+def _build_paired_outcome_rows(conv_result: dict, config_id: str, run_started_at: str) -> list[dict]:
+    """Build paired-outcome rows for evaluated questions only."""
+    paired_rows = []
+    for question in conv_result.get("results", []):
+        if _is_skipped_question_result(question):
+            continue
+        try:
+            score = float(question.get("score", 0.0))
+        except (TypeError, ValueError):
+            score = 0.0
+        paired_rows.append({
+            "config_id": config_id,
+            "run_started_at": run_started_at,
+            "scale": conv_result.get("scale"),
+            "conversation_id": conv_result.get("conversation_id"),
+            "qid": question.get("qid"),
+            "ability": question.get("ability"),
+            "score": score,
+            "correct": score >= 0.5,
+        })
+    return paired_rows
+
+
+def _finalize_reranker_run_health(preflight: dict | None, call_diag: dict | None = None) -> dict:
+    """Combine reranker preflight state with call-time health."""
+    finalized = deepcopy(call_diag or {})
+    preflight_diag = deepcopy(preflight or {})
+    finalized["preflight"] = preflight_diag
+    finalized["preflight_health"] = "ok" if preflight_diag.get("ok") else "unavailable"
+
+    calls = int(finalized.get("calls", 0) or 0)
+    successes = int(finalized.get("successes", 0) or 0)
+    failures = int(finalized.get("failures", 0) or 0)
+
+    if calls > 0:
+        if successes == 0:
+            call_health = "failed" if failures > 0 else "degraded"
+        elif failures > 0:
+            call_health = "degraded"
+        else:
+            call_health = "ok"
+    else:
+        call_health = "not_run"
+
+    finalized["call_health"] = call_health
+    finalized["health"] = call_health if calls > 0 else finalized["preflight_health"]
+    finalized["failed"] = finalized["health"] == "failed"
+    return finalized
+
+
+def _summarize_reranker_run(question_results: list[dict], preflight: dict | None) -> dict:
+    """Aggregate reranker call diagnostics for a conversation or run."""
+    summary = {
+        "calls": 0,
+        "successes": 0,
+        "failures": 0,
+        "fallbacks": 0,
+        "scores_recorded": 0,
+        "errors": [],
+    }
+    for question in question_results:
+        reranker_diag = question.get("retrieval_diagnostics", {}).get("reranker")
+        if not isinstance(reranker_diag, dict):
+            continue
+        for key in ("calls", "successes", "failures", "fallbacks", "scores_recorded"):
+            try:
+                summary[key] += int(reranker_diag.get(key, 0) or 0)
+            except (TypeError, ValueError):
+                continue
+        errors = reranker_diag.get("errors", [])
+        if isinstance(errors, list):
+            summary["errors"].extend(deepcopy(errors))
+        elif errors:
+            summary["errors"].append(deepcopy(errors))
+        if summary.get("url") is None and reranker_diag.get("url") is not None:
+            summary["url"] = reranker_diag.get("url")
+    return _finalize_reranker_run_health(preflight, summary)
 
 # --- Config ---
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
@@ -222,16 +669,30 @@ class LLMClient:
         self.base_url = (base_url or OPENROUTER_BASE_URL).rstrip("/")
         self.fallback_models = FALLBACK_MODELS.copy()
         self.call_count = 0
+        self.last_error_class = None
+        self.last_error_message = ""
+        self.last_finish_reason = None
+        self.last_response_had_content = None
+        self.last_response = ""
+        self.last_retry_count = 0
 
     def chat(self, messages: list, temperature: float = 0.1, max_tokens: int = 1024) -> str:
         """Send chat completion request with retry. No fallback models to avoid rate limits."""
         
         last_error = None
+        self.last_retry_count = 0
         for attempt in range(3):
             try:
-                return self._call_api(self.model, messages, temperature, max_tokens)
+                response = self._call_api(self.model, messages, temperature, max_tokens)
+                self.last_response = response
+                self.last_error_class = None
+                self.last_error_message = ""
+                return response
             except Exception as e:
                 last_error = str(e)
+                self.last_error_class = type(e).__name__
+                self.last_error_message = str(e)
+                self.last_retry_count = attempt + 1
                 if "429" in last_error or "rate" in last_error.lower():
                     wait = 15 * (attempt + 1)  # 15s, 30s, 45s backoff
                     time.sleep(wait)
@@ -239,7 +700,9 @@ class LLMClient:
                 else:
                     break  # Non-retryable error
 
-        return f"[LLM_ERROR: all models failed. Last: {last_error}]"
+        self.last_response = f"[LLM_ERROR: all models failed. Last: {last_error}]"
+        self.last_response_had_content = False
+        return self.last_response
 
     def _call_api(self, model: str, messages: list, temperature: float, max_tokens: int) -> str:
         """Single API call via requests (urllib blocked by Cloudflare on some providers)."""
@@ -262,10 +725,11 @@ class LLMClient:
         resp.raise_for_status()
         data = resp.json()
         self.call_count += 1
+        self.last_finish_reason = data["choices"][0].get("finish_reason", "unknown")
         content = data["choices"][0]["message"].get("content")
+        self.last_response_had_content = content is not None
         if content is None:
-            finish_reason = data["choices"][0].get("finish_reason", "unknown")
-            print(f"    [DEBUG-API-NULL] model={model} finish_reason={finish_reason} tokens_used={data.get('usage', {}).get('total_tokens', '?')}", flush=True)
+            print(f"    [DEBUG-API-NULL] model={model} finish_reason={self.last_finish_reason} tokens_used={data.get('usage', {}).get('total_tokens', '?')}", flush=True)
             return ""  # Return empty string instead of None so callers don't choke
         return content
 
@@ -454,18 +918,11 @@ def _extract_facts(content: str, source: str = "unknown") -> list[dict]:
         })
     
     # Pattern 3: Dates
-    date_patterns = [
-        r'(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},?\s*\d{4}',
-        r'\d{4}-\d{2}-\d{2}',
-    ]
-    for pat in date_patterns:
-        for match in re.findall(pat, content, re.IGNORECASE):
-            if isinstance(match, tuple):
-                match = " ".join(match)
-            facts.append({
-                "content": f"FACT date: {match}",
-                "importance": 0.7,
-            })
+    for span in _extract_shared_date_spans(content):
+        facts.append({
+            "content": f"FACT date: {span['raw']}",
+            "importance": 0.7,
+        })
     
     # Pattern 4: Deadlines
     deadline_matches = re.findall(r'(deadline|due by|sprint ends?|sprint \d+)\s*[:\-]?\s*([^.,;!?\n]{5,80})', content, re.IGNORECASE)
@@ -548,11 +1005,68 @@ def _detect_preference(content: str) -> bool:
     return any(re.search(p, q) for p in patterns)
 
 
-def ingest_conversation(beam: BeamMemory, messages: list[dict]) -> dict:
+def _update_embedding_diagnostic(
+    embed_diag: dict,
+    *,
+    backend_available: bool,
+    model: str | None = None,
+    dimension: int | None = None,
+    eligible_rows: int = 0,
+    inserted_vectors: int = 0,
+    rows_before: int | None = None,
+    rows_after: int | None = None,
+    api_calls_before: int | None = None,
+    api_calls_after: int | None = None,
+) -> dict:
+    """Update embedding diagnostics without mutating shared state."""
+    updated = dict(embed_diag)
+    updated.setdefault("backend", "dense" if backend_available else "keyword-only")
+    if model is not None:
+        updated.setdefault("model", model)
+    if dimension is not None:
+        updated.setdefault("dimension", dimension)
+    updated["eligible_rows"] = updated.get("eligible_rows", 0) + eligible_rows
+    updated["inserted_vectors"] = updated.get("inserted_vectors", 0) + inserted_vectors
+    if rows_before is not None and updated.get("memory_embeddings_rows_before") is None:
+        updated["memory_embeddings_rows_before"] = rows_before
+    if rows_after is not None:
+        updated["memory_embeddings_rows_after"] = rows_after
+    if rows_before is not None and rows_after is not None:
+        updated["memory_embeddings_row_delta"] = (
+            updated.get("memory_embeddings_row_delta", 0) + max(rows_after - rows_before, 0)
+        )
+    if api_calls_before is not None and api_calls_after is not None:
+        updated["api_calls"] = api_calls_after - api_calls_before
+    if backend_available and updated.get("eligible_rows", 0) > 0 and updated.get("inserted_vectors", 0) != updated.get("eligible_rows", 0):
+        updated["failed"] = True
+        updated["status"] = "failed"
+    elif not updated.get("failed"):
+        updated["status"] = "dense" if backend_available else "keyword-only"
+    return updated
+
+
+def ingest_conversation(beam: BeamMemory, messages: list[dict], diag: dict | None = None) -> dict:
     """Ingest conversation messages into edumem BEAM tiers.
     Also builds an in-memory facts index for fact-boosted retrieval."""
     start_time = time.perf_counter()
     stats = {"wm_count": 0, "ep_count": 0, "sp_count": 0, "total_chars": 0}
+    if diag is not None:
+        embedding_backend_available = _embeddings.available()
+        embed_diag = diag.setdefault("embedding", {})
+        embed_diag = _update_embedding_diagnostic(
+            embed_diag,
+            backend_available=embedding_backend_available,
+            model=getattr(_embeddings, "_DEFAULT_MODEL", None),
+            dimension=getattr(_embeddings, "EMBEDDING_DIM", None),
+        )
+        embed_diag.setdefault("query_vectors", 0)
+        embed_diag.setdefault("memory_embeddings_rows_before", None)
+        embed_diag.setdefault("memory_embeddings_rows_after", None)
+        embed_diag.setdefault("memory_embeddings_row_delta", 0)
+        embed_diag.setdefault("failed", False)
+        if hasattr(_embeddings, "_API_CALL_COUNT"):
+            embed_diag.setdefault("api_calls_before", getattr(_embeddings, "_API_CALL_COUNT", None))
+        diag["embedding"] = embed_diag
     
     # In-memory context→value facts index for direct fact matching.
     # Format: {"context phrase": "fact value"} -- maps question-like phrases to answers.
@@ -583,16 +1097,17 @@ def ingest_conversation(beam: BeamMemory, messages: list[dict]) -> dict:
             if not raw_content.strip():
                 continue
             content = raw_content
-            # Temporal tag injection: bake dates and durations into content
-            # so FTS5 can find them during recall. Same pattern as memory.py.
+            # Temporal tag injection: bake date strings into content so
+            # FTS5 can find them during recall. Preserve raw date text
+            # and only generate datetok tokens for explicit ISO dates.
             import re as _re_tags
-            dates = _re_tags.findall(r'\b\d{4}-\d{2}-\d{2}\b', content)
-            if dates:
-                content = f"{content} [DATES: {', '.join(dates)}]"
-                # FIX 1 (TR): Append FTS-survivable date tokens (datetokYYYYMMDD)
-                # so ISO dates like 2024-03-15 become searchable as single tokens.
-                datetok_strs = [f"datetok{date.replace('-', '')}" for date in dates]
-                content = f"{content} datetokens: {' '.join(datetok_strs)}"
+            date_spans = _extract_shared_date_spans(content)
+            if date_spans:
+                raw_dates = [span["raw"] for span in date_spans]
+                content = f"{content} [DATES: {', '.join(raw_dates)}]"
+                datetok_strs = [f"datetok{span['iso'].replace('-', '')}" for span in date_spans if span.get("iso")]
+                if datetok_strs:
+                    content = f"{content} datetokens: {' '.join(datetok_strs)}"
             durations = _re_tags.findall(r'\b\d+\s(?:days|weeks|months|years)\b', content, _re_tags.IGNORECASE)
             if durations:
                 content = f"{content} [DURATIONS: {', '.join(durations)}]"
@@ -601,16 +1116,16 @@ def ingest_conversation(beam: BeamMemory, messages: list[dict]) -> dict:
             content = f"[MSGIDX:{batch_start + i}] {content}"
 
             # Detect and tag instructions and preferences for IF/PF abilities
-            if _detect_instruction(raw_content):
+            if msg.get("role", "").lower() == "user" and _detect_instruction(raw_content):
                 content = f"{content} [INSTRUCTION]"
-            if _detect_preference(raw_content):
+            if msg.get("role", "").lower() == "user" and _detect_preference(raw_content):
                 content = f"{content} [PREFERENCE]"
 
             batch_items.append({
                 "content": content,
                 "source": f"beam_{msg.get('role', 'unknown')}",
-                "importance": 0.3 + (0.1 * ((batch_start + i) % 5)),
-                "timestamp": "2024-03-15T12:00:00",
+                "importance": 0.5,
+                "timestamp": msg.get("timestamp") or "1970-01-01T00:00:00Z",
                 "message_index": batch_start + i,
             })
             stats["total_chars"] += len(content)
@@ -647,24 +1162,38 @@ def ingest_conversation(beam: BeamMemory, messages: list[dict]) -> dict:
         if not batch_items:
             continue
 
+        structured_tables = [
+            "memoria_facts",
+            "memoria_timelines",
+            "memoria_instructions",
+            "memoria_preferences",
+            "memoria_kg",
+        ]
+        before_structured = _table_counts(beam.conn, structured_tables)
+        before_embedding_rows = _table_counts(beam.conn, ["memory_embeddings"]).get("memory_embeddings", 0)
         batch_ids = beam.remember_batch(batch_items)
+        after_structured = _table_counts(beam.conn, structured_tables)
+        after_embedding_rows = _table_counts(beam.conn, ["memory_embeddings"]).get("memory_embeddings", 0)
         stats["wm_count"] += len(batch_items)
-
-        # MEMORIA: Structured fact extraction for every message in this batch
-        # Uses regex to extract metrics, dates, versions, negations, etc.
-        # into the new facts/timelines/knowledge_graph tables.
-        _fact_counts = {}
-        for j, msg in enumerate(batch_msgs):
-            _raw = msg.get("content", "")
-            if _raw.strip():
-                _fc = beam.extract_and_store_facts(_raw, batch_start + j)
-                for k, v in _fc.items():
-                    if isinstance(v, (int, float)):
-                        _fact_counts[k] = _fact_counts.get(k, 0) + v
-        if _fact_counts:
-            stats["memoria_facts"] = _fact_counts
-            total = sum(_fact_counts.values())
-            print(f"    [MEMORIA] extracted {total} facts: {_fact_counts}", flush=True)
+        stats["structured_deltas"] = {
+            table: after_structured.get(table, 0) - before_structured.get(table, 0)
+            for table in structured_tables
+        }
+        if diag is not None:
+            embed_diag = diag.setdefault("embedding", {})
+            eligible_rows = len(batch_items)
+            batch_inserted = max(after_embedding_rows - before_embedding_rows, 0)
+            embed_diag = _update_embedding_diagnostic(
+                embed_diag,
+                backend_available=_embeddings.available(),
+                model=getattr(_embeddings, "_DEFAULT_MODEL", None),
+                dimension=getattr(_embeddings, "EMBEDDING_DIM", None),
+                eligible_rows=eligible_rows,
+                inserted_vectors=batch_inserted,
+                rows_before=before_embedding_rows,
+                rows_after=after_embedding_rows,
+            )
+            diag["embedding"] = embed_diag
 
         # Cloud fact extraction: extract facts from batch if enabled
         if getattr(beam, 'use_cloud', False):
@@ -775,6 +1304,21 @@ def ingest_conversation(beam: BeamMemory, messages: list[dict]) -> dict:
                 stats.setdefault("sleep_errors", []).append(repr(e))
 
     stats["ingest_time_ms"] = (time.perf_counter() - start_time) * 1000
+    if diag is not None:
+        diag.setdefault("embedding", {})
+        embed_diag = diag["embedding"]
+        embed_diag.setdefault("memory_embeddings_rows_before", 0)
+        embed_diag.setdefault("memory_embeddings_rows_after", 0)
+        embed_diag.setdefault("memory_embeddings_row_delta", 0)
+        embed_diag = _update_embedding_diagnostic(
+            embed_diag,
+            backend_available=_embeddings.available(),
+            model=getattr(_embeddings, "_DEFAULT_MODEL", None),
+            dimension=getattr(_embeddings, "EMBEDDING_DIM", None),
+            api_calls_before=embed_diag.pop("api_calls_before", None) if hasattr(_embeddings, "_API_CALL_COUNT") else None,
+            api_calls_after=getattr(_embeddings, "_API_CALL_COUNT", None) if hasattr(_embeddings, "_API_CALL_COUNT") else None,
+        )
+        diag["embedding"] = embed_diag
     return stats
 
 
@@ -947,29 +1491,59 @@ def _extract_search_terms(question: str) -> list[str]:
     return unique
 
 
-def _multi_strategy_recall(beam: BeamMemory, question: str, top_k: int = DEFAULT_TOP_K, ability: str = None) -> list:
+def _multi_strategy_recall(beam: BeamMemory, question: str, top_k: int = DEFAULT_TOP_K,
+                           ability: str = None, diag: dict | None = None) -> list:
     """Multi-strategy retrieval: keyword, semantic, entity, negation, temporal."""
     import re
     all_memories = []
     seen_content_keys = set()
+    strategy_diag = diag.setdefault("strategies", {}) if diag is not None else None
 
-    def _add_unique(mems):
+    def _strategy_bucket(name: str) -> dict | None:
+        if strategy_diag is None:
+            return None
+        return strategy_diag.setdefault(name, {
+            "activated": False,
+            "candidates_before_dedup": 0,
+            "added_after_dedup": 0,
+            "final_contribution": 0,
+        })
+
+    def _add_unique(mems, strategy_name: str | None = None):
+        before = len(all_memories)
         for mem in mems:
+            mem.setdefault("raw_score", mem.get("score", mem.get("relevance", 0.0)))
+            if strategy_name and not mem.get("retrieval_strategy"):
+                mem["retrieval_strategy"] = strategy_name
             ck = mem.get("content", "")[:80]
             if ck not in seen_content_keys:
                 seen_content_keys.add(ck)
                 all_memories.append(mem)
+        return len(all_memories) - before
+
+    def _mark(name: str, activated: bool = True):
+        bucket = _strategy_bucket(name)
+        if bucket is not None:
+            bucket["activated"] = bucket["activated"] or activated
+
+    def _note_add(name: str, candidates_before_dedup: int, added_after_dedup: int):
+        bucket = _strategy_bucket(name)
+        if bucket is not None:
+            bucket["candidates_before_dedup"] += max(candidates_before_dedup, 0)
+            bucket["added_after_dedup"] += max(added_after_dedup, 0)
 
     # FIX 2 (EO): Raise candidate depth for ordering queries.
     # Ordering questions need more candidates to capture all [MSGIDX:N] mentions.
     # Multiply top_k by 3 for ordering questions so they get broader context.
     if is_ordering_query(question):
         top_k = top_k * 3
+        _mark("EO")
 
     # MR: Raise candidate depth for aggregation queries
     # Aggregation questions need broader retrieval to find items across multiple sessions
     if is_aggregation_query(question):
         top_k = top_k * 3
+        _mark("MR")
 
     # Detect temporal questions by ability type or keywords
     temporal_keywords = ['when', 'date', 'deadline', 'sprint', 'day', 'week', 'month',
@@ -981,7 +1555,9 @@ def _multi_strategy_recall(beam: BeamMemory, question: str, top_k: int = DEFAULT
     temporal_weight = 0.3 if is_temporal else 0.0
     
     # Strategy 1: Direct question search (mostly keyword via FTS5)
-    _add_unique(_recall_safe(beam, question, top_k * 2, temporal_weight=temporal_weight))
+    _mark("S1")
+    _candidate_mems = _recall_safe(beam, question, top_k * 2, temporal_weight=temporal_weight)
+    _note_add("S1", len(_candidate_mems), _add_unique(_candidate_mems, "S1"))
     
     # Strategy 2: Negation search for contradiction detection
     if any(w in question.lower() for w in ["have i", "did i", "do i", "am i", "has"]):
@@ -989,7 +1565,9 @@ def _multi_strategy_recall(beam: BeamMemory, question: str, top_k: int = DEFAULT
         _neg_terms = _extract_search_terms(question)
         for term in _neg_terms[:3]:
             if len(term) > 2:
-                _add_unique(_recall_safe(beam, f"NEG {term}", max(5, top_k // 2)))
+                _mark("S2")
+                _candidate_mems = _recall_safe(beam, f"NEG {term}", max(5, top_k // 2))
+                _note_add("S2", len(_candidate_mems), _add_unique(_candidate_mems, "S2"))
 
         # 2b: SQL LIKE search for negation words near topic terms
         _neg_topic_terms = re.findall(r'[A-Z][a-z]+(?:[-\s][A-Z][a-z]+)*', question)
@@ -1014,8 +1592,8 @@ def _multi_strategy_recall(beam: BeamMemory, question: str, top_k: int = DEFAULT
                     ).fetchall()
                     for _nr in _neg_rows:
                         if _nr[1]:
-                            _add_unique([{"id": _nr[0], "content": _nr[1], "score": 0.80,
-                                         "source": "negation_search"}])
+                            _note_add("S2", 1, _add_unique([{"id": _nr[0], "content": _nr[1], "score": 0.80,
+                                 "source": "negation_search"}], "S2"))
                 except Exception:
                     pass
 
@@ -1035,8 +1613,8 @@ def _multi_strategy_recall(beam: BeamMemory, question: str, top_k: int = DEFAULT
                 ).fetchall()
                 for _tr in _topic_rows:
                     if _tr[1]:
-                        _add_unique([{"id": _tr[0], "content": _tr[1], "score": 0.70,
-                                     "source": "topic_mention"}])
+                        _note_add("S2", 1, _add_unique([{"id": _tr[0], "content": _tr[1], "score": 0.70,
+                                     "source": "topic_mention"}], "S2"))
             except Exception:
                 pass
 
@@ -1056,7 +1634,7 @@ def _multi_strategy_recall(beam: BeamMemory, question: str, top_k: int = DEFAULT
                     (f"%{term}%",)
                 ).fetchall()
                 for row in superseded_rows:
-                    _add_unique([{"id": row[0], "content": row[1], "score": 0.6, "source": "superseded_recall"}])
+                    _note_add("S2", 1, _add_unique([{"id": row[0], "content": row[1], "score": 0.6, "source": "superseded_recall"}], "S2"))
             except Exception:
                 pass
 
@@ -1064,14 +1642,18 @@ def _multi_strategy_recall(beam: BeamMemory, question: str, top_k: int = DEFAULT
     terms = _extract_search_terms(question)
     for term in terms[:5]:
         if len(term) > 2:
-            _add_unique(_recall_safe(beam, term, max(5, top_k // 3), temporal_weight=temporal_weight))
+            _mark("S3")
+            _candidate_mems = _recall_safe(beam, term, max(5, top_k // 3), temporal_weight=temporal_weight)
+            _note_add("S3", len(_candidate_mems), _add_unique(_candidate_mems, "S3"))
     
     # Strategy 4: Temporal search for date-related questions
     if is_temporal:
+        _mark("TR")
         # Stronger temporal boost for date-specific sub-queries
         date_temporal_weight = 0.5
         # Search for dates and timelines
-        _add_unique(_recall_safe(beam, "deadline schedule timeline date", top_k, temporal_weight=date_temporal_weight))
+        _candidate_mems = _recall_safe(beam, "deadline schedule timeline date", top_k, temporal_weight=date_temporal_weight)
+        _note_add("TR", len(_candidate_mems), _add_unique(_candidate_mems, "TR"))
 
         # --- NEW: Hard-filter for specific extracted date strings ---
         # If the question asks about a specific date (e.g., '2024-03-15'), force-filter SQL
@@ -1080,25 +1662,29 @@ def _multi_strategy_recall(beam: BeamMemory, question: str, top_k: int = DEFAULT
         if date_match:
             exact_date = date_match.group(0)
             # Inject a high-priority hard-filter query
-            _add_unique(_recall_safe(beam, f"content:'{exact_date}'", top_k * 2, temporal_weight=0.9))
+            _candidate_mems = _recall_safe(beam, f"content:'{exact_date}'", top_k * 2, temporal_weight=0.9)
+            _note_add("TR", len(_candidate_mems), _add_unique(_candidate_mems, "TR"))
 
             # FIX 1 (TR): Also search for the datetok version of this date
             # so FTS5 can find it as a single token (no hyphens: datetokYYYYMMDD)
             datetok = f"datetok{exact_date.replace('-', '')}"
-            _add_unique(_recall_safe(beam, datetok, top_k, temporal_weight=0.9))
+            _candidate_mems = _recall_safe(beam, datetok, top_k, temporal_weight=0.9)
+            _note_add("TR", len(_candidate_mems), _add_unique(_candidate_mems, "TR"))
 
         # FIX 1 (TR): Extract any ISO dates in the question and search via datetok tokens
         # This ensures date-bearing messages are retrievable even when FTS5 alone fails.
         iso_dates = re.findall(r'\d{4}-\d{2}-\d{2}', question)
         for iso_date in iso_dates:
             datetok = f"datetok{iso_date.replace('-', '')}"
-            _add_unique(_recall_safe(beam, datetok, max(5, top_k // 2), temporal_weight=date_temporal_weight))
+            _candidate_mems = _recall_safe(beam, datetok, max(5, top_k // 2), temporal_weight=date_temporal_weight)
+            _note_add("TR", len(_candidate_mems), _add_unique(_candidate_mems, "TR"))
 
         # Search for specific months mentioned in the question
         for month in ['january', 'february', 'march', 'april', 'may', 'june',
                       'july', 'august', 'september', 'october', 'november', 'december']:
             if month in question.lower():
-                _add_unique(_recall_safe(beam, month, top_k // 2, temporal_weight=date_temporal_weight))
+                _candidate_mems = _recall_safe(beam, month, top_k // 2, temporal_weight=date_temporal_weight)
+                _note_add("TR", len(_candidate_mems), _add_unique(_candidate_mems, "TR"))
 
     # Strategy 5: Two-hop entity retrieval for multi-hop reasoning
     if len(all_memories) > 0:
@@ -1111,19 +1697,43 @@ def _multi_strategy_recall(beam: BeamMemory, question: str, top_k: int = DEFAULT
         q_lower_hop = question.lower()
         _hop_entities = {e for e in _hop_entities if e.lower() not in q_lower_hop and len(e) > 3}
         for entity in list(_hop_entities)[:5]:
-            _add_unique(_recall_safe(beam, entity, max(5, top_k // 3)))
+            _mark("MR")
+            _candidate_mems = _recall_safe(beam, entity, max(5, top_k // 3))
+            _note_add("MR", len(_candidate_mems), _add_unique(_candidate_mems, "MR"))
 
     # Strategy 6: Instruction and Preference retrieval for IF/PF abilities
     try:
-        for tag in ["INSTRUCTION", "PREFERENCE"]:
-            tag_rows = beam.conn.execute(
-                "SELECT id, content FROM working_memory "
-                "WHERE content LIKE ? AND superseded_by IS NULL "
-                "LIMIT 10",
-                (f"%[{tag}]%",)
-            ).fetchall()
-            for row in tag_rows:
-                _add_unique([{"content": row["content"], "score": 0.8, "source": f"{tag.lower()}_recall"}])
+        if _query_wants_if_pf(question):
+            _mark("IF")
+            _mark("PF")
+            q_terms = [
+                term.lower()
+                for term in _extract_search_terms(question)
+                if len(term) > 2 and term.lower() not in {
+                    "instruction", "instructions", "preference", "preferences",
+                    "prefer", "should", "always", "never", "follow",
+                }
+            ]
+            for tag in ["INSTRUCTION", "PREFERENCE"]:
+                if q_terms:
+                    query_terms = q_terms[:8]
+                    term_clause = " OR ".join(["content LIKE ?"] * len(query_terms))
+                    params = [beam.session_id, f"%[{tag}]%"] + [f"%{term}%" for term in query_terms]
+                    tag_rows = beam.conn.execute(
+                        "SELECT id, content FROM working_memory "
+                        "WHERE session_id = ? AND superseded_by IS NULL "
+                        "AND content LIKE ? "
+                        f"AND ({term_clause}) "
+                        "ORDER BY message_index DESC, timestamp DESC, rowid DESC "
+                        "LIMIT 10",
+                        params,
+                    ).fetchall()
+                else:
+                    tag_rows = []
+                for row in tag_rows:
+                    content = row["content"]
+                    strategy_name = "IF" if tag == "INSTRUCTION" else "PF"
+                    _note_add(strategy_name, 1, _add_unique([{"content": content, "score": 0.75, "source": f"{tag.lower()}_recall"}], strategy_name))
     except Exception:
         pass
 
@@ -1137,11 +1747,35 @@ def _multi_strategy_recall(beam: BeamMemory, question: str, top_k: int = DEFAULT
                      'from', 'with', 'about', 'into', 'your', 'trying', 'implement'}
         _mr_terms = [t for t in _mr_terms if t not in _mr_stop][:5]
         for term in _mr_terms:
-            _add_unique(_recall_safe(beam, term, top_k))
+            _mark("MR")
+            _candidate_mems = _recall_safe(beam, term, top_k)
+            _note_add("MR", len(_candidate_mems), _add_unique(_candidate_mems, "MR"))
 
     # Sort by score and return top-k
     all_memories.sort(key=lambda x: x.get("score", 0), reverse=True)
+    if strategy_diag is not None:
+        final_counts = defaultdict(int)
+        for mem in all_memories[:top_k]:
+            final_counts[mem.get("retrieval_strategy") or "unknown"] += 1
+        for name, bucket in strategy_diag.items():
+            bucket["final_contribution"] = final_counts.get(name, 0)
     return all_memories[:top_k]
+
+
+def _attach_second_pass_diagnostics(q_diag: dict | None, gap_queries: list[str], gap_diag: dict | None) -> None:
+    """Store recursive pass telemetry separately from first-pass diagnostics."""
+    if q_diag is None:
+        return
+    q_diag["second_pass"] = {
+        "activated": bool(gap_queries),
+        "gap_queries": list(gap_queries),
+        "strategies": deepcopy((gap_diag or {}).get("strategies", {})),
+    }
+
+
+def _record_second_pass_diagnostics(diag: dict | None, gap_queries: list[str], gap_diag: dict | None) -> None:
+    """Attach second-pass telemetry to the active retrieval diagnostics dict."""
+    _attach_second_pass_diagnostics(diag, gap_queries, gap_diag)
 
 
 # ============================================================
@@ -1633,16 +2267,25 @@ def _summarize_recall_memories(memories: list) -> dict:
     schema consistency).
     """
     if not memories:
-        return {"engine": "unknown", "kept_count": 0, "voice_sums": {},
-                "top_result_voices": {}, "top_result_tier": None}
+        return {
+            "engine": "unknown",
+            "kept_count": 0,
+            "voice_sums": {},
+            "top_result_voices": {},
+            "top_result_tier": None,
+            "memories": [],
+        }
 
     # Engine ID by the voice_scores keyset of any result that has one.
     engine = "unknown"
     voice_sums: dict = {}
+    memory_summaries: list[dict] = []
+    import hashlib
+
     for m in memories:
         vs = m.get("voice_scores") or {}
         if not vs:
-            continue
+            vs = {}
         if engine == "unknown":
             keys = set(vs.keys())
             if keys & _POLYPHONIC_VOICE_KEYS:
@@ -1655,6 +2298,28 @@ def _summarize_recall_memories(memories: list) -> dict:
             except (TypeError, ValueError):
                 pass  # ignore non-numeric voice values
 
+        content = m.get("content", "")
+        content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest() if content else None
+        raw_score = m.get("raw_score", m.get("score", 0.0))
+        final_score = m.get("score", m.get("relevance", 0.0))
+        memory_summaries.append({
+            "memory_id": m.get("id"),
+            "content_hash": content_hash,
+            "source": m.get("source"),
+            "message_index": m.get("message_index"),
+            "raw_score": raw_score,
+            "final_score": final_score,
+            "components": {
+                "dense": vs.get("vector", vs.get("vec")),
+                "fts": vs.get("fts"),
+                "keyword": vs.get("keyword"),
+                "reranker": m.get("rerank_score"),
+                "importance": vs.get("importance", m.get("importance")),
+                "recency_decay": vs.get("recency_decay"),
+            },
+            "final_context_included": bool(m.get("final_context_included", False)),
+        })
+
     top = memories[0] if memories else {}
     return {
         "engine": engine,
@@ -1665,19 +2330,20 @@ def _summarize_recall_memories(memories: list) -> dict:
             for k, v in (top.get("voice_scores") or {}).items()
         },
         "top_result_tier": top.get("tier"),
+        "memories": memory_summaries,
     }
 
 
 def _inject_temporal_cheatsheet(memories: list, question: str) -> str:
-    """Extract ISO dates from recalled memories and inject a temporal cheat sheet.
+    """Extract natural-language dates from recalled memories and inject a temporal cheat sheet.
 
     Pure-recall legal: reads only from recalled memories, not raw conversation_messages.
 
     Logic:
     1. Only activate if is_temporal_query(question)
-    2. Extract ALL ISO dates from memory content with surrounding context
-    3. Parse, sort chronologically
-    4. Compute pairwise timedeltas between consecutive events
+    2. Extract all supported date spans from memory content with surrounding context
+    3. Parse explicit-year dates, sort chronologically
+    4. Compute pairwise timedeltas between consecutive explicit dates
     5. Return a formatted cheat sheet string with dates and deltas
 
     Returns: str -- cheat sheet markup (empty string if no dates or not temporal)
@@ -1688,44 +2354,30 @@ def _inject_temporal_cheatsheet(memories: list, question: str) -> str:
     if not is_temporal_query(question):
         return ""
 
-    # Extract all ISO dates from memories
-    date_pattern = r'\d{4}-\d{2}-\d{2}'
-    date_events = []  # list of (date_str, context_snippet)
+    # Extract all supported date spans from memories.
+    date_events = []  # list of (date_obj, date_str, context_snippet)
+    raw_only_events = []  # list of (raw_date, context_snippet)
 
     for mem in memories:
         content = mem.get("content", "")
         if not content:
             continue
 
-        # Find all ISO dates in this memory
-        for match in re.finditer(date_pattern, content):
-            date_str = match.group(0)
-
-            # Extract context snippet (~30 chars around the date)
-            start = max(0, match.start() - 15)
-            end = min(len(content), match.end() + 15)
+        for span in _extract_shared_date_spans(content):
+            start = max(0, span["start"] - 15)
+            end = min(len(content), span["end"] + 15)
             context = content[start:end].strip()
-
-            date_events.append((date_str, context))
+            if span.get("date_obj"):
+                date_events.append((span["date_obj"], span["iso"], context))
+            else:
+                raw_only_events.append((span["raw"], context))
 
     # If no dates found, return empty
-    if not date_events:
+    if not date_events and not raw_only_events:
         return ""
 
-    # Parse dates and sort chronologically
-    date_objs = []
-    for date_str, context in date_events:
-        try:
-            dt = datetime.strptime(date_str, "%Y-%m-%d")
-            date_objs.append((dt, date_str, context))
-        except ValueError:
-            pass  # Skip invalid dates
-
-    if not date_objs:
-        return ""
-
-    # Sort by date
-    date_objs.sort(key=lambda x: x[0])
+    # Sort explicit dates chronologically.
+    date_objs = sorted(date_events, key=lambda x: x[0])
 
     # Build cheat sheet
     lines = ["[TEMPORAL REFERENCE]"]
@@ -1733,6 +2385,11 @@ def _inject_temporal_cheatsheet(memories: list, question: str) -> str:
     # Add each event with date
     for dt, date_str, context in date_objs:
         lines.append(f"- Event: \"{context}\" ({date_str})")
+
+    # Retain raw date spans that do not have an explicit year. We do not
+    # infer a year for them, but we keep them visible for reasoning.
+    for raw_date, context in raw_only_events:
+        lines.append(f"- Event: \"{context}\" ({raw_date})")
 
     # Compute pairwise deltas between consecutive events
     if len(date_objs) >= 2:
@@ -1778,19 +2435,55 @@ def _apply_rerank_scores(memories: list, scores: list, top_n: int) -> list:
     return memories[:top_n]
 
 
-def _rerank(question: str, memories: list, top_n: int = 30) -> list:
+def _probe_reranker(url: str) -> dict:
+    """Check reranker availability with a real request."""
+    import requests as _rr
+    try:
+        resp = _rr.post(url, json={"query": "preflight", "texts": ["healthcheck"]}, timeout=5)
+        resp.raise_for_status()
+        payload = resp.json()
+        return {"ok": True, "status_code": resp.status_code, "response_type": type(payload).__name__}
+    except Exception as exc:
+        return {"ok": False, "error": type(exc).__name__, "message": str(exc)}
+
+
+def _rerank(question: str, memories: list, top_n: int = 30, diag: dict | None = None) -> list:
     """Re-score candidates with local cross-encoder reranker."""
     import requests as _rr
-    _reranker_url = os.environ.get("EDUMEM_RERANKER_URL", "http://localhost:8000/rerank")
+    _reranker_url = os.environ.get("EDUMEM_RERANKER_URL", "http://localhost:3002/rerank")
     texts = [m.get("content", "")[:500] for m in memories[:top_n * 2]]
     if not texts:
         return memories
+    if diag is not None:
+        rerank_diag = diag.setdefault("reranker", {
+            "url": _reranker_url,
+            "calls": 0,
+            "successes": 0,
+            "failures": 0,
+            "fallbacks": 0,
+            "scores_recorded": 0,
+            "errors": [],
+            "health": None,
+        })
+        rerank_diag["calls"] += 1
+    else:
+        rerank_diag = None
     try:
         resp = _rr.post(_reranker_url, json={"query": question, "texts": texts}, timeout=5)
         resp.raise_for_status()
         scores = resp.json()
         memories = _apply_rerank_scores(memories, scores, top_n)
-    except Exception:
+        if rerank_diag is not None:
+            rerank_diag["successes"] += 1
+            rerank_diag["scores_recorded"] += len(scores) if isinstance(scores, list) else 0
+    except Exception as exc:
+        if rerank_diag is not None:
+            rerank_diag["failures"] += 1
+            rerank_diag["fallbacks"] += 1
+            rerank_diag.setdefault("errors", []).append({
+                "class": type(exc).__name__,
+                "message": str(exc),
+            })
         return memories[:top_n]
     return memories
 
@@ -1798,6 +2491,7 @@ def _rerank(question: str, memories: list, top_n: int = 30) -> list:
 def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
                       conversation_messages: list = None, top_k: int = DEFAULT_TOP_K,
                       ability: str = None,
+                      diag: dict | None = None,
                       return_memories: bool = False):
     """Retrieve memories and have LLM answer, with context strategy based on conversation size.
 
@@ -1831,6 +2525,22 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
     # experiment instead needs to compare Arm A vs Arm B vs Arm C on
     # the recall surface itself.
     _pure_recall = _env_truthy("EDUMEM_BENCHMARK_PURE_RECALL")
+    routing_ability = None if _pure_recall else ability
+    if diag is not None:
+        embed_diag = diag.setdefault("embedding", {
+            "backend": "dense" if _embeddings.available() else "keyword-only",
+            "model": getattr(_embeddings, "_DEFAULT_MODEL", None),
+            "dimension": getattr(_embeddings, "EMBEDDING_DIM", None),
+            "inserted_vectors": 0,
+            "query_vectors": 0,
+            "status": "dense" if _embeddings.available() else "keyword-only",
+            "failed": False,
+        })
+        if _embeddings.available():
+            embed_diag["query_vectors"] = embed_diag.get("query_vectors", 0) + 1
+            embed_diag["status"] = "dense"
+        else:
+            embed_diag["status"] = "keyword-only"
 
     total_msgs = len(conversation_messages) if conversation_messages else 0
 
@@ -1891,7 +2601,7 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
         # Gated by pure_recall -- when ON, full-context mode still hits the LLM with raw
         # conversation but skips the zero-LLM context→value shortcut.
         _FACT_ABILITIES = {'IE', 'KU'}
-        if not _pure_recall and ability in _FACT_ABILITIES and hasattr(beam, '_context_facts') and beam._context_facts:
+        if not _pure_recall and routing_ability in _FACT_ABILITIES and hasattr(beam, '_context_facts') and beam._context_facts:
             # Strong-match gate: only bypass the LLM on a confident match.
             _ctx_floor = float(os.environ.get("BEAM_CTX_MATCH_FLOOR", "0.5"))
             best_match, _ctx_score = _context_value_match(question, beam._context_facts, min_score=_ctx_floor)
@@ -1930,7 +2640,7 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
     # This benchmark exists to measure MEMORY performance, not LLM reading comprehension.
     
     # Multi-strategy retrieval
-    memories = _multi_strategy_recall(beam, question, top_k * 3, ability=None)  # PATCH: label-free recall
+    memories = _multi_strategy_recall(beam, question, top_k * 3, ability=None, diag=diag)  # label-free recall
 
     # ---- MEMORIA: Structured Fact Retrieval (Phase 2) ----
     # Supplement recall with structured facts from memoria_facts, memoria_timelines,
@@ -1938,14 +2648,16 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
     # may miss (dates, metrics, versions, negations, sequences, entity mappings).
     # Injected as synthetic high-score entries so they surface ahead of fuzzy matches.
     try:
-        _memoria_result = beam.memoria_retrieve(question, ability=ability, top_k=top_k)
+        _memoria_result = beam.memoria_retrieve(question, ability=routing_ability, top_k=top_k)
         if _memoria_result and _memoria_result.get("source") != "fallback" and _memoria_result.get("context"):
             _memoria_facts = _memoria_result.get("facts", [])
-            print(f"    [MEMORIA] {_memoria_result['source']} hit for ability={ability}: {len(_memoria_facts)} facts", flush=True)
+            print(f"    [MEMORIA] {_memoria_result['source']} hit for ability={routing_ability}: {len(_memoria_facts)} facts", flush=True)
             memories.insert(0, {
                 "content": f"[MEMORIA {_memoria_result['source']}]\n{_memoria_result['context']}",
                 "score": 0.95,
                 "source": f"memoria_{_memoria_result['source']}",
+                "raw_score": 0.95,
+                "retrieval_strategy": "MEMORIA",
             })
     except Exception:
         pass  # MEMORIA retrieval is best-effort
@@ -1955,7 +2667,7 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
     # for ordering queries -- the char-budgeted context builder trims later. A flat
     # top_k cap here would drop topic mentions and make the ordering incomplete.
     _rerank_top_n = top_k * 3 if is_ordering_query(question) else top_k
-    memories = _rerank(question, memories, top_n=_rerank_top_n)
+    memories = _rerank(question, memories, top_n=_rerank_top_n, diag=diag)
 
     # ---- EO: Sort by message_index for ordering queries ----
     if is_ordering_query(question):
@@ -1972,7 +2684,7 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
     # Gated by pure_recall -- when ON, IE/KU questions go through full recall+LLM
     # rather than returning a side-indexed value directly.
     _FACT_ABILITIES = {'IE', 'KU'}
-    if not _pure_recall and ability in _FACT_ABILITIES and hasattr(beam, '_context_facts') and beam._context_facts:
+    if not _pure_recall and routing_ability in _FACT_ABILITIES and hasattr(beam, '_context_facts') and beam._context_facts:
         # Skip context→value matching for procedural/descriptive questions
         # (how, why, walk me through, describe). These need full answer, not one word.
         _q_lower = question.lower()
@@ -1998,6 +2710,8 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
                     "content": f"FACT: {f['content']}",
                     "score": f.get("score", 0.5) * 2.0,  # 2x weight for facts
                     "source": "fact_extraction",
+                    "raw_score": f.get("score", 0.5) * 2.0,
+                    "retrieval_strategy": "FACT",
                 })
             # Re-sort by score
             memories.sort(key=lambda x: x.get("score", 0), reverse=True)
@@ -2055,7 +2769,7 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
     if needs_second_pass(question):
         # --- Helper: build context string from memory list ---
         def _build_context(mems, recents):
-            if ability == "EO":
+            if routing_ability == "EO":
                 # Sort by message_index (true conversation order). All messages
                 # share a constant ingest timestamp, so timestamp sort is a no-op.
                 mems = sorted(mems, key=lambda x: x.get("message_index") if x.get("message_index") is not None else float('inf'))
@@ -2126,7 +2840,9 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
                                 _neg_seen.add(_nk)
                                 memories.insert(0, {
                                     "id": _nr[0], "content": _nr[1], "score": 0.80,
-                                    "source": "negation_cr"
+                                    "source": "negation_cr",
+                                    "raw_score": 0.80,
+                                    "retrieval_strategy": "CR",
                                 })
                     except Exception:
                         pass
@@ -2148,7 +2864,9 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
                 _tl_str = "\n".join(_tl_lines)
                 # Prepend timeline to memories as a synthetic high-score entry
                 memories.insert(0, {"id": "timeline_direct", "content": _tl_str, "score": 1.0,
-                                    "source": "tr_timeline_bypass"})
+                                    "source": "tr_timeline_bypass",
+                                    "raw_score": 1.0,
+                                    "retrieval_strategy": "TR"})
                 print(f"    [TR-timeline] injected {len(_tr_timeline)} dates from conversation", flush=True)
         
         # --- Pass 1: Initial context building (no LLM call, only retrieval) ---
@@ -2185,22 +2903,23 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
         gap_queries = list(dict.fromkeys(gap_queries))
 
         # Debug: log gap analysis results
-        print(f"    [DEBUG-GAP] ability={ability} regex-extracted queries={gap_queries}", flush=True)
+        print(f"    [DEBUG-GAP] ability={routing_ability} regex-extracted queries={gap_queries}", flush=True)
         
         # --- Pass 2: Targeted retrieval + re-answer ---
         if gap_queries:
             gap_memories = []
             gap_seen = set()
+            gap_diag = {"strategies": {}}
             for gq in gap_queries[:3]:
                 # Standard recall
-                for mem in _multi_strategy_recall(beam, gq, top_k, ability=ability):
+                for mem in _multi_strategy_recall(beam, gq, top_k, ability=routing_ability, diag=gap_diag):
                     ck = mem.get("content", "")[:80]
                     if ck not in gap_seen:
                         gap_seen.add(ck)
                         gap_memories.append(mem)
                 # MEMORIA structured recall for the same gap query
                 try:
-                    _memoria_gap = beam.memoria_retrieve(gq, ability=ability, top_k=5)
+                    _memoria_gap = beam.memoria_retrieve(gq, ability=routing_ability, top_k=5)
                     if _memoria_gap and _memoria_gap.get("source") != "fallback" and _memoria_gap.get("context"):
                         _mg_key = _memoria_gap["context"][:80]
                         if _mg_key not in gap_seen:
@@ -2211,6 +2930,8 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
                                 "content": f"[MEMORIA {_memoria_gap['source']}]\n{_memoria_gap['context']}",
                                 "score": 0.95,
                                 "source": f"memoria_gap_{_memoria_gap['source']}",
+                                "raw_score": 0.95,
+                                "retrieval_strategy": "MEMORIA",
                             })
                 except Exception:
                     pass
@@ -2258,6 +2979,7 @@ Follow this format strictly:
                     {"role": "system", "content": _pass2_prompt},
                     {"role": "user", "content": _pass2_temporal_cheat + pass2_ctx + "\n\nQUESTION: " + question + "\n\nANSWER:"},
                 ]
+            _record_second_pass_diagnostics(diag, gap_queries[:3], gap_diag)
             return _ret(llm.chat(pass2_messages, temperature=0.1, max_tokens=8192), all_mems)
 
         # No gaps: fall through to the single final LLM answer below
@@ -2288,6 +3010,8 @@ Follow this format strictly:
                         memories.append({
                             "id": row["id"], "content": row["content"],
                             "score": 0.3, "source": "sum_broad_sample",
+                            "raw_score": 0.3,
+                            "retrieval_strategy": "SUM",
                             "message_index": row["message_index"],
                         })
         except Exception:
@@ -2306,6 +3030,7 @@ Follow this format strictly:
     memory_parts = []
     total_chars = 0
     for i, mem in enumerate(memories):
+        mem.setdefault("final_context_included", False)
         content = mem.get("content", "")
         # Deduplicate
         content_key = content[:100]
@@ -2320,8 +3045,10 @@ Follow this format strictly:
         if total_chars + len(content) > _effective_max_chars:
             remaining = _effective_max_chars - total_chars
             if remaining > 100:
+                mem["final_context_included"] = True
                 memory_parts.append(f"[Memory] {content[:remaining]}...")
             break
+        mem["final_context_included"] = True
         memory_parts.append(f"[Memory] {content}")
         total_chars += len(content)
 
@@ -2438,6 +3165,29 @@ def _clean_judge_json(raw: str) -> str:
     return _json_j.dumps(parsed)
 
 
+def _judge_client_snapshot(llm: LLMClient) -> dict:
+    """Capture non-secret judge client diagnostics after a chat call."""
+    return {
+        "raw_response": getattr(llm, "last_response", "") or "",
+        "finish_reason": getattr(llm, "last_finish_reason", None),
+        "response_had_content": getattr(llm, "last_response_had_content", None),
+        "retry_count": getattr(llm, "last_retry_count", 0),
+        "api_error_class": getattr(llm, "last_error_class", None),
+        "api_error_message": getattr(llm, "last_error_message", ""),
+    }
+
+
+def _llm_client_snapshot(llm: LLMClient) -> dict:
+    """Capture answer-side API diagnostics without secrets."""
+    return {
+        "finish_reason": getattr(llm, "last_finish_reason", None),
+        "response_had_content": getattr(llm, "last_response_had_content", None),
+        "retry_count": getattr(llm, "last_retry_count", 0),
+        "api_error_class": getattr(llm, "last_error_class", None),
+        "api_error_message": getattr(llm, "last_error_message", ""),
+    }
+
+
 def judge_with_rubrics(llm: LLMClient, question: str, rubric: list, ai_answer: str, ability: str = None) -> dict:
     """Judge an AI answer against pre-written BEAM rubric items using the official BEAM grader."""
     if not rubric:
@@ -2464,7 +3214,7 @@ def judge_with_rubrics(llm: LLMClient, question: str, rubric: list, ai_answer: s
         import sys
         if "/opt/BEAM_official" not in sys.path:
             sys.path.append("/opt/BEAM_official")
-        
+
         import os
         if "OPENAI_API_KEY" not in os.environ:
             os.environ["OPENAI_API_KEY"] = "dummy"
@@ -2474,7 +3224,7 @@ def judge_with_rubrics(llm: LLMClient, question: str, rubric: list, ai_answer: s
         eval_func = getattr(compute_metrics, func_name, None)
 
         if not eval_func:
-            raise RuntimeError(f"[Grader-Swap] Fatal Error: {func_name} not found in compute_metrics")
+            raise ImportError(f"{func_name} not found in compute_metrics")
 
         class LangchainLLMWrapper:
             def __init__(self, client):
@@ -2499,6 +3249,7 @@ def judge_with_rubrics(llm: LLMClient, question: str, rubric: list, ai_answer: s
 
         print(f"      [Grader-Swap] Running official {func_name}...")
         eval_result = eval_func(rubric=rubric, llm_response=ai_answer, probing_question=question, model=wrapped_model)
+        client_diag = _judge_client_snapshot(llm)
 
         if ability == "EO":
             score = eval_result.get("tau_norm", 0.0)
@@ -2520,18 +3271,36 @@ def judge_with_rubrics(llm: LLMClient, question: str, rubric: list, ai_answer: s
         while len(scores) < len(rubric):
             scores.append(0.0)
 
+        parse_status = "ok"
+        if client_diag.get("api_error_class"):
+            parse_status = "api_failure"
+        elif client_diag.get("response_had_content") is False:
+            parse_status = "parse_failure"
+        elif client_diag.get("raw_response") and not responses:
+            parse_status = "parse_failure"
+
         return {
             "scores": scores[:len(rubric)],
             "overall_score": float(score),
+            "official_score": float(score),
+            "partial_credit_score": sum(scores[:len(rubric)]) / len(rubric) if rubric else 0.0,
+            "scoring_mode": "official",
+            "parse_status": parse_status,
+            "judge_status": "ok" if parse_status == "ok" else parse_status,
+            "judge_failure_class": client_diag.get("api_error_class"),
+            "judge_failure_message": client_diag.get("api_error_message", ""),
+            "raw_response": client_diag.get("raw_response", ""),
+            "finish_reason": client_diag.get("finish_reason"),
+            "response_had_content": client_diag.get("response_had_content"),
+            "retry_count": client_diag.get("retry_count", 0),
             "assessment": f"Evaluated using official BEAM compute_metrics.{func_name}",
-            "raw_result": eval_result
+            "brief_assessment": f"official BEAM grader ({func_name})",
+            "raw_result": eval_result,
         }
 
     except Exception as e:
-        print(f"      [Grader-Swap] Fatal Error executing official {func_name}: {e}")
-        import traceback
-        traceback.print_exc()
-        raise RuntimeError(f"Official BEAM evaluation failed for {ability}: {e}") from e
+        print(f"      [Grader-Swap] Official grader unavailable, using local fallback for {ability}: {e}")
+        return _legacy_judge_with_rubrics(llm, question, rubric, ai_answer)
 
 
 def _legacy_judge_with_rubrics(llm: LLMClient, question: str, rubric: list, ai_answer: str) -> dict:
@@ -2549,25 +3318,74 @@ For each rubric item, score how well the AI's answer matches. Return JSON with s
         {"role": "user", "content": user_prompt},
     ]
     response = llm.chat(messages, temperature=0.0, max_tokens=500)
+    client_diag = _judge_client_snapshot(llm)
     if response is None:
         return {
             "scores": [0.0] * len(rubric),
             "overall_score": 0.0,
+            "official_score": 0.0,
+            "partial_credit_score": 0.0,
+            "scoring_mode": "fallback",
+            "parse_status": "api_failure",
+            "judge_status": "api_failure",
+            "judge_failure_class": client_diag.get("api_error_class"),
+            "judge_failure_message": client_diag.get("api_error_message", ""),
+            "raw_response": client_diag.get("raw_response", ""),
+            "finish_reason": client_diag.get("finish_reason"),
+            "response_had_content": client_diag.get("response_had_content"),
+            "retry_count": client_diag.get("retry_count", 0),
             "assessment": "LLM judge returned None (timeout or error)",
         }
-    try:
-        json_start = response.find("{")
-        json_end = response.rfind("}") + 1
-        if json_start >= 0 and json_end > json_start:
-            result = json.loads(response[json_start:json_end])
-            return result
-    except (json.JSONDecodeError, ValueError):
-        pass
+    result, parse_status = _parse_judge_payload(response)
+    if parse_status == "ok" and isinstance(result, dict):
+        scores = []
+        for item in result.get("scores", []):
+            try:
+                scores.append(float(item))
+            except (TypeError, ValueError):
+                scores.append(0.0)
+        while len(scores) < len(rubric):
+            scores.append(0.0)
+        official_score = _mean_int_score(scores[:len(rubric)])
+        partial_credit_score = _mean_float_score(scores[:len(rubric)])
+        self_reported_overall = result.get("overall_score", 0.0)
+        try:
+            self_reported_overall = float(self_reported_overall or 0.0)
+        except (TypeError, ValueError):
+            self_reported_overall = 0.0
+        return {
+            "scores": scores[:len(rubric)],
+            "overall_score": self_reported_overall,
+            "official_score": official_score,
+            "partial_credit_score": partial_credit_score,
+            "scoring_mode": "fallback",
+            "parse_status": "ok",
+            "judge_status": "ok",
+            "judge_failure_class": client_diag.get("api_error_class"),
+            "judge_failure_message": client_diag.get("api_error_message", ""),
+            "raw_response": client_diag.get("raw_response", response),
+            "finish_reason": client_diag.get("finish_reason"),
+            "response_had_content": client_diag.get("response_had_content"),
+            "retry_count": client_diag.get("retry_count", 0),
+            "assessment": "LLM judge fallback parsed JSON",
+            "raw_result": result,
+        }
     return {
         "scores": [0.0] * len(rubric),
         "overall_score": basic_text_similarity(ai_answer, " ".join(rubric)),
+        "official_score": 0.0,
+        "partial_credit_score": 0.0,
+        "scoring_mode": "fallback",
+        "parse_status": "parse_failure" if client_diag.get("api_error_class") is None else "api_failure",
+        "judge_status": "parse_failure" if client_diag.get("api_error_class") is None else "api_failure",
+        "judge_failure_class": client_diag.get("api_error_class"),
+        "judge_failure_message": client_diag.get("api_error_message", ""),
+        "raw_response": client_diag.get("raw_response", response),
+        "finish_reason": client_diag.get("finish_reason"),
+        "response_had_content": client_diag.get("response_had_content"),
+        "retry_count": client_diag.get("retry_count", 0),
         "assessment": "JSON parse failed; using fallback",
-        "raw_response": response,
+        "raw_result": response,
     }
 
 
@@ -2597,6 +3415,8 @@ def evaluate_conversation(
     conv_id = conversation["id"]
     questions = conversation["questions"][:BENCHMARK_QUERIES_PER_CONV]
     results = []
+    evaluated_count = 0
+    skipped_count = 0
 
     print(f"  Conversation {conv_id}: {len(questions)} questions")
 
@@ -2605,24 +3425,36 @@ def evaluate_conversation(
         if resume_ids and qid in resume_ids:
             continue
 
-        question = q["question"]
-        ideal = q["ideal_answer"]
-        rubric = q.get("rubric", [])
+        policy = _question_row_policy(q)
+        question = policy["question"]
+        ideal = policy["ideal_answer"]
+        rubric = policy["rubric"]
         ability = q.get("ability", "unknown")
         # Map dataset ability names to BEAM abbreviations
         ability = ABILITY_MAP.get(ability, ability)
 
-        if not question or not ideal:
+        if not policy["should_evaluate"]:
+            results.append(_build_skipped_question_result(
+                qid=qid,
+                ability=ability,
+                question=question,
+                ideal_answer=ideal,
+                rubric=rubric,
+                skip_reason=policy["skip_reason"],
+            ))
+            skipped_count += 1
+            print(f"    [SKIP] [{ability}] {qid} reason={policy['skip_reason']}")
             continue
 
         # Step 1: LLM answers using edumem memories + conversation context.
         # `return_memories=True` gives us the per-question retrieved memory
         # list so we can summarize voice-attribution provenance below.
+        q_diag = {}
         t0 = time.perf_counter()
         ai_answer, recall_memories = answer_with_memory(
             llm, beam, question,
             conversation_messages=conversation.get("messages", []),
-            ability=ability, return_memories=True,
+            ability=ability, diag=q_diag, return_memories=True,
         )
         answer_time = time.perf_counter() - t0
 
@@ -2630,13 +3462,17 @@ def evaluate_conversation(
         if ai_answer is None:
             ai_answer = "[LLM_ERROR: No response from answering model]"
 
+        answer_diag = _llm_client_snapshot(llm)
+        q_diag["answer_api"] = answer_diag
+
         # Step 2: LLM-as-judge scores the answer (after normalizing EO/KU JSON output)
         t0 = time.perf_counter()
         normalized_answer = normalize_for_judge(ai_answer, ability)
         judgment = judge_with_rubrics(judge_llm, question, rubric, normalized_answer, ability=ability)
         judge_time = time.perf_counter() - t0
 
-        score = judgment.get("overall_score", 0.0)
+        judged = _summarize_judge_result(judgment)
+        score = judged.get("official_score", 0.0)
 
         # Compact recall-provenance summary so per-voice attribution
         # analysis (docs/benchmark-results-analysis.md Recipe E) works
@@ -2649,16 +3485,40 @@ def evaluate_conversation(
             "qid": qid,
             "ability": ability,
             "question": question[:200],
+            "question_full": question,
             "ideal_answer": ideal[:200],
-            "ai_answer": ai_answer[:500],
+            "ideal_answer_full": ideal,
+            "rubric": rubric,
+            "ai_answer": ai_answer,
+            "ai_answer_full": ai_answer,
+            "ai_answer_excerpt": ai_answer[:500],
             "recall_provenance": recall_provenance,
             "score": score,
-            "nuggets": judgment.get("nuggets", []),
-            "assessment": judgment.get("brief_assessment", ""),
+            "official_score": judged.get("official_score", score),
+            "partial_credit_score": judged.get("partial_credit_score", score),
+            "scoring_mode": judged.get("scoring_mode", "unknown"),
+            "parse_status": judged.get("parse_status", "unknown"),
+            "judge_status": judged.get("judge_status", "unknown"),
+            "judge_failure_class": judged.get("judge_failure_class"),
+            "judge_failure_message": judged.get("judge_failure_message", ""),
+            "judge_raw_response": judged.get("raw_response", ""),
+            "judge_raw_result": judged.get("raw_result"),
+            "judge_raw_payload": judged.get("raw_result", judged.get("raw_response", "")),
+            "judge_finish_reason": judged.get("finish_reason"),
+            "judge_response_had_content": judged.get("response_had_content"),
+            "judge_retry_count": judged.get("retry_count", 0),
+            "nuggets": judged.get("nuggets", []),
+            "assessment": judged.get("brief_assessment", judged.get("assessment", "")),
+            "judge_assessment": judged.get("assessment", ""),
+            "answer_model": llm.model,
+            "judge_model": judge_llm.model,
             "answer_time_ms": answer_time * 1000,
             "judge_time_ms": judge_time * 1000,
+            "retrieval_diagnostics": q_diag,
+            "answer_api_diagnostics": answer_diag,
         }
         results.append(result)
+        evaluated_count += 1
 
         print(f"    [{ability}] score={score:.2f} ans={answer_time*1000:.0f}ms judge={judge_time*1000:.0f}ms "
               f"Q: {question[:60]}...")
@@ -2673,7 +3533,9 @@ def evaluate_conversation(
         "conversation_id": conv_id,
         "scale": conversation["scale"],
         "num_questions": len(questions),
-        "num_evaluated": len(results),
+        "num_evaluated": evaluated_count,
+        "num_skipped": skipped_count,
+        "num_accounted_for": len(results),
         "results": results,
     }
 
@@ -2684,7 +3546,9 @@ def compute_ability_scores(all_results: list[dict]) -> dict:
 
     for conv_result in all_results:
         scale = conv_result["scale"]
-        for r in conv_result["results"]:
+        for r in conv_result.get("results", []):
+            if _is_skipped_question_result(r):
+                continue
             ability = r.get("ability", "unknown")
             score = r.get("score", 0.0)
             by_scale_ability[scale][ability].append(score)
@@ -2717,6 +3581,322 @@ def compute_ability_scores(all_results: list[dict]) -> dict:
         summary[scale] = scale_scores
 
     return summary
+
+
+def compute_micro_scores(all_results: list[dict]) -> dict[str, float]:
+    """Compute micro-averaged scores per scale for diagnostics."""
+    by_scale = defaultdict(list)
+    for conv_result in all_results:
+        scale = conv_result["scale"]
+        for r in conv_result.get("results", []):
+            if _is_skipped_question_result(r):
+                continue
+            score = r.get("score", 0.0)
+            by_scale[scale].append(score)
+    return {
+        scale: (sum(scores) / len(scores)) if scores else 0.0
+        for scale, scores in by_scale.items()
+    }
+
+
+def compute_partial_credit_overall(all_results: list[dict]) -> float:
+    """Compute overall partial-credit from nested question rows."""
+    scores = []
+    for question in _iter_evaluated_question_rows(all_results):
+        try:
+            scores.append(float(question.get("partial_credit_score", 0.0)))
+        except (TypeError, ValueError):
+            scores.append(0.0)
+    return sum(scores) / len(scores) if scores else 0.0
+
+
+def _build_evaluation_summary(all_results: list[dict], metadata: dict) -> dict:
+    """Build the summary artifact shared by live runs and re-judge runs."""
+    ability_summary = compute_ability_scores(all_results)
+    micro_overall = compute_micro_scores(all_results)
+    partial_credit_overall = compute_partial_credit_overall(all_results)
+    return {
+        "date": datetime.now(timezone.utc).isoformat(),
+        "metadata": metadata,
+        "ability_summary": {
+            scale: {
+                ab: {"avg_score": v["avg_score"], "count": v["count"]}
+                for ab, v in abilities.items()
+            }
+            for scale, abilities in ability_summary.items()
+        },
+        "micro_overall": micro_overall,
+        "partial_credit_overall": partial_credit_overall,
+    }
+
+
+def _results_summary_path(results_path: Path) -> Path:
+    """Derive the summary path associated with a results JSON artifact."""
+    if results_path.name == RESULTS_FILE.name:
+        return results_path.with_name("beam_e2e_summary.json")
+    return results_path.with_name(f"{results_path.stem}_summary{results_path.suffix}")
+
+
+def _rejudge_output_path(source_path: Path) -> Path:
+    """Derive the default re-judge output path without overwriting the source."""
+    return source_path.with_name(f"{source_path.stem}.rejudged{source_path.suffix}")
+
+
+def _load_results_artifact(path: Path) -> dict:
+    """Load a BEAM results artifact from disk."""
+    if not path.exists():
+        raise FileNotFoundError(f"Results artifact not found: {path}")
+
+    with open(path, encoding="utf-8") as f:
+        artifact = json.load(f)
+
+    if not isinstance(artifact, dict):
+        raise ValueError(f"Results artifact must be a JSON object: {path}")
+
+    results = artifact.get("results")
+    if not isinstance(results, list):
+        raise ValueError(f"Results artifact missing top-level 'results' list: {path}")
+
+    return artifact
+
+
+def _required_rejudge_fields(row: dict) -> list[str]:
+    """Return the stored row fields needed for a re-judge pass."""
+    missing = []
+
+    question_full = row.get("question_full")
+    if not isinstance(question_full, str) or not question_full.strip():
+        missing.append("question_full")
+
+    rubric = row.get("rubric")
+    if rubric is None or not isinstance(rubric, list):
+        missing.append("rubric")
+
+    ai_answer_full = row.get("ai_answer_full")
+    if not isinstance(ai_answer_full, str) or not ai_answer_full.strip():
+        missing.append("ai_answer_full")
+
+    return missing
+
+
+def _update_rejudged_question_row(
+    row: dict,
+    judged: dict,
+    judge_model: str,
+    judge_time_ms: float,
+) -> dict:
+    """Merge a fresh judge result into a stored question row."""
+    updated = deepcopy(row)
+    updated["score"] = judged.get("official_score", 0.0)
+    updated["official_score"] = judged.get("official_score", 0.0)
+    updated["partial_credit_score"] = judged.get("partial_credit_score", 0.0)
+    updated["scoring_mode"] = judged.get("scoring_mode", "unknown")
+    updated["parse_status"] = judged.get("parse_status", "unknown")
+    updated["judge_status"] = judged.get("judge_status", "unknown")
+    updated["judge_failure_class"] = judged.get("judge_failure_class")
+    updated["judge_failure_message"] = judged.get("judge_failure_message", "")
+    updated["judge_raw_response"] = judged.get("raw_response", "")
+    updated["judge_raw_result"] = judged.get("raw_result")
+    raw_payload = judged.get("raw_result")
+    if raw_payload is None:
+        raw_payload = judged.get("raw_response", "")
+    updated["judge_raw_payload"] = raw_payload
+    updated["judge_finish_reason"] = judged.get("finish_reason")
+    updated["judge_response_had_content"] = judged.get("response_had_content")
+    updated["judge_retry_count"] = judged.get("retry_count", 0)
+    updated["assessment"] = judged.get("brief_assessment", judged.get("assessment", ""))
+    updated["judge_assessment"] = judged.get("assessment", "")
+    updated["nuggets"] = judged.get("nuggets", [])
+    updated["judge_model"] = judge_model
+    updated["judge_time_ms"] = judge_time_ms
+    return updated
+
+
+def _normalize_stored_judgment_record(record: dict, qid: str) -> tuple[dict, float]:
+    """Extract a stored judgment payload and timing from a keyed record."""
+    if not isinstance(record, dict):
+        raise ValueError(f"Stored judgment record for {qid} must be a JSON object")
+
+    record_qid = record.get("qid")
+    if record_qid is not None and record_qid != qid:
+        raise ValueError(f"Stored judgment record key {qid} does not match embedded qid {record_qid}")
+
+    judgment = record.get("judgment", record)
+    if not isinstance(judgment, dict):
+        raise ValueError(f"Stored judgment payload for {qid} must be a JSON object")
+
+    judge_time_ms = record.get("judge_time_ms", judgment.get("judge_time_ms", 0.0))
+    try:
+        judge_time_ms = float(judge_time_ms)
+    except (TypeError, ValueError):
+        judge_time_ms = 0.0
+
+    return judgment, judge_time_ms
+
+
+def apply_rejudge_judgment_records(
+    source_artifact: dict,
+    judgment_records_by_qid: dict[str, dict],
+    judge_model: str,
+    source_path: Path | None = None,
+) -> tuple[dict, dict]:
+    """Re-score an existing results artifact from stored judgment records."""
+    if not isinstance(source_artifact, dict):
+        raise ValueError("Results artifact must be a JSON object")
+
+    source_results = source_artifact.get("results")
+    if not isinstance(source_results, list):
+        raise ValueError("Results artifact missing top-level 'results' list")
+    if not isinstance(judgment_records_by_qid, dict):
+        raise ValueError("Stored judgment records must be a JSON object keyed by qid")
+
+    updated_results = []
+    for conv_idx, conv_result in enumerate(source_results):
+        if not isinstance(conv_result, dict):
+            raise ValueError(f"Conversation result at index {conv_idx} must be a JSON object")
+
+        conv_copy = deepcopy(conv_result)
+        updated_rows = []
+        for row_idx, row in enumerate(conv_result.get("results", [])):
+            if not isinstance(row, dict):
+                raise ValueError(f"Question row at index {row_idx} in conversation {conv_copy.get('conversation_id')} must be a JSON object")
+
+            missing = _required_rejudge_fields(row)
+            if missing:
+                qid = row.get("qid") or f"{conv_copy.get('conversation_id', conv_idx)}:q{row_idx}"
+                location = str(source_path) if source_path else "results artifact"
+                raise ValueError(
+                    f"Cannot rejudge {location}: row {qid} is missing required field(s): {', '.join(missing)}"
+                )
+
+            qid = row.get("qid") or f"{conv_copy.get('conversation_id', conv_idx)}:q{row_idx}"
+            if qid not in judgment_records_by_qid:
+                location = str(source_path) if source_path else "results artifact"
+                raise ValueError(f"Cannot rejudge {location}: missing stored judgment record for qid {qid}")
+
+            judgment, judge_time_ms = _normalize_stored_judgment_record(judgment_records_by_qid[qid], qid)
+            judged = _summarize_judge_result(judgment)
+            updated_rows.append(_update_rejudged_question_row(row, judged, judge_model, judge_time_ms))
+
+        conv_copy["results"] = updated_rows
+        conv_copy["num_questions"] = conv_result.get("num_questions", len(updated_rows))
+        conv_copy["num_evaluated"] = len(updated_rows)
+        updated_results.append(conv_copy)
+
+    source_metadata = source_artifact.get("metadata", {})
+    if not isinstance(source_metadata, dict):
+        source_metadata = {}
+
+    updated_metadata = deepcopy(source_metadata)
+    updated_at = datetime.now(timezone.utc).isoformat()
+    updated_metadata["date"] = updated_at
+    updated_metadata["judge_model"] = judge_model
+    updated_metadata["rejudge_mode"] = True
+    updated_metadata["rejudge_generated_at"] = updated_at
+    if source_path is not None:
+        updated_metadata["rejudge_source_path"] = str(source_path)
+    if source_metadata.get("judge_model") is not None:
+        updated_metadata["rejudge_source_judge_model"] = source_metadata.get("judge_model")
+
+    summary_metadata = {
+        "model": updated_metadata.get("model", "unknown"),
+        "sample_size": updated_metadata.get("sample_size", "ALL"),
+        "conversation_count": updated_metadata.get("conversation_count", updated_metadata.get("sample_size", "ALL")),
+        "judge_model": judge_model,
+        "rejudge_mode": True,
+    }
+    if source_path is not None:
+        summary_metadata["source_results_path"] = str(source_path)
+    if source_metadata.get("judge_model") is not None:
+        summary_metadata["source_judge_model"] = source_metadata.get("judge_model")
+
+    updated_artifact = {
+        "metadata": updated_metadata,
+        "results": updated_results,
+    }
+    summary_artifact = _build_evaluation_summary(updated_results, summary_metadata)
+    return updated_artifact, summary_artifact
+
+
+rejudge_results_artifact = apply_rejudge_judgment_records
+
+
+def _collect_rejudge_judgment_records(
+    source_artifact: dict,
+    judge_llm: LLMClient,
+    judge_model: str,
+) -> dict[str, dict]:
+    """Collect fresh judgments for a loaded results artifact."""
+    source_results = source_artifact.get("results", [])
+    judgment_records: dict[str, dict] = {}
+    for conv_idx, conv_result in enumerate(source_results):
+        conv_copy = conv_result if isinstance(conv_result, dict) else {}
+        for row_idx, row in enumerate(conv_copy.get("results", [])):
+            if not isinstance(row, dict):
+                continue
+            missing = _required_rejudge_fields(row)
+            if missing:
+                qid = row.get("qid") or f"{conv_copy.get('conversation_id', conv_idx)}:q{row_idx}"
+                location = "results artifact"
+                raise ValueError(
+                    f"Cannot rejudge {location}: row {qid} is missing required field(s): {', '.join(missing)}"
+                )
+            qid = row.get("qid") or f"{conv_copy.get('conversation_id', conv_idx)}:q{row_idx}"
+            t0 = time.perf_counter()
+            judgment = judge_with_rubrics(
+                judge_llm,
+                row["question_full"],
+                row["rubric"],
+                row["ai_answer_full"],
+                ability=row.get("ability"),
+            )
+            judge_time_ms = (time.perf_counter() - t0) * 1000
+            judgment_records[qid] = {
+                "qid": qid,
+                "judge_model": judge_model,
+                "judge_time_ms": judge_time_ms,
+                "judgment": judgment,
+            }
+    return judgment_records
+
+
+def write_rejudge_artifacts(
+    output_path: Path,
+    updated_artifact: dict,
+    summary_artifact: dict,
+) -> tuple[Path, Path]:
+    """Write the re-judged results and summary artifacts to disk."""
+    summary_path = _results_summary_path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w", encoding="utf-8") as f:
+        _write_json_sanitized(updated_artifact, f, indent=2)
+    with open(summary_path, "w", encoding="utf-8") as f:
+        _write_json_sanitized(summary_artifact, f, indent=2)
+    return output_path, summary_path
+
+
+def rejudge_results_file(
+    source_path: Path,
+    judge_model: str,
+    output_path: Path | None = None,
+) -> tuple[Path, Path]:
+    """Load, re-judge, and write a results artifact to a separate output file."""
+    source_artifact = _load_results_artifact(source_path)
+    output_path = output_path or _rejudge_output_path(source_path)
+    judge_llm = None
+    try:
+        judge_llm = LLMClient(model=judge_model)
+        judgment_records = _collect_rejudge_judgment_records(source_artifact, judge_llm, judge_model)
+        updated_artifact, summary_artifact = apply_rejudge_judgment_records(
+            source_artifact,
+            judgment_records_by_qid=judgment_records,
+            judge_model=judge_model,
+            source_path=source_path,
+        )
+        return write_rejudge_artifacts(output_path, updated_artifact, summary_artifact)
+    finally:
+        if judge_llm is not None:
+            judge_llm.close()
 
 
 # ============================================================
@@ -2757,13 +3937,13 @@ def print_sota_report(ability_summary: dict, metadata: dict):
     print(f"  MNEMOSYNE BEAM END-TO-END SOTA REPORT")
     print(f"  Date: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
     print(f"  Model: {metadata.get('model', 'unknown')}")
-    print(f"  Conversations/scale: {metadata.get('sample_size', 'N/A')}")
+    print(f"  Conversation Prefix Count: {metadata.get('conversation_count', metadata.get('sample_size', 'N/A'))}")
     print(f"  Top-K memories: {DEFAULT_TOP_K}")
     print(f"  Methodology: LLM answering + LLM-as-judge (nugget scoring, per BEAM protocol)")
     print(f"{'='*80}")
 
     print(f"\n  Per-Ability Scores:")
-    print(f"  {'Scale':<8} {'OVERALL':>8}", end="")
+    print(f"  {'Scale':<8} {'OVERALL (macro)':>14}", end="")
     for ab in BEAM_ABILITIES:
         print(f" {ab:>6}", end="")
     print()
@@ -2771,11 +3951,21 @@ def print_sota_report(ability_summary: dict, metadata: dict):
     for scale in sorted(ability_summary.keys()):
         scores = ability_summary[scale]
         overall = scores.get("OVERALL", {}).get("avg_score", 0.0)
-        print(f"  {scale:<8} {overall*100:>7.1f}%", end="")
+        print(f"  {scale:<8} {overall*100:>13.1f}%", end="")
         for ab in BEAM_ABILITIES:
             s = scores.get(ab, {}).get("avg_score", 0.0)
             print(f" {s*100:>5.1f}%", end="")
         print()
+
+    micro = metadata.get("micro_overall", {})
+    if micro:
+        print(f"\n  Micro Diagnostic:")
+        for scale in sorted(micro.keys()):
+            print(f"  {scale:<8} {micro[scale]*100:>13.1f}%")
+
+    partial_credit = metadata.get("partial_credit_overall")
+    if partial_credit is not None:
+        print(f"\n  Partial-Credit Diagnostic: {partial_credit*100:.1f}%")
 
     print(f"\n  SOTA Comparison (OVERALL):")
     print(f"  {'Scale':<8} {'edumem':>12}", end="")
@@ -2794,7 +3984,10 @@ def print_sota_report(ability_summary: dict, metadata: dict):
     print(f"\n  Note: Published SOTA numbers from Hindsight blog (Apr 2026) and BEAM paper Table 3.")
     print(f"  edumem uses {metadata.get('model', 'unknown')} as answering + judging LLM.")
     print(f"  OVERALL is a macro-average across abilities (BEAM leaderboard convention).")
-    print(f"  Direct comparison valid: identical BEAM dataset, identical LLM-as-judge protocol.")
+    if metadata.get("comparison_valid"):
+        print(f"  Direct comparison valid: identical BEAM dataset, identical LLM-as-judge protocol.")
+    else:
+        print(f"  Direct comparison not asserted for this run (subset/protocol mismatch).")
     print(f"{'='*80}")
 
 
@@ -2807,7 +4000,11 @@ def main():
     parser.add_argument("--scales", default="100K,500K,1M,10M",
                         help="Scales to evaluate (comma-separated)")
     parser.add_argument("--sample", type=int, default=3,
-                        help="Conversations per scale (0=all)")
+                        help="Prefix count of conversations per scale from start-index (0=all)")
+    parser.add_argument("--start-index", type=int, default=0,
+                        help="Prefix start index for deterministic conversation selection")
+    parser.add_argument("--case-index", type=int, default=None,
+                        help="Select exactly one conversation by index per scale")
     parser.add_argument("--model", default=DEFAULT_MODEL,
                         help="LLM model for answering and judging")
     parser.add_argument("--judge-model", default=None,
@@ -2822,6 +4019,9 @@ def main():
                              "Equivalent to EDUMEM_BENCHMARK_PURE_RECALL=1.")
     parser.add_argument("--resume", action="store_true",
                         help="Resume from previous results file")
+    parser.add_argument("--rejudge-results", nargs="?", const=RESULTS_FILE, type=Path, default=None,
+                        help="Re-judge an existing results artifact with the selected judge model. "
+                             "With no path, uses the default results file.")
     parser.add_argument("--dry-run", action="store_true",
                         help="Download data and print stats, don't evaluate")
     parser.add_argument("--use-cloud", action="store_true",
@@ -2841,7 +4041,29 @@ def main():
                              "BeamMemory.recall(), which contaminates arm-vs-arm "
                              "comparisons. Set this flag only for ceiling-test or legacy-"
                              "reproduction runs where you explicitly want the bypasses.")
+    parser.add_argument("--allow-no-reranker", action="store_true",
+                        help="Allow the run to continue when the reranker endpoint is unavailable.")
     args = parser.parse_args()
+
+    if args.rejudge_results is not None:
+        judge_model = args.judge_model or args.model
+        print(f"{'='*80}")
+        print("  BEAM Results Re-Judge")
+        print(f"  Source: {args.rejudge_results}")
+        print(f"  Judge: {judge_model}")
+        print(f"{'='*80}")
+        try:
+            output_path, summary_path = rejudge_results_file(
+                Path(args.rejudge_results),
+                judge_model=judge_model,
+            )
+        except Exception as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            sys.exit(2)
+
+        print(f"\n  Re-judged results saved to: {output_path}")
+        print(f"  Re-judged summary saved to: {summary_path}")
+        return
 
     scales = [s.strip() for s in args.scales.split(",")]
     sample_size = args.sample if args.sample > 0 else None
@@ -2870,13 +4092,7 @@ def main():
         k: v for k, v in os.environ.items()
         if k.startswith("EDUMEM_") or k in ("FULL_CONTEXT_MODE", "OPENROUTER_BASE_URL")
     }
-    print(f"\n  Env snapshot ({len(_benchmark_env_snapshot)} vars):")
-    for k in sorted(_benchmark_env_snapshot):
-        # Don't echo API keys even if they accidentally got the EDUMEM_ prefix.
-        v = _benchmark_env_snapshot[k]
-        if "KEY" in k or "TOKEN" in k or "SECRET" in k:
-            v = "***redacted***"
-        print(f"    {k}={v}")
+    _print_env_snapshot(_benchmark_env_snapshot)
 
     # Gap E: config_id labels each row in paired_outcomes.jsonl so a
     # downstream notebook can paired-bootstrap CIs across multiple A/B
@@ -2913,7 +4129,10 @@ def main():
     print(f"{'='*80}")
     print(f"  BEAM End-to-End Evaluation Pipeline")
     print(f"  Scales: {scales}")
-    print(f"  Sample: {sample_size or 'ALL'} conversations/scale")
+    print(f"  Conversation Prefix Count: {sample_size or 'ALL'} conversations/scale")
+    if args.sample == 1 and args.case_index is None:
+        print("  Diagnostic: --sample is a prefix count; --sample 1 selects the first conversation from --start-index. "
+              "Use --case-index to target one exact conversation.")
     print(f"  Model: {args.model}")
     print(f"  Judge: {args.judge_model or args.model}")
     # Mode resolution + banner. Pure-recall overrides full-context
@@ -2936,7 +4155,7 @@ def main():
 
     # Load data
     print(f"\n[1/4] Loading BEAM dataset...")
-    data = load_beam_dataset(scales, max_conversations=sample_size)
+    data = load_beam_dataset(scales, max_conversations=None if args.case_index is not None or args.start_index else sample_size)
 
     if not data:
         print("ERROR: No data loaded. Check HuggingFace token and dataset name.")
@@ -2948,6 +4167,30 @@ def main():
         total_msgs = sum(len(c["messages"]) for c in convs)
         total_qs = sum(len(c["questions"]) for c in convs)
         print(f"    {scale}: {len(convs)} convs, {total_msgs:,} msgs, {total_qs} questions")
+
+    # Deterministic subset selection happens after loading so `--start-index`
+    # and `--case-index` can address the full scale split.
+    selected_conversation_ids: dict[str, list[str]] = {}
+    if args.case_index is not None or args.start_index:
+        for scale, convs in list(data.items()):
+            selected, selected_ids = _select_conversations(
+                convs,
+                sample_size=sample_size,
+                start_index=args.start_index,
+                case_index=args.case_index,
+            )
+            data[scale] = selected
+            selected_conversation_ids[scale] = selected_ids
+    else:
+        for scale, convs in data.items():
+            selected_conversation_ids[scale] = [conv["id"] for conv in convs]
+
+    reranker_url = os.environ.get("EDUMEM_RERANKER_URL", "http://localhost:3002/rerank")
+    reranker_preflight = _probe_reranker(reranker_url)
+    print(f"  Reranker preflight: {reranker_url} -> {'OK' if reranker_preflight.get('ok') else 'UNAVAILABLE'}")
+    if not reranker_preflight.get("ok") and not args.allow_no_reranker:
+        print("ERROR: reranker endpoint unavailable. Re-run with --allow-no-reranker to continue without reranking.", file=sys.stderr)
+        sys.exit(2)
 
     if args.dry_run:
         print(f"\n  Dry run complete. Exiting.")
@@ -2987,12 +4230,17 @@ def main():
                 beam = BeamMemory(session_id=f"beam_{scale}_{conv['id']}",
                                    db_path=db_path, use_cloud=args.use_cloud,
                                    llm_client=llm)
+                conv_diag = {
+                    "reranker": reranker_preflight,
+                    "embedding": {},
+                }
 
                 # Ingest (includes per-batch consolidation via beam.sleep())
                 os.environ["BEAM_CURRENT_SCALE"] = scale
                 t0 = time.perf_counter()
-                stats = ingest_conversation(beam, conv["messages"])
+                stats = ingest_conversation(beam, conv["messages"], diag=conv_diag)
                 ingest_time = time.perf_counter() - t0
+                conv_diag["ingest_diagnostics_batch"] = getattr(beam, "_last_ingest_diagnostics_batch", None)
 
                 # Post-ingestion consolidation sweep: catch any rows that the
                 # per-batch sleep loop didn't process. Uses AAAK compression
@@ -3019,6 +4267,31 @@ def main():
                 conv_result = evaluate_conversation(
                     llm, judge_llm, beam, conv, resume_ids
                 )
+                conv_result["ingest_stats"] = stats
+                conv_result["ingest_diagnostics_batch"] = conv_diag.get("ingest_diagnostics_batch")
+                conv_result["diagnostics"] = {
+                    "ingest_stats": stats,
+                    "ingest_diagnostics_batch": conv_diag.get("ingest_diagnostics_batch"),
+                    "embedding": conv_diag.get("embedding", {}),
+                    "reranker": conv_diag.get("reranker", reranker_preflight),
+                }
+                embedding_diag = conv_diag.setdefault("embedding", {})
+                query_vectors = 0
+                for question_result in conv_result.get("results", []):
+                    q_embed = (
+                        question_result.get("retrieval_diagnostics", {})
+                        .get("embedding", {})
+                    )
+                    try:
+                        query_vectors += int(q_embed.get("query_vectors", 0))
+                    except (TypeError, ValueError):
+                        continue
+                embedding_diag["query_vectors"] = query_vectors
+                api_calls_before = embedding_diag.pop("api_calls_before", None)
+                if hasattr(_embeddings, "_API_CALL_COUNT") and api_calls_before is not None:
+                    api_calls_after = getattr(_embeddings, "_API_CALL_COUNT", None)
+                    if api_calls_after is not None:
+                        embedding_diag["api_calls"] = api_calls_after - api_calls_before
                 all_results.append(conv_result)
                 beam.conn.close()
 
@@ -3027,18 +4300,23 @@ def main():
                     from collections import defaultdict
                     _scores = defaultdict(list)
                     for q_res in conv_result.get("results", []):
+                        if _is_skipped_question_result(q_res):
+                            continue
                         _ab = q_res.get("ability")
                         _sc = q_res.get("score")
                         if _ab and _sc is not None:
                             _scores[_ab].append(_sc)
                     
+                    _ability_avgs = [sum(scs) / len(scs) for scs in _scores.values() if scs]
+                    _macro_overall = (sum(_ability_avgs) / len(_ability_avgs)) * 100 if _ability_avgs else 0.0
                     _conv_total_score = sum(sum(scs) for scs in _scores.values())
                     _conv_total_count = sum(len(scs) for scs in _scores.values())
-                    _avg_overall = (_conv_total_score / _conv_total_count) * 100 if _conv_total_count else 0.0
+                    _micro_overall = (_conv_total_score / _conv_total_count) * 100 if _conv_total_count else 0.0
                     
                     print("\n====================================================")
                     print(f"🎉 CONVERSATION {conv_result.get('conversation_id')} EVALUATION COMPLETE")
-                    print(f"Scale: {scale} | Overall Accuracy: {_avg_overall:.2f}%")
+                    print(f"Scale: {scale} | OVERALL (macro): {_macro_overall:.2f}%")
+                    print(f"                 micro diag: {_micro_overall:.2f}%")
                     print("----------------------------------------------------")
                     for _ab, scs in sorted(_scores.items()):
                         _ab_avg = (sum(scs) / len(scs)) * 100
@@ -3060,19 +4338,8 @@ def main():
             # Append-only with run_started_at + config_id means multiple
             # phases accumulate in one file; analyst filters by config_id.
             with open(PAIRED_OUTCOMES_FILE, "a") as paired_f:
-                for question in conv_result.get("results", []):
-                    qid = question.get("qid")
-                    score = question.get("score", 0.0)
-                    paired_f.write(json.dumps({
-                        "config_id": _config_id,
-                        "run_started_at": _run_started_at,
-                        "scale": conv_result.get("scale"),
-                        "conversation_id": conv_result.get("conversation_id"),
-                        "qid": qid,
-                        "ability": question.get("ability"),
-                        "score": score,  # raw rubric score 0.0-1.0
-                        "correct": score >= 0.5,  # boolean threshold for paired tests
-                    }) + "\n")
+                for paired_row in _build_paired_outcome_rows(conv_result, _config_id, _run_started_at):
+                    paired_f.write(_json_dumps_sanitized(paired_row) + "\n")
             _recall_diag = None
             _extraction_diag = None
             try:
@@ -3086,6 +4353,10 @@ def main():
             except ImportError:
                 pass
 
+            reranker_summary = _summarize_reranker_run(conv_result.get("results", []), reranker_preflight)
+            conv_diag["reranker"] = reranker_summary
+            conv_result.setdefault("diagnostics", {})["reranker"] = reranker_summary
+
             metadata = {
                 "date": datetime.now(timezone.utc).isoformat(),
                 "run_started_at": _run_started_at,
@@ -3094,22 +4365,29 @@ def main():
                 "judge_model": args.judge_model or args.model,
                 "top_k": DEFAULT_TOP_K,
                 "sample_size": sample_size or "ALL",
+                "conversation_count": sample_size or "ALL",
                 "scales": scales,
                 "total_conversations": len(all_results),
+                "selected_conversation_ids": selected_conversation_ids,
                 "config": {
                     "env": _benchmark_env_snapshot,
                     "pure_recall": _pr_active,
                     "allow_harness_oracles": args.allow_harness_oracles,
                     "full_context": args.full_context,
                     "use_cloud": args.use_cloud,
+                    "allow_no_reranker": args.allow_no_reranker,
+                    "case_index": args.case_index,
+                    "start_index": args.start_index,
                 },
                 "diagnostics": {
                     "recall": _recall_diag,
                     "extraction": _extraction_diag,
+                    "reranker": reranker_summary,
+                    "embedding": conv_diag.get("embedding", {}),
                 },
             }
             with open(RESULTS_FILE, "w") as f:
-                json.dump({"metadata": metadata, "results": all_results}, f, indent=2)
+                _write_json_sanitized({"metadata": metadata, "results": all_results}, f, indent=2)
 
     # Cleanup
     llm.close()
@@ -3118,28 +4396,33 @@ def main():
     # Compute and print report
     print(f"\n[4/4] Computing SOTA report...")
     ability_summary = compute_ability_scores(all_results)
+    micro_overall = compute_micro_scores(all_results)
+    partial_credit_overall = compute_partial_credit_overall(all_results)
+    comparison_valid = (
+        sample_size is None
+        and args.case_index is None
+        and args.start_index == 0
+        and args.judge_model is None
+        and not args.full_context
+        and reranker_preflight.get("ok")
+    )
 
     metadata = {
         "model": args.model,
         "sample_size": sample_size or "ALL",
+        "conversation_count": sample_size or "ALL",
         "judge_model": args.judge_model or args.model,
+        "micro_overall": micro_overall,
+        "partial_credit_overall": partial_credit_overall,
+        "comparison_valid": comparison_valid,
+        "selected_conversation_ids": selected_conversation_ids,
     }
     print_sota_report(ability_summary, metadata)
 
     # Save summary
-    summary_file = RESULTS_FILE.parent / "beam_e2e_summary.json"
+    summary_file = _results_summary_path(RESULTS_FILE)
     with open(summary_file, "w") as f:
-        json.dump({
-            "date": datetime.now(timezone.utc).isoformat(),
-            "metadata": metadata,
-            "ability_summary": {
-                scale: {
-                    ab: {"avg_score": v["avg_score"], "count": v["count"]}
-                    for ab, v in abilities.items()
-                }
-                for scale, abilities in ability_summary.items()
-            },
-        }, f, indent=2)
+        _write_json_sanitized(_build_evaluation_summary(all_results, metadata), f, indent=2)
 
     print(f"\n  Results saved to: {RESULTS_FILE}")
     print(f"  Summary saved to: {summary_file}")

@@ -19,7 +19,7 @@ apt-get install -y nodejs
 ```
 
 ### **2. Unified Docker Compose Stack (Highly Recommended)**
-To launch both the **Qdrant Vector Database** and the **OpenVINO Inference Server** (hosting the TEI-like `/embed` and `/rerank` endpoints) in a unified, single-command environment with native Intel iGPU acceleration:
+To launch both the **Qdrant Vector Database** and the **OpenVINO Inference Server** (hosting the benchmark-supported `/v1/embeddings` and `/rerank` endpoints) in a unified, single-command environment with native Intel iGPU acceleration:
 
 ```bash
 # Navigate to the deploy folder
@@ -31,7 +31,7 @@ docker compose up --build -d
 
 This will cleanly configure and spin up:
 1. **`edumem-qdrant`** (Port `6333` and `6334` for database storage).
-2. **`openvino-server`** (Exposing `/embed`, `/rerank`, and `/v1/chat/completions` on host port `3002` with integrated GPU devices mapped).
+2. **`openvino-server`** (Exposing `/v1/embeddings`, `/rerank`, and `/v1/chat/completions` on host port `3002` with integrated GPU devices mapped).
 
 *Alternatively, if you prefer to run Qdrant as a standalone container without the inference server:*
 ```bash
@@ -62,26 +62,29 @@ pip install --upgrade pip
 pip install datasets requests tqdm numpy scipy pydantic sqlite-vec
 ```
 
-### **5. Prepare & Export OpenVINO Models**
-Before building the Docker image or running the OpenVINO Inference Server, you need to download the raw Hugging Face models and export them to OpenVINO IR (FP16) format.
+### **5. OpenVINO Models**
+The Dockerfile now runs the model export step during `podman build` or `docker build`, so you do not need to pre-export the models on the host.
 
-A convenient, non-interactive script is provided for this purpose:
+Build with an authenticated Hugging Face token if needed. If the token is only in `.env`, load it into PowerShell first:
+```powershell
+$env:HF_TOKEN = ((Get-Content .env | Where-Object { $_ -match '^HF_TOKEN=' } | Select-Object -First 1) -replace '^HF_TOKEN=', '').Trim('"')
+podman build --build-arg HF_TOKEN=$env:HF_TOKEN -t edumem:latest .
+```
+
+If you prefer to export manually on the host, the script is still available:
 ```bash
 python3 /opt/edumem/bin/prepare_models.py
-```
-
-This script will:
-1. Parse `/opt/edumem/.env` to read `HF_TOKEN` if present (falling back to standard system environment variables like `HF_TOKEN` or `HUGGING_FACE_HUB_TOKEN`).
-2. Automatically check if `optimum-intel[openvino]` is installed in the active virtual environment `/opt/edumem/.venv`, and install it if missing.
-3. Check if `models/gte-modernbert-ov` and `models/ettin-17m-ov` already exist. If they do, it will skip downloading/exporting to prevent redundant disk and network operations.
-4. Execute `optimum-cli export openvino` under the hood to export:
-   - **GTE ModernBERT** (`Alibaba-NLP/gte-modernbert-base`) with `--task feature-extraction` and `--weight-format fp16` to `models/gte-modernbert-ov`.
-   - **Ettin Reranker** (`cross-encoder/ettin-reranker-17m-v1`) with `--task text-classification` and `--weight-format fp16` to `models/ettin-17m-ov`.
-
-*Note: If you need to force re-exporting of existing models, you can run the script with the `--force` flag:*
-```bash
 python3 /opt/edumem/bin/prepare_models.py --force
 ```
+
+The build and the script both prepare these FP16 OpenVINO models:
+1. **Embedding model** (`sentence-transformers/all-mpnet-base-v2`, 768 dims) -> `models/gte-modernbert-ov`
+2. **MiniLM Reranker** (`cross-encoder/ms-marco-MiniLM-L-6-v2`) -> `models/ettin-17m-ov`
+
+For the official BEAM runner, the only supported dense embedding path is:
+`http://localhost:3002/v1/embeddings`
+with `EDUMEM_EMBEDDING_MODEL=sentence-transformers/all-mpnet-base-v2` and
+`EDUMEM_EMBEDDING_DIM=768`.
 
 ### **6. Start and Register `api-daemon` Service**
 1. Generate the service defaults environment file at **`/etc/default/api-daemon`** containing your active API keys:

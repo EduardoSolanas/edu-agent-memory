@@ -49,7 +49,7 @@ class EmbedResponse(BaseModel):
 
 class OpenAIEmbeddingRequest(BaseModel):
     input: str | List[str]
-    model: Optional[str] = "Alibaba-NLP/gte-modernbert-base"
+    model: Optional[str] = "sentence-transformers/all-mpnet-base-v2"
     
 class RerankRequest(BaseModel):
     query: str
@@ -449,7 +449,7 @@ async def health():
 @app.get("/info")
 async def info():
     return {
-        "model_id": "Alibaba-NLP/gte-modernbert-base",
+        "model_id": "sentence-transformers/all-mpnet-base-v2",
         "model_type": "embedding",
         "max_input_length": 8192,
         "dimension": 768,

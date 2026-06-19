@@ -1,0 +1,146 @@
+{
+  "metadata": {
+    "date": "2026-06-19T08:48:38.448249+00:00",
+    "run_started_at": "2026-06-19T08:43:32.274882+00:00",
+    "config_id": "cfg-test-rejudge",
+    "model": "answer-model-v1",
+    "judge_model": "judge-model-v1",
+    "top_k": 30,
+    "sample_size": 1,
+    "conversation_count": 1,
+    "scales": [
+      "100K"
+    ],
+    "total_conversations": 1,
+    "selected_conversation_ids": {
+      "100K": [
+        "conv-1"
+      ]
+    }
+  },
+  "results": [
+    {
+      "conversation_id": "conv-1",
+      "scale": "100K",
+      "num_questions": 2,
+      "num_evaluated": 2,
+      "results": [
+        {
+          "qid": "conv-1:q0",
+          "ability": "IE",
+          "question": "What did I prefer for lunch?",
+          "question_full": "What did I prefer for lunch?",
+          "ideal_answer": "I preferred salads.",
+          "ideal_answer_full": "I preferred salads.",
+          "rubric": [
+            "The answer should mention salads.",
+            "The answer should mention lunch."
+          ],
+          "ai_answer": "You preferred salads for lunch.",
+          "ai_answer_full": "You preferred salads for lunch.",
+          "ai_answer_excerpt": "You preferred salads for lunch.",
+          "recall_provenance": {
+            "engine": "linear",
+            "kept_count": 3
+          },
+          "score": 0.0,
+          "official_score": 0.0,
+          "partial_credit_score": 0.0,
+          "scoring_mode": "fallback",
+          "parse_status": "ok",
+          "judge_status": "ok",
+          "judge_failure_class": null,
+          "judge_failure_message": "",
+          "judge_raw_response": "{\"scores\":[0,0]}",
+          "judge_raw_result": {
+            "scores": [
+              0,
+              0
+            ],
+            "overall_score": 0.0
+          },
+          "judge_raw_payload": {
+            "scores": [
+              0,
+              0
+            ],
+            "overall_score": 0.0
+          },
+          "judge_finish_reason": "stop",
+          "judge_response_had_content": true,
+          "judge_retry_count": 0,
+          "assessment": "old brief",
+          "judge_assessment": "old assessment",
+          "answer_model": "answer-model-v1",
+          "judge_model": "judge-model-v1",
+          "answer_time_ms": 10.5,
+          "judge_time_ms": 4.0,
+          "retrieval_diagnostics": {
+            "strategy": "keyword"
+          },
+          "answer_api_diagnostics": {
+            "finish_reason": "stop",
+            "retry_count": 0
+          },
+          "nuggets": []
+        },
+        {
+          "qid": "conv-1:q1",
+          "ability": "MR",
+          "question": "What did I say about afternoon tea?",
+          "question_full": "What did I say about afternoon tea?",
+          "ideal_answer": "I preferred afternoon tea.",
+          "ideal_answer_full": "I preferred afternoon tea.",
+          "rubric": [
+            "The answer should mention afternoon tea."
+          ],
+          "ai_answer": "I preferred afternoon tea.",
+          "ai_answer_full": "I preferred afternoon tea.",
+          "ai_answer_excerpt": "I preferred afternoon tea.",
+          "recall_provenance": {
+            "engine": "linear",
+            "kept_count": 2
+          },
+          "score": 0.0,
+          "official_score": 0.0,
+          "partial_credit_score": 0.0,
+          "scoring_mode": "fallback",
+          "parse_status": "ok",
+          "judge_status": "ok",
+          "judge_failure_class": null,
+          "judge_failure_message": "",
+          "judge_raw_response": "{\"scores\":[0]}",
+          "judge_raw_result": {
+            "scores": [
+              0
+            ],
+            "overall_score": 0.0
+          },
+          "judge_raw_payload": {
+            "scores": [
+              0
+            ],
+            "overall_score": 0.0
+          },
+          "judge_finish_reason": "stop",
+          "judge_response_had_content": true,
+          "judge_retry_count": 0,
+          "assessment": "old brief",
+          "judge_assessment": "old assessment",
+          "answer_model": "answer-model-v1",
+          "judge_model": "judge-model-v1",
+          "answer_time_ms": 9.5,
+          "judge_time_ms": 4.5,
+          "retrieval_diagnostics": {
+            "strategy": "keyword"
+          },
+          "answer_api_diagnostics": {
+            "finish_reason": "stop",
+            "retry_count": 0
+          },
+          "nuggets": []
+        }
+      ]
+    }
+  ]
+}

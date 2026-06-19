@@ -49,26 +49,34 @@ RUN pip install --no-cache-dir \
     pydantic \
     numpy
 
+# Layer 8: Install benchmark data loading dependency used by BEAM runs
+RUN pip install --no-cache-dir datasets
+
+# Layer 9: Install CPU-only PyTorch so export tooling cannot resolve CUDA wheels
+RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu torch
+
+# Layer 10: Install OpenVINO export tooling used to build the bundled model assets
+RUN pip install --no-cache-dir optimum-intel[openvino]
+
 # Set working directory
 WORKDIR /app
 
-# Layer 8: Explicitly Copy Large Baked-In Model Weights (Avoids rebuilding when code changes)
-COPY models/gte-modernbert-ov /app/models/gte-modernbert-ov
-COPY models/ettin-17m-ov /app/models/ettin-17m-ov
-
-# Layer 9: Copy Application Source Files and Folders explicitly to avoid copying models or virtual environments
+# Layer 11: Copy model-prep tooling and build the OpenVINO exports inside the image
 COPY bin /app/bin
+ARG HF_TOKEN
+ARG HUGGING_FACE_HUB_TOKEN
+RUN HF_TOKEN="${HF_TOKEN:-$HUGGING_FACE_HUB_TOKEN}" python3 /app/bin/prepare_models.py
+
+# Layer 12: Copy Application Source Files and Folders explicitly to avoid copying models or virtual environments
 COPY benchmarks /app/benchmarks
 COPY tests /app/tests
-COPY data /app/data
-COPY data_hf /app/data_hf
 COPY docs /app/docs
 COPY server.py /app/server.py
 COPY package.json /app/package.json
 COPY entrypoint.sh /app/entrypoint.sh
 
 # Ensure entrypoint script is executable
-RUN chmod +x /app/entrypoint.sh
+RUN sed -i 's/\r$//' /app/entrypoint.sh && chmod +x /app/entrypoint.sh
 
 # Environment Configurations
 ENV EMBED_MODEL_PATH=/app/models/gte-modernbert-ov

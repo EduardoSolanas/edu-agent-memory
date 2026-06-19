@@ -405,6 +405,82 @@ VEC_TYPE = os.environ.get("EDUMEM_VEC_TYPE", "int8").lower()
 if VEC_TYPE not in ("float32", "int8", "bit"):
     VEC_TYPE = "float32"
 
+_DEFAULT_EMBEDDING_BATCH_SIZE = 8
+_DEFAULT_EMBEDDING_BATCH_TOTAL_CHARS = 6000
+
+
+def _get_embedding_batch_size() -> int:
+    """Return the CPU-friendly embedding chunk size."""
+    raw = os.environ.get("EDUMEM_EMBEDDING_BATCH_SIZE")
+    if raw is None:
+        return _DEFAULT_EMBEDDING_BATCH_SIZE
+    try:
+        batch_size = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return _DEFAULT_EMBEDDING_BATCH_SIZE
+    if batch_size < 1:
+        return _DEFAULT_EMBEDDING_BATCH_SIZE
+    return batch_size
+
+
+def _get_embedding_batch_total_chars() -> int:
+    """Return the total character budget for one embedding request."""
+    for env_name in ("EDUMEM_EMBEDDING_BATCH_TOTAL_CHARS", "EDUMEM_EMBEDDING_BATCH_CHAR_BUDGET"):
+        raw = os.environ.get(env_name)
+        if raw is None:
+            continue
+        try:
+            total_chars = int(str(raw).strip())
+        except (TypeError, ValueError):
+            return _DEFAULT_EMBEDDING_BATCH_TOTAL_CHARS
+        if total_chars < 1:
+            return _DEFAULT_EMBEDDING_BATCH_TOTAL_CHARS
+        return total_chars
+    return _DEFAULT_EMBEDDING_BATCH_TOTAL_CHARS
+
+
+def _iter_embedding_chunks(
+    items: List[Dict],
+    ids: List[str],
+    batch_size: Optional[int] = None,
+    total_chars: Optional[int] = None,
+):
+    """Yield aligned embedding slices for remember_batch().
+
+    The helper keeps memory IDs and contents in the same positional
+    slice so a failed chunk can be skipped without disturbing later
+    IDs/vectors. Chunking is greedy and bounded by both item count and
+    total text size so long messages do not drag unrelated rows into the
+    same provider call.
+    """
+    effective_batch_size = batch_size if batch_size is not None else _get_embedding_batch_size()
+    if effective_batch_size < 1:
+        effective_batch_size = _DEFAULT_EMBEDDING_BATCH_SIZE
+    effective_total_chars = total_chars if total_chars is not None else _get_embedding_batch_total_chars()
+    if effective_total_chars < 1:
+        effective_total_chars = _DEFAULT_EMBEDDING_BATCH_TOTAL_CHARS
+
+    start = 0
+    while start < len(items):
+        end = start
+        chunk_chars = 0
+        while end < len(items) and (end - start) < effective_batch_size:
+            content = items[end].get("content", "")
+            content_chars = len(content or "")
+            if end > start and (chunk_chars + content_chars) > effective_total_chars:
+                break
+            chunk_chars += content_chars
+            end += 1
+            if end == start + 1 and content_chars > effective_total_chars:
+                break
+
+        if end == start:
+            end = min(start + 1, len(items))
+
+        chunk_items = items[start:end]
+        yield start, end, ids[start:end], [item.get("content", "") for item in chunk_items]
+        start = end
+
 
 def _get_connection(db_path: Path = None) -> sqlite3.Connection:
     """Get thread-local database connection with extensions loaded.
@@ -1508,6 +1584,63 @@ def _minimum_recall_relevance(query_tokens: List[str]) -> float:
     return 0.15
 
 
+# Shared admission floor for vector-only candidates.
+# Calibrated to the shipped all-mpnet-base-v2 endpoint so strong semantic
+# paraphrases can pass without letting unrelated noise through.
+_WM_VECTOR_ONLY_FLOOR = 0.60
+
+
+def _wm_vector_only_hit_meets_floor(vec_sim: float,
+                                    floor: float = _WM_VECTOR_ONLY_FLOOR) -> bool:
+    """Explicit admission floor for vector-only working-memory hits."""
+    return vec_sim >= floor
+
+
+def _is_user_authored_source(source: Optional[str]) -> bool:
+    """Return True when a structured extraction source looks user-authored."""
+    if not source:
+        return True
+    normalized = str(source).strip().lower()
+    if not normalized:
+        return True
+    if normalized in {"assistant", "system", "tool", "model"}:
+        return False
+    return not any(token in normalized for token in ("assistant", "system", "bot", "llm"))
+
+
+def _strip_synthetic_structured_metadata(content: str) -> str:
+    """Remove benchmark-only structured tags before regex extraction."""
+    if not content:
+        return content
+    cleaned = re.sub(r"\s*\[MSGIDX:\d+\]", " ", content)
+    cleaned = re.sub(r"\s*\[DATES:[^\]]*\]", " ", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s*\[DURATIONS:[^\]]*\]", " ", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\bdatetokens:\s*(?:datetok\d+\s*)+", " ", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\bdatetok\d+\b", " ", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
+
+
+def _add_role_aware_benchmark_tags(content: str, source: Optional[str]) -> str:
+    """Append benchmark IF/PF tags for user-authored content only."""
+    if not _is_user_authored_source(source):
+        return content
+    tagged = content
+    if "[INSTRUCTION]" not in tagged and re.search(
+        r"\b(?:always|never|must|should(?: not)?|need(?:s)? to|required to|prefer(?: not)? to|want to(?: avoid| ensure| use| keep))\b",
+        tagged,
+        re.IGNORECASE,
+    ):
+        tagged = f"{tagged} [INSTRUCTION]"
+    if "[PREFERENCE]" not in tagged and re.search(
+        r"\b(?:prefer|like|love|hate|dislike|want|need|tend to)\b",
+        tagged,
+        re.IGNORECASE,
+    ):
+        tagged = f"{tagged} [PREFERENCE]"
+    return tagged
+
+
 def _fact_match_tokens(text: str) -> Set[str]:
     """Return meaningful tokens for strict fact matching."""
     return set(_recall_tokens(text))
@@ -2263,6 +2396,9 @@ class BeamMemory:
             except Exception:
                 logger.info("Regex extraction failed, skipping", exc_info=True)
 
+        self._last_ingest_diagnostics = None
+        self._last_ingest_diagnostics_batch = None
+
     # ------------------------------------------------------------------
     # E6 schema split + auto-migration
     # ------------------------------------------------------------------
@@ -2539,11 +2675,18 @@ class BeamMemory:
             # structured retrieval router. Runs silently on every remember()
             # so the MEMORIA tables stay current regardless of extract=True.
             try:
-                self.extract_and_store_facts(content, message_idx=0, source_memory_id=existing_id)
+                self.extract_and_store_facts(
+                    content,
+                    message_idx=message_index if message_index is not None else 0,
+                    source_memory_id=existing_id,
+                    source=source,
+                )
             except Exception:
                 pass  # regex extraction failures must not block memory storage
             # Phase 3-4: Extract graph and consolidate veracity for dedup update
-            self._ingest_graph_and_veracity(existing_id, content, source, veracity)
+            self._ingest_graph_and_veracity(
+                existing_id, content, source, veracity, message_idx=message_index
+            )
             self._emit_event("MEMORY_UPDATED", existing_id, content=content,
                              source=source, importance=importance, metadata=metadata)
 
@@ -2566,6 +2709,7 @@ class BeamMemory:
         if _neg_matches:
             for _neg in _neg_matches[:3]:
                 content_to_store += f" [NEG] {_neg.strip()}"
+        content_to_store = _add_role_aware_benchmark_tags(content_to_store, source)
 
         # Build INSERT with optional message_index
         if message_index is not None:
@@ -2642,12 +2786,19 @@ class BeamMemory:
         # Populates memoria_facts, memoria_timelines, memoria_kg for the
         # structured retrieval router. Runs on every remember() call.
         try:
-            self.extract_and_store_facts(content, message_idx=0, source_memory_id=memory_id)
+            self.extract_and_store_facts(
+                content,
+                message_idx=message_index if message_index is not None else 0,
+                source_memory_id=memory_id,
+                source=source,
+            )
         except Exception:
             pass  # regex extraction failures must not block memory storage
 
         # Phase 3-4: Extract graph and consolidate veracity for new memory
-        self._ingest_graph_and_veracity(memory_id, content, source, veracity)
+        self._ingest_graph_and_veracity(
+            memory_id, content, source, veracity, message_idx=message_index
+        )
 
         self._emit_event("MEMORY_ADDED", memory_id, content=content,
                          source=source, importance=importance, metadata=metadata)
@@ -2743,13 +2894,19 @@ class BeamMemory:
         """
         cursor = self.conn.cursor()
         ids = []
+        batch_diagnostics = []
+        batch_totals = {
+            "graph_facts_delta": 0,
+            "consolidated_delta": 0,
+            "superseded_delta": 0,
+        }
         # Carry per-row source + veracity through to enrichment so we
         # don't re-derive them post-insert. Keyed by memory_id rather
         # than indexed-by-position (post-/review M4 -- dict eliminates
         # the parallel-list class of refactor bug, and works under
         # python -O where the prior `assert mid_check == memory_id`
         # would have stripped).
-        meta_by_id: Dict[str, Tuple[str, str]] = {}  # mid → (source, veracity)
+        meta_by_id: Dict[str, Tuple[str, str, Optional[int]]] = {}  # mid → (source, veracity, message_idx)
         timestamp = datetime.now().isoformat()
         # Clamp the method-level default once, not per row -- operators
         # who pass a bad default should see one warning, not N.
@@ -2798,7 +2955,8 @@ class BeamMemory:
             else:
                 item_veracity = default_veracity
             item_source = item.get("source", "conversation")
-            meta_by_id[memory_id] = (item_source, item_veracity)
+            item_message_index = item.get("message_index")
+            meta_by_id[memory_id] = (item_source, item_veracity, item_message_index)
             item_recorded_at = item.get("recorded_at") or item.get("timestamp") or timestamp
             item_occurred_at = item.get("occurred_at") or parse_relative_date(item["content"], item_recorded_at) or item_recorded_at.split('T')[0]
 
@@ -2808,9 +2966,10 @@ class BeamMemory:
             if neg_matches:
                 for neg in neg_matches[:3]:
                     content_to_store += f" [NEG] {neg.strip()}"
+            content_to_store = _add_role_aware_benchmark_tags(content_to_store, item_source)
 
             # Build INSERT with optional message_index
-            message_index = item.get("message_index")
+            message_index = item_message_index
             if message_index is not None:
                 cursor.execute("""
                     INSERT INTO working_memory (id, content, source, timestamp, session_id, importance, metadata_json,
@@ -2869,40 +3028,48 @@ class BeamMemory:
         # toward earlier-ingested rows without any operator signal.
         # Fix: length-mismatch check + WARNING log on the swallow.
         if _embeddings.available():
-            try:
-                contents = [item["content"] for item in items]
-                vectors = _embeddings.embed(contents)
-                if vectors is None:
-                    logger.warning(
-                        "remember_batch: _embeddings.embed returned None for "
-                        "batch of %d items -- no vectors stored, vector voice "
-                        "will miss these rows",
-                        len(contents),
-                    )
-                elif len(vectors) != len(contents):
-                    logger.warning(
-                        "remember_batch: embedding count mismatch (%d vectors "
-                        "for %d inputs) -- skipping vector storage for this "
-                        "batch to avoid partial-alignment errors",
-                        len(vectors), len(contents),
-                    )
-                else:
+            batch_size = _get_embedding_batch_size()
+            total_chars = _get_embedding_batch_total_chars()
+            for chunk_index, (chunk_start, chunk_end, chunk_ids, chunk_contents) in enumerate(
+                _iter_embedding_chunks(items, ids, batch_size=batch_size, total_chars=total_chars),
+                start=1,
+            ):
+                try:
+                    vectors = _embeddings.embed(chunk_contents)
+                    if vectors is None:
+                        logger.warning(
+                            "remember_batch: embedding chunk %d items[%d:%d] "
+                            "(memory_ids=%s) returned None -- no vectors stored "
+                            "for this chunk",
+                            chunk_index, chunk_start, chunk_end, chunk_ids,
+                        )
+                        continue
+                    if len(vectors) != len(chunk_contents):
+                        logger.warning(
+                            "remember_batch: embedding chunk %d items[%d:%d] "
+                            "(memory_ids=%s) produced %d vectors for %d inputs -- "
+                            "skipping this chunk to avoid partial-alignment errors",
+                            chunk_index, chunk_start, chunk_end, chunk_ids,
+                            len(vectors), len(chunk_contents),
+                        )
+                        continue
                     model = _embeddings._DEFAULT_MODEL
-                    for i, memory_id in enumerate(ids):
-                        emb_json = _embeddings.serialize(vectors[i])
+                    for memory_id, vector in zip(chunk_ids, vectors):
+                        emb_json = _embeddings.serialize(vector)
                         cursor.execute(
                             "INSERT OR REPLACE INTO memory_embeddings (memory_id, embedding_json, model) VALUES (?, ?, ?)",
                             (memory_id, emb_json, model)
                         )
-            except Exception as exc:
-                # M3 review fix: include exception type name so operators
-                # can distinguish sqlite3.OperationalError from RuntimeError
-                # etc. without parsing the message string.
-                logger.warning(
-                    "remember_batch: embedding storage failed for batch of "
-                    "%d items (vector voice will miss these rows) (%s): %s",
-                    len(items), type(exc).__name__, exc,
-                )
+                except Exception as exc:
+                    # Include chunk boundaries and memory IDs so a bad
+                    # provider response can be diagnosed without
+                    # misaligning later chunks.
+                    logger.warning(
+                        "remember_batch: embedding chunk %d items[%d:%d] "
+                        "(memory_ids=%s) failed (%s): %s",
+                        chunk_index, chunk_start, chunk_end, chunk_ids,
+                        type(exc).__name__, exc,
+                    )
 
         # E2 -- enrichment parity with `remember()`. The merge of PR #82
         # accidentally stripped these calls during conflict resolution;
@@ -2915,9 +3082,31 @@ class BeamMemory:
         # working_memory + embedding writes so a failure here doesn't
         # poison the per-row source / veracity bookkeeping.
         for memory_id in ids:
-            item_source, item_veracity = meta_by_id.get(
-                memory_id, ("conversation", "unknown")
+            item_source, item_veracity, item_message_index = meta_by_id.get(
+                memory_id, ("conversation", "unknown", None)
             )
+            row_diag = {
+                "memory_id": memory_id,
+                "source": item_source,
+                "source_role": None,
+                "message_idx": item_message_index,
+                "graph_facts_before": None,
+                "graph_facts_after": None,
+                "graph_facts_delta": 0,
+                "consolidated_before": None,
+                "consolidated_after": None,
+                "consolidated_delta": 0,
+                "superseded_before": None,
+                "superseded_after": None,
+                "superseded_delta": 0,
+                "graph_fact_rows": 0,
+            }
+            if item_source:
+                parts = str(item_source).strip().lower().split("_", 1)
+                if len(parts) == 2 and parts[0] == "beam":
+                    row_diag["source_role"] = parts[1]
+                else:
+                    row_diag["source_role"] = parts[-1]
             try:
                 # Look up the just-written row to find its content +
                 # timestamp; cheap (PK lookup).
@@ -2932,16 +3121,24 @@ class BeamMemory:
                 self._add_temporal_triple(
                     memory_id, row_timestamp, item_source, row_content
                 )
-                self._ingest_graph_and_veracity(
-                    memory_id, row_content, item_source, item_veracity
+                diag = self._ingest_graph_and_veracity(
+                    memory_id, row_content, item_source, item_veracity,
+                    message_idx=item_message_index
                 )
+                if diag:
+                    row_diag.update(diag)
                 if extract_entities:
                     _extract_and_store_entities(self, memory_id, row_content)
                 if extract:
                     _extract_and_store_facts(self, memory_id, row_content, item_source)
                 # Phase 2: MEMORIA regex-based extraction for every batch row.
                 try:
-                    self.extract_and_store_facts(row_content, message_idx=0, source_memory_id=memory_id)
+                    self.extract_and_store_facts(
+                        row_content,
+                        message_idx=item_message_index if item_message_index is not None else 0,
+                        source_memory_id=memory_id,
+                        source=item_source,
+                    )
                 except Exception:
                     pass  # regex extraction failures must not block memory storage
                 # MEMORY_ADDED parity with remember() -- streaming
@@ -2961,17 +3158,43 @@ class BeamMemory:
                     "remember_batch: per-row enrichment failed for %s (%s): %s",
                     memory_id, type(exc).__name__, exc,
                 )
+            finally:
+                batch_diagnostics.append(row_diag)
+                batch_totals["graph_facts_delta"] += row_diag["graph_facts_delta"] or 0
+                batch_totals["consolidated_delta"] += row_diag["consolidated_delta"] or 0
+                batch_totals["superseded_delta"] += row_diag["superseded_delta"] or 0
 
         self._trim_working_memory()
+        self._last_ingest_diagnostics_batch = {
+            "rows": batch_diagnostics,
+            "totals": batch_totals,
+        }
         return ids
 
     def _ingest_graph_and_veracity(self, memory_id: str, content: str,
-                                    source: str, veracity: str = "unknown"):
+                                    source: str, veracity: str = "unknown",
+                                    message_idx: Optional[int] = None):
         """Phase 3-4: Extract gists + facts, store in graph, consolidate veracity.
         Non-blocking -- failures in graph/veracity don't affect memory storage."""
 
         gist = None
         facts = []
+        source_role = None
+        if source:
+            parts = str(source).strip().lower().split("_", 1)
+            if len(parts) == 2 and parts[0] == "beam":
+                source_role = parts[1]
+            else:
+                source_role = parts[-1]
+
+        cursor = self.conn.cursor()
+        before_graph_facts = cursor.execute("SELECT COUNT(*) FROM facts").fetchone()[0]
+        before_consolidated = cursor.execute(
+            "SELECT COUNT(*) FROM consolidated_facts"
+        ).fetchone()[0]
+        before_superseded = cursor.execute(
+            "SELECT COUNT(*) FROM consolidated_facts WHERE superseded_by IS NOT NULL"
+        ).fetchone()[0]
 
         # Phase 3: Episodic graph extraction
         if self.episodic_graph is not None:
@@ -2980,6 +3203,22 @@ class BeamMemory:
                 self.episodic_graph.store_gist(gist, memory_id)
 
                 facts = self.episodic_graph.extract_facts(content, memory_id)
+                unique_facts = []
+                seen_fact_keys: Set[tuple] = set()
+                def _fact_field(fact, name: str):
+                    if isinstance(fact, dict):
+                        return fact.get(name)
+                    return getattr(fact, name, None)
+                for fact in facts:
+                    fact_key = (_fact_field(fact, "subject"),
+                                _fact_field(fact, "predicate"),
+                                _fact_field(fact, "object"))
+                    if fact_key in seen_fact_keys:
+                        continue
+                    seen_fact_keys.add(fact_key)
+                    unique_facts.append(fact)
+
+                facts = unique_facts
                 for fact in facts:
                     self.episodic_graph.store_fact(fact, memory_id)
 
@@ -3012,6 +3251,31 @@ class BeamMemory:
 
         # Phase 5: Proactive linking — auto-create graph edges to related memories
         self._proactively_link(memory_id, content)
+
+        after_graph_facts = cursor.execute("SELECT COUNT(*) FROM facts").fetchone()[0]
+        after_consolidated = cursor.execute(
+            "SELECT COUNT(*) FROM consolidated_facts"
+        ).fetchone()[0]
+        after_superseded = cursor.execute(
+            "SELECT COUNT(*) FROM consolidated_facts WHERE superseded_by IS NOT NULL"
+        ).fetchone()[0]
+        self._last_ingest_diagnostics = {
+            "memory_id": memory_id,
+            "source": source,
+            "source_role": source_role,
+            "message_idx": message_idx,
+            "graph_facts_before": before_graph_facts,
+            "graph_facts_after": after_graph_facts,
+            "graph_facts_delta": after_graph_facts - before_graph_facts,
+            "consolidated_before": before_consolidated,
+            "consolidated_after": after_consolidated,
+            "consolidated_delta": after_consolidated - before_consolidated,
+            "superseded_before": before_superseded,
+            "superseded_after": after_superseded,
+            "superseded_delta": after_superseded - before_superseded,
+            "graph_fact_rows": len(facts),
+        }
+        return self._last_ingest_diagnostics
 
     def _proactively_link(self, memory_id: str, content: str):
         """Phase 5: Auto-create graph edges between new memory and related existing memories.
@@ -3898,19 +4162,23 @@ class BeamMemory:
     }
 
     def extract_and_store_facts(self, content: str, message_idx: int = 0,
-                                source_memory_id: Optional[str] = None) -> dict:
+                                source_memory_id: Optional[str] = None,
+                                source: str = "") -> dict:
         import re as _re
-        msgidx_match = _re.search(r'\[MSGIDX:(\\d+)\]', content)
+        msgidx_match = _re.search(r'\[MSGIDX:(\d+)\]', content)
         if msgidx_match:
             message_idx = int(msgidx_match.group(1))
+        content = _strip_synthetic_structured_metadata(content)
+        if source_memory_id is None and message_idx is not None:
+            source_memory_id = f"msgidx:{message_idx}"
         """Extract structured facts from a message and store in facts/timelines/kg tables.
         Uses regex patterns matching the BEAM benchmark oracles.
         Language-aware: detects language and uses language-specific patterns.
         Returns dict of counts per fact_type."""
-        import re as _re
         counts = {"metric": 0, "date": 0, "version": 0, "entity": 0,
                   "sequence": 0, "timeline": 0, "negation": 0, "decision": 0}
         session = self.session_id
+        is_user_source = _is_user_authored_source(source)
 
         # Language detection
         lang = self.detect_language(content)
@@ -3975,10 +4243,10 @@ class BeamMemory:
                 key = key.replace('_%', '_pct')
                 if not key.endswith('_pct'):
                     key = f"{prefix}_pct" if prefix else 'pct'
-            self._insert_fact(session, message_idx, 'metric', key, val,
-                              self._context_snippet(content, m.start()), 0.65,
-                              source_memory_id=source_memory_id)
-            counts["metric"] += 1
+            if self._insert_fact(session, message_idx, 'metric', key, val,
+                                 self._context_snippet(content, m.start()), 0.65,
+                                 source_memory_id=source_memory_id):
+                counts["metric"] += 1
 
         # ISO Dates — require event context within 100 chars to avoid
         # file paths, report dates, and passing mentions as timeline entries
@@ -3991,20 +4259,22 @@ class BeamMemory:
             _has_event_context = any(kw in _ctx_lower for kw in _EVENT_KEYWORDS)
             if not _has_event_context:
                 # Still store as a fact (date mention), but skip timeline entry
-                self._insert_fact(session, message_idx, 'date', 'iso_date', dt, ctx, 0.5, source_memory_id=source_memory_id)
-                counts["date"] += 1
+                if self._insert_fact(session, message_idx, 'date', 'iso_date', dt, ctx, 0.5, source_memory_id=source_memory_id):
+                    counts["date"] += 1
             else:
-                self._insert_fact(session, message_idx, 'date', 'iso_date', dt, ctx, 0.7, source_memory_id=source_memory_id)
-                self._insert_timeline(session, dt, message_idx, ctx[:120], 'iso_date', source_memory_id=source_memory_id)
-                counts["date"] += 1
-                counts["timeline"] += 1
+                inserted_date = self._insert_fact(session, message_idx, 'date', 'iso_date', dt, ctx, 0.7, source_memory_id=source_memory_id)
+                inserted_timeline = self._insert_timeline(session, dt, message_idx, ctx[:120], 'iso_date', source_memory_id=source_memory_id)
+                if inserted_date:
+                    counts["date"] += 1
+                if inserted_timeline:
+                    counts["timeline"] += 1
 
         # Named dates (e.g. March 29, 2024 — language-aware)
         for m in _re.finditer(pat['named_months'], content, _re.IGNORECASE):
             dt = m.group(1).strip()
             ctx = self._context_snippet(content, m.start())
-            self._insert_fact(session, message_idx, 'date', 'named_date', dt, ctx, 0.7, source_memory_id=source_memory_id)
-            counts["date"] += 1
+            if self._insert_fact(session, message_idx, 'date', 'named_date', dt, ctx, 0.7, source_memory_id=source_memory_id):
+                counts["date"] += 1
 
         # Version strings — two patterns:
         # Pattern A: "PostgreSQL v14.2", "Docker 27.1.1" (name directly before version)
@@ -4012,10 +4282,10 @@ class BeamMemory:
             name = m.group(1).strip()
             ver = m.group(2)
             key = f"{name.lower().replace(' ', '_')}_version"
-            self._insert_fact(session, message_idx, 'version', key, ver,
-                              self._context_snippet(content, m.start()), 0.7,
-                              source_memory_id=source_memory_id)
-            counts["version"] += 1
+            if self._insert_fact(session, message_idx, 'version', key, ver,
+                                 self._context_snippet(content, m.start()), 0.7,
+                                 source_memory_id=source_memory_id):
+                counts["version"] += 1
         # Pattern B: "PostgreSQL version 14.2", "Python version 3.11" (explicit 'version' word)
         _seen_versions = set()  # dedup across patterns
         for m in _re.finditer(r'([A-Z][a-zA-Z]+)\s+version\s+v?(\d+\.\d+(?:\.\d+)?)', content, _re.IGNORECASE):
@@ -4027,10 +4297,10 @@ class BeamMemory:
             key = f"{name.lower().replace(' ', '_')}_version"
             if ver not in _seen_versions:
                 _seen_versions.add(ver)
-                self._insert_fact(session, message_idx, 'version', key, ver,
-                                  self._context_snippet(content, m.start()), 0.7,
-                                  source_memory_id=source_memory_id)
-                counts["version"] += 1
+                if self._insert_fact(session, message_idx, 'version', key, ver,
+                                     self._context_snippet(content, m.start()), 0.7,
+                                     source_memory_id=source_memory_id):
+                    counts["version"] += 1
 
         # Negations (critical for CR) — language-aware
         for m in _re.finditer(pat['negation'], content, _re.IGNORECASE):
@@ -4048,75 +4318,78 @@ class BeamMemory:
                     if len(parts) > 1:
                         obj = parts[-1].strip()
                         break
-            self._insert_kg(session, 'user', 'negation', obj[:80], message_idx, 0.75, source_memory_id=source_memory_id)
-            counts["negation"] += 1
+            if self._insert_kg(session, 'user', 'negation', obj[:80], message_idx, 0.75, source_memory_id=source_memory_id):
+                counts["negation"] += 1
 
         # Decisions — language-aware
         for m in _re.finditer(pat['decision'], content, _re.IGNORECASE):
             decision = m.group(1).strip()
-            self._insert_kg(session, 'user', 'decision', decision, message_idx, 0.65, source_memory_id=source_memory_id)
-            counts["decision"] += 1
+            if self._insert_kg(session, 'user', 'decision', decision, message_idx, 0.65, source_memory_id=source_memory_id):
+                counts["decision"] += 1
 
         # Entity-action pairs (MR support) — language-aware
         for m in _re.finditer(pat['entity'], content, _re.IGNORECASE):
             entity = m.group(1).strip()
             action = m.group(2).strip()
-            self._insert_kg(session, entity, 'requires', action, message_idx, 0.65, source_memory_id=source_memory_id)
-            counts["decision"] += 1
+            if self._insert_kg(session, entity, 'requires', action, message_idx, 0.65, source_memory_id=source_memory_id):
+                counts["decision"] += 1
 
         # Sequence markers (EO support) — language-aware
         for m in _re.finditer(pat['sequence'], content, _re.IGNORECASE):
             seq = m.group(1).strip()
             first_word = seq.split()[0].lower()
-            self._insert_fact(session, message_idx, 'sequence', first_word, seq[:120],
-                              self._context_snippet(content, m.start()), 0.6,
-                              source_memory_id=source_memory_id)
-            counts["sequence"] += 1
+            if self._insert_fact(session, message_idx, 'sequence', first_word, seq[:120],
+                                 self._context_snippet(content, m.start()), 0.6,
+                                 source_memory_id=source_memory_id):
+                counts["sequence"] += 1
 
-        # Instructions (IF support): language-aware
-        _INSTRUCTION_FALSE_POSITIVES = pat['instruction_false_positives']
-        _INSTR_IMPERATIVE_VERBS = pat['instruction_imperative']
-        _instr_re = pat['instruction'].replace('IMPVERBS', _INSTR_IMPERATIVE_VERBS)
-        for m in _re.finditer(_instr_re, content, _re.IGNORECASE):
-            instr = m.group(0).strip()
-            topic = m.group(1).strip()[:60]
-            # Skip known false positives
-            _instr_lower = instr.lower()
-            if any(fp in _instr_lower for fp in _INSTRUCTION_FALSE_POSITIVES):
-                continue
-            # Skip bare "should"/"sollte"/"dovrebbe"/"dovresti" questions not directed at anyone
-            if _re.match(r'^(?:should|sollte|dovrebbe|dovresti)\s+(?:i|we|it|they|he|she|the|ich|wir|es|man|der|die|das|io|noi|lui|lei|loro)\b', instr, _re.IGNORECASE):
-                continue
-            self.conn.execute(
-                "INSERT INTO memoria_instructions (session_id, message_idx, instruction, topic, context_snippet, source_memory_id) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (session, message_idx, instr[:200], topic, self._context_snippet(content, m.start()), source_memory_id))
-            counts["instruction"] = counts.get("instruction", 0) + 1
+        if is_user_source:
+            # Instructions (IF support): language-aware
+            _INSTRUCTION_FALSE_POSITIVES = pat['instruction_false_positives']
+            _INSTR_IMPERATIVE_VERBS = pat['instruction_imperative']
+            _instr_re = pat['instruction'].replace('IMPVERBS', _INSTR_IMPERATIVE_VERBS)
+            for m in _re.finditer(_instr_re, content, _re.IGNORECASE):
+                instr = m.group(0).strip()
+                topic = m.group(1).strip()[:60]
+                # Skip known false positives
+                _instr_lower = instr.lower()
+                if any(fp in _instr_lower for fp in _INSTRUCTION_FALSE_POSITIVES):
+                    continue
+                # Skip bare "should"/"sollte"/"dovrebbe"/"dovresti" questions not directed at anyone
+                if _re.match(r'^(?:should|sollte|dovrebbe|dovresti)\s+(?:i|we|it|they|he|she|the|ich|wir|es|man|der|die|das|io|noi|lui|lei|loro)\b', instr, _re.IGNORECASE):
+                    continue
+                if self._insert_instruction(
+                    session, message_idx, instr[:200], topic,
+                    self._context_snippet(content, m.start()),
+                    source_memory_id=source_memory_id,
+                ):
+                    counts["instruction"] = counts.get("instruction", 0) + 1
 
-        # Preferences (PF support): evolving user tastes — language-aware
-        for m in _re.finditer(pat['preference'], content, _re.IGNORECASE):
-            pref = m.group(0).strip()
-            topic = m.group(1).strip()[:60]
-            # Extract a clean topic key from the preference for dedup
-            _topic_key = ' '.join(
-                w for w in _re.findall(r'[a-zA-Z]{4,}', topic)
-                if w.lower() not in _FACT_MATCH_STOPWORDS
-            )[:30] or topic[:20]
-            # Check for evolution: did this topic already have a preference?
-            existing = self.conn.execute(
-                "SELECT preference, topic FROM memoria_preferences "
-                "WHERE session_id = ? AND (topic LIKE ? OR preference LIKE ?) "
-                "ORDER BY message_idx DESC LIMIT 1",
-                (session, f'%{_topic_key}%', f'%{_topic_key}%')
-            ).fetchone()
-            evolution = None
-            if existing:
-                evolution = f"was: {existing[0][:120]}"
-            self.conn.execute(
-                "INSERT INTO memoria_preferences (session_id, message_idx, preference, topic, evolution, context_snippet, source_memory_id) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (session, message_idx, pref[:200], topic, evolution, self._context_snippet(content, m.start()), source_memory_id))
-            counts["preference"] = counts.get("preference", 0) + 1
+            # Preferences (PF support): evolving user tastes — language-aware
+            for m in _re.finditer(pat['preference'], content, _re.IGNORECASE):
+                pref = m.group(0).strip()
+                topic = m.group(1).strip()[:60]
+                # Extract a clean topic key from the preference for dedup
+                _topic_key = ' '.join(
+                    w for w in _re.findall(r'[a-zA-Z]{4,}', topic)
+                    if w.lower() not in _FACT_MATCH_STOPWORDS
+                )[:30] or topic[:20]
+                # Check for evolution: did this topic already have a preference?
+                existing = self.conn.execute(
+                    "SELECT preference, topic FROM memoria_preferences "
+                    "WHERE session_id = ? AND (topic LIKE ? OR preference LIKE ?) "
+                    "ORDER BY message_idx DESC LIMIT 1",
+                    (session, f'%{_topic_key}%', f'%{_topic_key}%')
+                ).fetchone()
+                evolution = None
+                if existing:
+                    evolution = f"was: {existing[0][:120]}"
+                if self._insert_preference(
+                    session, message_idx, pref[:200], topic, evolution,
+                    self._context_snippet(content, m.start()),
+                    source_memory_id=source_memory_id,
+                ):
+                    counts["preference"] = counts.get("preference", 0) + 1
 
         self.conn.commit()
         counts["_lang"] = lang  # Tag extraction with detected language
@@ -4125,6 +4398,17 @@ class BeamMemory:
     def _insert_fact(self, session: str, msg_idx: int, ftype: str,
                      key: str, value: str, ctx: str, importance: float,
                      source_memory_id: Optional[str] = None):
+        dedupe_msg_idx = msg_idx if msg_idx is not None else -1
+        exists = self.conn.execute(
+            "SELECT 1 FROM memoria_facts "
+            "WHERE session_id = ? AND (source_memory_id = ? OR message_idx = ?) "
+            "AND fact_type = ? AND key = ? AND value = ? "
+            "LIMIT 1",
+            (session, source_memory_id, dedupe_msg_idx, ftype, key, value),
+        ).fetchone()
+        if exists:
+            return False
+
         # Dates all share generic keys (e.g. "named_date", "iso_date").
         # Versioning would create false evolution chains when different
         # events happen on different dates. Skip versioning for dates.
@@ -4134,7 +4418,7 @@ class BeamMemory:
                 "context_snippet, importance, valid_from_msg_idx, source_memory_id) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (session, msg_idx, ftype, key, value, ctx, importance, msg_idx, source_memory_id))
-            return
+            return True
 
         # Check if this key already has a fact with a different value
         existing = self.conn.execute(
@@ -4169,22 +4453,84 @@ class BeamMemory:
                 "context_snippet, importance, valid_from_msg_idx, source_memory_id) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (session, msg_idx, ftype, key, value, ctx, importance, msg_idx, source_memory_id))
+        return True
 
     def _insert_timeline(self, session: str, date: str, msg_idx: int,
                          desc: str, source: str = 'extraction',
                          source_memory_id: Optional[str] = None):
+        dedupe_msg_idx = msg_idx if msg_idx is not None else -1
+        exists = self.conn.execute(
+            "SELECT 1 FROM memoria_timelines "
+            "WHERE session_id = ? AND (source_memory_id = ? OR message_idx = ?) "
+            "AND date = ? AND description = ? AND source = ? "
+            "LIMIT 1",
+            (session, source_memory_id, dedupe_msg_idx, date, desc, source),
+        ).fetchone()
+        if exists:
+            return False
         self.conn.execute(
             "INSERT INTO memoria_timelines (session_id, date, message_idx, description, source, source_memory_id) "
             "VALUES (?, ?, ?, ?, ?, ?)",
             (session, date, msg_idx, desc, source, source_memory_id))
+        return True
 
     def _insert_kg(self, session: str, subject: str, predicate: str,
                    obj: str, msg_idx: int, confidence: float = 0.7,
                    source_memory_id: Optional[str] = None):
+        dedupe_msg_idx = msg_idx if msg_idx is not None else -1
+        exists = self.conn.execute(
+            "SELECT 1 FROM memoria_kg "
+            "WHERE session_id = ? AND (source_memory_id = ? OR message_idx = ?) "
+            "AND subject = ? AND predicate = ? AND object = ? "
+            "LIMIT 1",
+            (session, source_memory_id, dedupe_msg_idx, subject, predicate, obj),
+        ).fetchone()
+        if exists:
+            return False
         self.conn.execute(
             "INSERT INTO memoria_kg (session_id, subject, predicate, object, message_idx, confidence, source_memory_id) "
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
             (session, subject, predicate, obj, msg_idx, confidence, source_memory_id))
+        return True
+
+    def _insert_instruction(self, session: str, msg_idx: int, instruction: str,
+                             topic: str, context_snippet: str,
+                             source_memory_id: Optional[str] = None):
+        dedupe_msg_idx = msg_idx if msg_idx is not None else -1
+        exists = self.conn.execute(
+            "SELECT 1 FROM memoria_instructions "
+            "WHERE session_id = ? AND (source_memory_id = ? OR message_idx = ?) "
+            "AND instruction = ? AND topic = ? "
+            "LIMIT 1",
+            (session, source_memory_id, dedupe_msg_idx, instruction, topic),
+        ).fetchone()
+        if exists:
+            return False
+        self.conn.execute(
+            "INSERT INTO memoria_instructions (session_id, message_idx, instruction, topic, context_snippet, source_memory_id) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (session, msg_idx, instruction, topic, context_snippet, source_memory_id))
+        return True
+
+    def _insert_preference(self, session: str, msg_idx: int, preference: str,
+                            topic: str, evolution: Optional[str],
+                            context_snippet: str,
+                            source_memory_id: Optional[str] = None):
+        dedupe_msg_idx = msg_idx if msg_idx is not None else -1
+        exists = self.conn.execute(
+            "SELECT 1 FROM memoria_preferences "
+            "WHERE session_id = ? AND (source_memory_id = ? OR message_idx = ?) "
+            "AND preference = ? AND topic = ? "
+            "LIMIT 1",
+            (session, source_memory_id, dedupe_msg_idx, preference, topic),
+        ).fetchone()
+        if exists:
+            return False
+        self.conn.execute(
+            "INSERT INTO memoria_preferences (session_id, message_idx, preference, topic, evolution, context_snippet, source_memory_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (session, msg_idx, preference, topic, evolution, context_snippet, source_memory_id))
+        return True
 
     @staticmethod
     def _context_snippet(content: str, pos: int, width: int = 60) -> str:
@@ -4919,7 +5265,9 @@ class BeamMemory:
             content_lower = row["content"].lower()
             content_words_list = content_lower.split()
             content_words_set = set(content_words_list)
-            if wm_ranks and row["id"] in wm_ranks:
+            vec_sim = wm_vec_sims.get(row["id"], 0.0)
+            has_fts_rank = bool(wm_ranks and row["id"] in wm_ranks)
+            if has_fts_rank:
                 normalized = 1.0 - ((wm_ranks[row["id"]] - min_rank) / rng)
                 lexical = _lexical_relevance(query_words, row["content"], query_lower)
                 # FTS rank is a candidate-order signal, not a hard relevance
@@ -4933,7 +5281,10 @@ class BeamMemory:
             else:
                 relevance = _lexical_relevance(query_words, row["content"], query_lower)
                 row_min_relevance = single_token_relevance if broad_multi_hit_query else min_relevance
-            if relevance >= row_min_relevance or (wm_ranks and len(query_words) <= 1 and relevance > 0):
+            vector_only_hit = (not has_fts_rank and row["id"] in wm_vec_sims and
+                               _wm_vector_only_hit_meets_floor(vec_sim))
+            if (has_fts_rank and (relevance >= row_min_relevance or (len(query_words) <= 1 and relevance > 0))) or \
+               (not has_fts_rank and (vector_only_hit or relevance >= row_min_relevance)):
                 decay = _recency_decay(row["timestamp"])
                 # Phase 4: configurable scoring for working memory
                 # keyword_share = (1 - importance_weight) * 0.6, recency_share = (1 - importance_weight) * 0.4
@@ -4941,7 +5292,6 @@ class BeamMemory:
                 rc_share = (1.0 - iw) * 0.4
                 base_score = relevance * kw_share + row["importance"] * iw + (relevance ** 2) * 0.08
                 # Blend vector similarity into working memory score (weighted toward keyword precision)
-                vec_sim = wm_vec_sims.get(row["id"], 0.0)
                 if vec_sim > 0:
                     base_score = base_score * 0.80 + vec_sim * 0.20
                 score = base_score * (rc_share + (1.0 - rc_share) * decay)
@@ -5382,7 +5732,7 @@ class BeamMemory:
             # candidate answers a broad natural-language query. Require enough
             # lexical coverage before admitting FTS-only episodic rows, while
             # still allowing genuinely strong vector-only hits through.
-            if lexical < min_relevance and sim < 0.65:
+            if lexical < min_relevance and sim < _WM_VECTOR_ONLY_FLOOR:
                 continue
             if self.episodic_graph is not None and not _env_disabled("EDUMEM_GRAPH_BONUS"):
                 try:
