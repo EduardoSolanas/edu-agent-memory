@@ -42,7 +42,6 @@ def main():
         stats = ingest_conversation(beam, conv['messages'])
         print(f"  WM: {beam.get_working_stats()['total']}, EP: {beam.get_episodic_stats()['total']}, SP: {stats.get('sp_count', 0)}")
         
-        # Create LLM clients
         llm = LLMClient(model='nvidia/nemotron-3-super-120b-a12b:free')
         judge_llm = LLMClient(model='nvidia/nemotron-3-super-120b-a12b:free')
         

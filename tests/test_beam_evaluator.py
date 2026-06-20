@@ -1174,3 +1174,85 @@ def test_false_contradiction_prompt_order():
     assert change_idx != -1, "CHANGE OVER TIME should be in the prompt"
     assert conflict_idx != -1, "CONFLICTS should be in the prompt"
     assert change_idx < conflict_idx, "CHANGE OVER TIME must appear before CONFLICTS"
+
+
+# ---------- Regression tests from 2026-06-20 11:00 run ----------
+
+
+def test_eo_modifier_bans_date_labels_and_requires_functional():
+    """EO q0/q1: model used 'Planning tasks and schedule with March 15 time
+    anchor' instead of 'Core functionality'. Modifier must ban date labels."""
+    from edumem.core.query_mode import build_system_prompt
+
+    prompt = build_system_prompt(
+        "Can you list the order in which I brought up different aspects "
+        "of developing my personal budget tracker?"
+    )
+    assert "FUNCTIONAL PURPOSE" in prompt
+    assert "BAD:" in prompt and "GOOD:" in prompt
+    assert "Do NOT include dates" in prompt
+
+
+def test_sum_modifier_suppresses_conflicts():
+    """SUM q1: model started with 'contradictory information' instead of
+    summarizing security evolution. SUM must override CONFLICTS."""
+    from edumem.core.query_mode import build_system_prompt
+
+    prompt = build_system_prompt(
+        "Can you give me a comprehensive summary of how I handled the "
+        "security and database challenges?"
+    )
+    assert "Summaries NEVER flag contradictions" in prompt
+    assert "narrate the PROGRESSION" in prompt
+
+
+def test_cr_yesno_question_triggers_both_sides_check():
+    """CR q0: 'Have I worked with Flask routes?' — model only reported one
+    side. Yes/no questions must prompt for both-sides evidence search."""
+    from edumem.core.query_mode import build_system_prompt, is_yesno_check_query
+
+    q = "Have I worked with Flask routes and handled HTTP requests in this project?"
+    assert is_yesno_check_query(q) is True
+    prompt = build_system_prompt(q)
+    assert "YES/NO VERIFICATION" in prompt
+    assert "BOTH supporting AND contradicting" in prompt
+
+
+def test_ie_how_question_suppresses_false_absence():
+    """IE q1: 'How did I organize tasks over the sprint?' — model falsely
+    triggered ABSENCE. HOW modifier must override it."""
+    from edumem.core.query_mode import build_system_prompt, is_how_query
+
+    q = "How did I organize the tasks over the course of the sprint?"
+    assert is_how_query(q) is True
+    prompt = build_system_prompt(q)
+    assert "HOW QUESTIONS" in prompt
+    assert "Do NOT trigger ABSENCE" in prompt
+
+
+def test_tr_duration_modifier_uses_semantic_matching():
+    """TR q0: 'Weeks between transaction management and final deployment
+    deadline' — model couldn't find 'final deployment deadline'. Duration
+    modifier must instruct semantic matching."""
+    from edumem.core.query_mode import build_system_prompt
+
+    prompt = build_system_prompt(
+        "How many weeks do I have between finishing the transaction "
+        "management features and the final deployment deadline?"
+    )
+    assert "DURATION" in prompt
+    assert "semantic matches" in prompt
+    assert "exact wording" in prompt or "literal strings" in prompt
+
+
+def test_if_list_question_triggers_exhaustive_modifier():
+    """IF q1: 'Which libraries are used?' — answer was truncated. List
+    modifier must demand exhaustive enumeration with versions."""
+    from edumem.core.query_mode import build_system_prompt, is_list_query
+
+    q = "Which libraries are used in this project?"
+    assert is_list_query(q) is True
+    prompt = build_system_prompt(q)
+    assert "LIST COMPLETENESS" in prompt
+    assert "EXHAUSTIVE" in prompt
+    assert "version" in prompt.lower()

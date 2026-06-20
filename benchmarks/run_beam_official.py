@@ -140,6 +140,7 @@ def _build_evaluator_command(
     *,
     start_index: int = 0,
     case_index: int | None = None,
+    output_dir: Path | None = None,
 ) -> list[str]:
     cmd = [
         sys.executable,
@@ -161,6 +162,8 @@ def _build_evaluator_command(
         cmd.extend(["--case-index", str(case_index)])
     if dry_run:
         cmd.append("--dry-run")
+    if output_dir is not None:
+        cmd.extend(["--output-dir", str(output_dir)])
     return cmd
 
 
@@ -198,6 +201,8 @@ def main() -> None:
         action="store_true",
         help="Continue when the shipped reranker is unavailable",
     )
+    parser.add_argument("--output-dir", type=Path, default=None,
+                        help="Directory for results. Defaults to results/<timestamp>_<model>/")
     args = parser.parse_args()
 
     dot_env = load_env(WORKDIR / ".env")
@@ -284,6 +289,7 @@ def main() -> None:
         args.dry_run,
         start_index=args.start_index,
         case_index=args.case_index,
+        output_dir=args.output_dir,
     )
 
     print("======================================================================")
@@ -298,6 +304,8 @@ def main() -> None:
     print(f"[*] Base URL: {base_url}")
     print(f"[*] Embedding: {embedding_base_url.rstrip('/')}/v1/embeddings")
     print(f"[*] Reranker: {reranker_url}")
+    if args.output_dir:
+        print(f"[*] Output Dir: {args.output_dir}")
     print("======================================================================\n")
 
     try:

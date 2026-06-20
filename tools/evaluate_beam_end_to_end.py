@@ -710,9 +710,19 @@ def _benchmark_pure_recall_enabled() -> bool:
         return True
     return _env_truthy("EDUMEM_BENCHMARK_PURE_RECALL")
 BENCHMARK_QUERIES_PER_CONV = 50  # Max probing questions per conversation
-RESULTS_FILE = PROJECT_ROOT / "results" / "beam_e2e_results.json"
-PAIRED_OUTCOMES_FILE = PROJECT_ROOT / "results" / "paired_outcomes.jsonl"
-QUESTION_VALIDATIONS_FILE = PROJECT_ROOT / "results" / "beam_question_validations.jsonl"
+
+def _result_paths(output_dir: Path):
+    return (
+        output_dir / "beam_e2e_results.json",
+        output_dir / "paired_outcomes.jsonl",
+        output_dir / "beam_question_validations.jsonl",
+    )
+
+# Keep defaults for backward compat (used by --rejudge-results default)
+_DEFAULT_RESULTS_DIR = PROJECT_ROOT / "results"
+RESULTS_FILE = _DEFAULT_RESULTS_DIR / "beam_e2e_results.json"
+PAIRED_OUTCOMES_FILE = _DEFAULT_RESULTS_DIR / "paired_outcomes.jsonl"
+QUESTION_VALIDATIONS_FILE = _DEFAULT_RESULTS_DIR / "beam_question_validations.jsonl"
 
 # Memory abilities tested by BEAM (10 dimensions)
 BEAM_ABILITIES = [
@@ -4178,6 +4188,7 @@ def print_sota_report(ability_summary: dict, metadata: dict):
 # ============================================================
 
 def main():
+    global RESULTS_FILE, PAIRED_OUTCOMES_FILE, QUESTION_VALIDATIONS_FILE
     parser = argparse.ArgumentParser(description="BEAM End-to-End Evaluation")
     parser.add_argument("--scales", default="100K,500K,1M,10M",
                         help="Scales to evaluate (comma-separated)")
@@ -4225,7 +4236,14 @@ def main():
                              "reproduction runs where you explicitly want the bypasses.")
     parser.add_argument("--allow-no-reranker", action="store_true",
                         help="Allow the run to continue when the reranker endpoint is unavailable.")
+    parser.add_argument("--output-dir", type=Path, default=None,
+                        help="Directory for results. Defaults to results/<timestamp>_<model>/")
     args = parser.parse_args()
+
+    _ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    _model_slug = (args.model or "unknown").replace("/", "_").replace("\\", "_")
+    _run_output_dir = args.output_dir or (PROJECT_ROOT / "results" / f"{_ts}_{_model_slug}")
+    RESULTS_FILE, PAIRED_OUTCOMES_FILE, QUESTION_VALIDATIONS_FILE = _result_paths(_run_output_dir)
 
     if args.rejudge_results is not None:
         judge_model = args.judge_model or args.model

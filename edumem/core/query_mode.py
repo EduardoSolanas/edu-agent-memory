@@ -74,11 +74,28 @@ _CR_KEYWORDS = (
     "both said", "inconsistent", "disagree", "disagreement",
 )
 
+_YESNO_CHECK_KEYWORDS = (
+    "have i ", "did i ", "have we ", "did we ",
+    "has the ", "was the ", "is the ",
+)
+
 _AGGREGATION_KEYWORDS = (
     "how many", "how much", "total", "all the", "across",
     "across my", "across our", "across sessions",
     "combined", "altogether", "in total",
     "everything", "every time", "each time",
+)
+
+_HOW_KEYWORDS = (
+    "how did i ", "how did we ", "how was ", "how were ",
+    "how have i ", "how have we ",
+    "organize", "structure", "approach", "handle", "manage",
+)
+
+_LIST_KEYWORDS = (
+    "which libraries", "which dependencies", "what libraries", "what dependencies",
+    "list all", "list the", "what tools", "which tools",
+    "what technologies", "which technologies", "what frameworks", "which frameworks",
 )
 
 
@@ -150,6 +167,22 @@ def is_contradiction_query(question: str) -> bool:
     return any(k in q for k in _CR_KEYWORDS)
 
 
+def is_yesno_check_query(question: str) -> bool:
+    q = question.lower()
+    return any(q.startswith(k) or f" {k}" in q for k in _YESNO_CHECK_KEYWORDS)
+
+
+def is_how_query(question: str) -> bool:
+    q = question.lower()
+    return any(k in q for k in _HOW_KEYWORDS)
+
+
+def is_list_query(question: str) -> bool:
+    """Return True when the question asks for a list of items to enumerate."""
+    q = question.lower()
+    return any(k in q for k in _LIST_KEYWORDS)
+
+
 def is_temporal_query(question: str) -> bool:
     return is_ordering_query(question) or is_duration_query(question)
 
@@ -189,13 +222,19 @@ METHOD:
 2. Sort by LOWEST MSGIDX (earliest mention = first in list).
 3. Use ACTUAL descriptions from context; quote or paraphrase closely.
 4. Do NOT invent labels or merge distinct topics into summaries.
-5. One clause per line, earliest first, no preamble."""
+5. Describe each item by its FUNCTIONAL PURPOSE (what was being built, fixed, or discussed), NOT by dates or timeline positions.
+   BAD: "Planning tasks and schedule with March 15 time anchor"
+   GOOD: "Setting up core functionality including user authentication and expense tracking"
+6. Do NOT include dates, date ranges, or MSGIDX numbers in the output — use them only internally for ordering.
+7. One clause per line, earliest first, no preamble."""
 
 _DURATION_MODIFIER = """
 
 DURATION: This question asks for an amount of elapsed time between two specific events.
 Step 1: Identify the TWO specific events mentioned in the question.
 Step 2: For each event, find its date by reading the surrounding context — match the event description to the [MSGIDX:N] entry that discusses that specific event. Do NOT pick dates from unrelated events or different phases of the same topic.
+IMPORTANT: Match events by MEANING, not exact wording. "Final deployment deadline" might appear as "project deadline", "deployment date", "launch date", or simply a date associated with deployment. "Finishing transaction management" might appear as "transaction management complete" or a date marking the end of that phase. Look for semantic matches, not literal strings.
+If the question mentions a milestone, look for ANY date associated with that milestone in the context, even if the exact phrase differs.
 Step 3: compute the difference between the two dates and state it explicitly (e.g. "2024-04-02 to 2024-05-03 = 31 days").
 Compute strictly from dates present in the context; do not estimate. End with the exact value the question asks for."""
 
@@ -225,6 +264,8 @@ ALL distinct items you found and then count them."""
 
 _SUM_MODIFIER = """
 
+CRITICAL OVERRIDE: Summaries NEVER flag contradictions. If the context shows evolving practices, changing approaches, or updated values, narrate the PROGRESSION — do not start with "The conversation contains contradictory information." Summarize how things developed and changed.
+
 SUMMARIZATION: This question asks for a summary of the conversation.
 If the question mentions progression, development, or resolution "over time", structure your answer as a CHRONOLOGICAL NARRATIVE — describe what happened first, what came next, and how things evolved. Use [MSGIDX:N] tags to determine the order. Do NOT organize by topic/category — organize by TIME.
 If the question asks for a general overview without temporal emphasis, cover ALL major themes and topics from the context. Structure as a comprehensive overview. Aim for completeness over brevity."""
@@ -238,6 +279,21 @@ and should be treated as the current truth, unless the earlier statement was exp
 confirmed or the later statement was hypothetical. Always end with a clear resolution
 stating which value is current and why."""
 
+_YESNO_CHECK_MODIFIER = """
+
+YES/NO VERIFICATION: This question asks whether something was done or is true.
+Before answering, search the context for BOTH supporting AND contradicting evidence.
+If you find evidence on both sides, treat it as a contradiction and present both sides.
+Do NOT answer with only one side if the other side also has evidence in the context."""
+
+_HOW_MODIFIER = """
+
+HOW QUESTIONS: This question asks HOW something was done, organized, structured, or approached. The answer is often the sequence of WHAT was actually done — the actions taken, decisions made, and their order implicitly describe the approach. Do NOT trigger ABSENCE just because there is no explicit meta-statement about methodology or strategy. If the context contains the actual tasks, steps, or actions that were performed, describe them as the answer to "how". List the sequence of activities and decisions, which together show HOW the thing was accomplished."""
+
+_LIST_MODIFIER = """
+
+LIST COMPLETENESS: This question asks for a list of items. Be EXHAUSTIVE — include EVERY item found in the context with ALL available details (versions, configurations, purposes). Do not truncate or summarize. If versions are mentioned, always include the exact version number next to each item. Format as a bullet list or comma-separated list with details. Do NOT cut off your answer early — provide a complete enumeration."""
+
 
 def build_system_prompt(question: str) -> str:
     """Base behavior always; append format guidance only when the question asks for it."""
@@ -250,10 +306,16 @@ def build_system_prompt(question: str) -> str:
         prompt += _DURATION_MODIFIER
     if is_contradiction_query(question):
         prompt += _CR_MODIFIER
+    if is_yesno_check_query(question):
+        prompt += _YESNO_CHECK_MODIFIER
+    if is_how_query(question):
+        prompt += _HOW_MODIFIER
     if is_knowledge_update_query(question):
         prompt += _KU_MODIFIER
     if is_multi_hop_query(question):
         prompt += _MR_MODIFIER
     if is_summarization_query(question):
         prompt += _SUM_MODIFIER
+    if is_list_query(question):
+        prompt += _LIST_MODIFIER
     return prompt
