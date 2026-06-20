@@ -4343,6 +4343,67 @@ class BeamMemory:
                                  source_memory_id=source_memory_id):
                 counts["sequence"] += 1
 
+        # Change patterns: "switched/changed/moved from X to Y"
+        _change_from_to_re = _re.compile(
+            r'(?:switched|changed|moved|migrated|transitioned|upgraded|downgraded|converted|replaced)\s+'
+            r'(?:from\s+)?(.{2,40}?)\s+to\s+(.{2,40}?)(?:\s+(?:for|because|due|since|as)|[.,;!?\n]|$)',
+            _re.IGNORECASE
+        )
+        for m in _change_from_to_re.finditer(content):
+            old_val = m.group(1).strip().strip('"\'')
+            new_val = m.group(2).strip().strip('"\'')
+            if len(old_val) < 2 or len(new_val) < 2:
+                continue
+            # Build a semantic key from context
+            pre_text = content[max(0, m.start()-30):m.start()]
+            ctx_words = [w.strip('.,:;!?()[]"\'') for w in pre_text.split()
+                         if len(w.strip('.,:;!?()[]"\'')) > 3
+                         and w.lower() not in ('the', 'and', 'for', 'was', 'from', 'have', 'that', 'this', 'with')][-2:]
+            key = '_'.join(w.lower() for w in ctx_words) if ctx_words else 'choice'
+            key = f"{key}_change"
+            if self._insert_change_fact(session, message_idx, key, old_val, new_val,
+                                         self._context_snippet(content, m.start()),
+                                         source_memory_id=source_memory_id):
+                counts["change"] = counts.get("change", 0) + 1
+
+        # Metric change patterns: "increased/decreased X from N to M"
+        _metric_change_re = _re.compile(
+            r'(?:increased|decreased|raised|lowered|reduced|grew|dropped|bumped|expanded|shrunk)\s+'
+            r'(?:the\s+)?(.{2,30}?)\s+from\s+(\d+[.,]?\d*\s*\w*)\s+to\s+(\d+[.,]?\d*\s*\w*)',
+            _re.IGNORECASE
+        )
+        for m in _metric_change_re.finditer(content):
+            subject = m.group(1).strip()
+            old_val = m.group(2).strip()
+            new_val = m.group(3).strip()
+            key = '_'.join(w.lower() for w in subject.split()
+                          if len(w) > 2 and w.lower() not in ('the', 'our', 'my'))[:3]
+            key = f"{key}_metric" if key else "metric_change"
+            if self._insert_change_fact(session, message_idx, key, old_val, new_val,
+                                         self._context_snippet(content, m.start()),
+                                         source_memory_id=source_memory_id):
+                counts["change"] = counts.get("change", 0) + 1
+
+        # Date change patterns: "postponed/rescheduled X from D1 to D2"
+        _date_change_re = _re.compile(
+            r'(?:moved|postponed|rescheduled|pushed|delayed|advanced|shifted)\s+'
+            r'(?:the\s+)?(.{2,30}?)\s+from\s+'
+            r'(\d{4}-\d{2}-\d{2}|(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2}(?:,?\s*\d{4})?)\s+to\s+'
+            r'(\d{4}-\d{2}-\d{2}|(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2}(?:,?\s*\d{4})?)',
+            _re.IGNORECASE
+        )
+        for m in _date_change_re.finditer(content):
+            subject = m.group(1).strip()
+            old_date = m.group(2).strip()
+            new_date = m.group(3).strip()
+            key = '_'.join(w.lower() for w in subject.split()
+                          if len(w) > 2 and w.lower() not in ('the', 'our', 'my'))[:3]
+            key = f"{key}_date" if key else "date_change"
+            if self._insert_change_fact(session, message_idx, key, old_date, new_date,
+                                         self._context_snippet(content, m.start()),
+                                         source_memory_id=source_memory_id):
+                counts["change"] = counts.get("change", 0) + 1
+
         if is_user_source:
             # Instructions (IF support): language-aware
             _INSTRUCTION_FALSE_POSITIVES = pat['instruction_false_positives']
@@ -4453,6 +4514,62 @@ class BeamMemory:
                 "context_snippet, importance, valid_from_msg_idx, source_memory_id) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (session, msg_idx, ftype, key, value, ctx, importance, msg_idx, source_memory_id))
+        return True
+
+    def _insert_change_fact(self, session: str, msg_idx: int,
+                            key: str, old_value: str, new_value: str,
+                            ctx: str, importance: float = 0.7,
+                            source_memory_id: Optional[str] = None) -> bool:
+        """Insert a pre-resolved change fact (old→new) as a version chain.
+
+        Creates the old value as a superseded row, then inserts the new value
+        as the current version with previous_value set.
+        """
+        # Check if this exact change already exists
+        exists = self.conn.execute(
+            "SELECT 1 FROM memoria_facts "
+            "WHERE session_id = ? AND key = ? AND fact_type = 'change' "
+            "AND value = ? AND previous_value = ? LIMIT 1",
+            (session, key, new_value, old_value)
+        ).fetchone()
+        if exists:
+            return False
+
+        # Check if key already has a current fact
+        existing = self.conn.execute(
+            "SELECT id, value, version_id FROM memoria_facts "
+            "WHERE session_id = ? AND key = ? AND fact_type = 'change' "
+            "AND valid_to_msg_idx IS NULL "
+            "ORDER BY version_id DESC LIMIT 1",
+            (session, key)
+        ).fetchone()
+
+        if existing:
+            # Mark existing as superseded
+            self.conn.execute(
+                "UPDATE memoria_facts SET valid_to_msg_idx = ? WHERE id = ?",
+                (msg_idx, existing[0])
+            )
+            new_version = (existing[2] or 0) + 1
+        else:
+            # Insert old value as the first version (already superseded)
+            self.conn.execute(
+                "INSERT INTO memoria_facts (session_id, message_idx, fact_type, key, value, "
+                "context_snippet, importance, version_id, valid_from_msg_idx, "
+                "valid_to_msg_idx, source_memory_id) "
+                "VALUES (?, ?, 'change', ?, ?, ?, ?, 0, ?, ?, ?)",
+                (session, msg_idx, key, old_value, ctx, importance,
+                 msg_idx, msg_idx, source_memory_id))
+            new_version = 1
+
+        # Insert new value as current version
+        self.conn.execute(
+            "INSERT INTO memoria_facts (session_id, message_idx, fact_type, key, value, "
+            "context_snippet, importance, version_id, previous_value, "
+            "updated_msg_idx, valid_from_msg_idx, source_memory_id) "
+            "VALUES (?, ?, 'change', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (session, msg_idx, key, new_value, ctx, importance,
+             new_version, old_value, msg_idx, msg_idx, source_memory_id))
         return True
 
     def _insert_timeline(self, session: str, date: str, msg_idx: int,
@@ -4568,15 +4685,21 @@ class BeamMemory:
             ability = self._classify_ability(query)
 
         if ability in ('IE', 'KU'):
-            return self._memoria_fact_retrieve(query, top_k)
+            return self._memoria_fact_retrieve(query, top_k, ability=ability)
         elif ability == 'TR':
-            return self._memoria_timeline_retrieve(query, top_k)
+            timeline = self._memoria_timeline_retrieve(query, top_k)
+            facts = self._memoria_fact_retrieve(query, top_k, ability='TR')
+            return self._merge_memoria_results(timeline, facts)
         elif ability == 'CR':
-            return self._memoria_negation_retrieve(query, top_k)
+            neg = self._memoria_negation_retrieve(query, top_k)
+            facts = self._memoria_fact_retrieve(query, top_k, ability='CR')
+            return self._merge_memoria_results(neg, facts)
         elif ability == 'MR':
             return self._memoria_entity_retrieve(query, top_k)
         elif ability == 'EO':
-            return self._memoria_chrono_retrieve(query, top_k)
+            chrono = self._memoria_chrono_retrieve(query, top_k)
+            facts = self._memoria_fact_retrieve(query, top_k, ability='EO')
+            return self._merge_memoria_results(chrono, facts)
         elif ability == 'IF':
             return self._memoria_instruction_retrieve(query, top_k)
         elif ability == 'PF':
@@ -4661,7 +4784,7 @@ class BeamMemory:
 
         return ''
 
-    def _memoria_fact_retrieve(self, query: str, top_k: int = 10) -> dict:
+    def _memoria_fact_retrieve(self, query: str, top_k: int = 10, ability: str = '') -> dict:
         """Query memoria_facts table for exact metric/version/entity matches.
         Uses multi-pass strategy:
           Pass 1: numbers from query → search fact values
@@ -4679,7 +4802,7 @@ class BeamMemory:
         numbers = _re.findall(r'\b(\d+)\b', query)
         for num in numbers[:3]:
             rows = cursor.execute(
-                "SELECT fact_type, key, value, context_snippet, previous_value, updated_msg_idx, version_id, source_memory_id FROM memoria_facts "
+                "SELECT fact_type, key, value, context_snippet, previous_value, updated_msg_idx, version_id, source_memory_id, message_idx, valid_from_msg_idx FROM memoria_facts "
                 "WHERE value LIKE ? AND session_id = ? LIMIT ?",
                 (f'%{num}%', self.session_id, top_k)
             ).fetchall()
@@ -4687,7 +4810,7 @@ class BeamMemory:
                 fk = (row[1], row[2])
                 if fk not in seen:
                     seen.add(fk)
-                    facts.append(dict(zip(['type', 'key', 'value', 'context', 'previous_value', 'updated_msg_idx', 'version_id', 'source_memory_id'], row)))
+                    facts.append(dict(zip(['type', 'key', 'value', 'context', 'previous_value', 'updated_msg_idx', 'version_id', 'source_memory_id', 'message_idx', 'valid_from_msg_idx'], row)))
 
         # -- Pass 2: Capitalized/key terms in query → search key + value --
         terms = _re.findall(r'\b[A-Z][a-z]+(?:[-][A-Z][a-z]+)*\b', query)
@@ -4698,7 +4821,7 @@ class BeamMemory:
         terms = [t for t in terms if t not in stop_words]
         for term in terms[:5]:
             rows = cursor.execute(
-                "SELECT fact_type, key, value, context_snippet, previous_value, updated_msg_idx, version_id, source_memory_id FROM memoria_facts "
+                "SELECT fact_type, key, value, context_snippet, previous_value, updated_msg_idx, version_id, source_memory_id, message_idx, valid_from_msg_idx FROM memoria_facts "
                 "WHERE (key LIKE ? OR value LIKE ?) AND session_id = ? LIMIT ?",
                 (f'%{term}%', f'%{term}%', self.session_id, top_k)
             ).fetchall()
@@ -4706,7 +4829,7 @@ class BeamMemory:
                 fk = (row[1], row[2])
                 if fk not in seen:
                     seen.add(fk)
-                    facts.append(dict(zip(['type', 'key', 'value', 'context', 'previous_value', 'updated_msg_idx', 'version_id', 'source_memory_id'], row)))
+                    facts.append(dict(zip(['type', 'key', 'value', 'context', 'previous_value', 'updated_msg_idx', 'version_id', 'source_memory_id', 'message_idx', 'valid_from_msg_idx'], row)))
 
         # -- Pass 3: Synonym/keyword mapping --
         # Maps common question words to (fact_type, [unit_hints]).
@@ -4732,13 +4855,13 @@ class BeamMemory:
                     if unit_hints:
                         for unit in unit_hints:
                             rows = cursor.execute(
-                                "SELECT fact_type, key, value, context_snippet, previous_value, updated_msg_idx, version_id, source_memory_id FROM memoria_facts "
+                                "SELECT fact_type, key, value, context_snippet, previous_value, updated_msg_idx, version_id, source_memory_id, message_idx, valid_from_msg_idx FROM memoria_facts "
                                 "WHERE fact_type = ? AND key LIKE ? AND session_id = ? LIMIT ?",
                                 (ftype, f'%{unit}%', self.session_id, top_k)
                             ).fetchall()
                     else:
                         rows = cursor.execute(
-                            "SELECT fact_type, key, value, context_snippet, previous_value, updated_msg_idx, version_id, source_memory_id FROM memoria_facts "
+                            "SELECT fact_type, key, value, context_snippet, previous_value, updated_msg_idx, version_id, source_memory_id, message_idx, valid_from_msg_idx FROM memoria_facts "
                             "WHERE fact_type = ? AND session_id = ? LIMIT ?",
                             (ftype, self.session_id, top_k)
                         ).fetchall()
@@ -4746,7 +4869,7 @@ class BeamMemory:
                         fk = (row[1], row[2])
                         if fk not in seen:
                             seen.add(fk)
-                            facts.append(dict(zip(['type', 'key', 'value', 'context', 'previous_value', 'updated_msg_idx', 'version_id', 'source_memory_id'], row)))
+                            facts.append(dict(zip(['type', 'key', 'value', 'context', 'previous_value', 'updated_msg_idx', 'version_id', 'source_memory_id', 'message_idx', 'valid_from_msg_idx'], row)))
                     if facts:
                         break
 
@@ -4766,7 +4889,7 @@ class BeamMemory:
                        if w not in q_stop]
             for word in q_words[:5]:
                 rows = cursor.execute(
-                    "SELECT fact_type, key, value, context_snippet, previous_value, updated_msg_idx, version_id, source_memory_id FROM memoria_facts "
+                    "SELECT fact_type, key, value, context_snippet, previous_value, updated_msg_idx, version_id, source_memory_id, message_idx, valid_from_msg_idx FROM memoria_facts "
                     "WHERE context_snippet LIKE ? AND session_id = ? LIMIT ?",
                     (f'%{word}%', self.session_id, top_k)
                 ).fetchall()
@@ -4774,7 +4897,7 @@ class BeamMemory:
                     fk = (row[1], row[2])
                     if fk not in seen:
                         seen.add(fk)
-                        facts.append(dict(zip(['type', 'key', 'value', 'context', 'previous_value', 'updated_msg_idx', 'version_id', 'source_memory_id'], row)))
+                        facts.append(dict(zip(['type', 'key', 'value', 'context', 'previous_value', 'updated_msg_idx', 'version_id', 'source_memory_id', 'message_idx', 'valid_from_msg_idx'], row)))
                 if facts:
                     break
 
@@ -4806,6 +4929,8 @@ class BeamMemory:
                             'updated_msg_idx': prior.get('updated_msg_idx'),
                             'version_id': prior.get('version_id', 0),
                             'source_memory_id': prior.get('source_memory_id'),
+                            'message_idx': prior.get('message_idx'),
+                            'valid_from_msg_idx': prior.get('valid_from_msg_idx'),
                         })
                 newest['history'] = history
                 latest.append(newest)
@@ -4814,7 +4939,7 @@ class BeamMemory:
 
             ctx_lines = []
             for f in latest[:top_k]:
-                ctx_lines.append(f"[Fact {f['type']}] {f['key']}: {f['value']}")
+                ctx_lines.append(self._format_versioned_fact(f, ability=ability))
             return {
                 "context": "\n".join(ctx_lines),
                 "facts": latest[:top_k],
@@ -4825,6 +4950,121 @@ class BeamMemory:
                 ],
             }
         return {"context": "", "facts": [], "source": "fallback"}
+
+    def _format_versioned_fact(self, fact: dict, ability: str = '') -> str:
+        """Render a fact with version-aware formatting based on query ability."""
+        ftype = fact.get('type', '')
+        key = fact.get('key', '')
+        value = fact.get('value', '')
+        history = fact.get('history', [])
+        previous_value = fact.get('previous_value')
+        updated_msg_idx = fact.get('updated_msg_idx')
+        msg_idx = fact.get('message_idx') or fact.get('valid_from_msg_idx')
+
+        has_history = bool(history) or (previous_value is not None and previous_value != value)
+
+        if not has_history:
+            if ability == 'EO' and msg_idx is not None:
+                return f"[Fact {ftype} MSGIDX:{msg_idx}] {key}: {value}"
+            return f"[Fact {ftype}] {key}: {value}"
+
+        # Determine the old value and its MSGIDX
+        if history:
+            old_val = history[0].get('value', previous_value or '?')
+            old_idx = history[0].get('message_idx') or history[0].get('valid_from_msg_idx') or history[0].get('updated_msg_idx')
+        else:
+            old_val = previous_value or '?'
+            old_idx = None
+        new_idx = updated_msg_idx or msg_idx
+
+        if ability == 'KU':
+            parts = [f"[Fact CURRENT {ftype}] {key}: {value}"]
+            was_parts = []
+            if old_val and old_val != '?':
+                was_parts.append(f"was: {old_val}")
+                if old_idx is not None:
+                    was_parts[-1] += f" at MSGIDX:{old_idx}"
+            if new_idx is not None:
+                was_parts.append(f"updated at MSGIDX:{new_idx}")
+            if was_parts:
+                parts.append(f"({', '.join(was_parts)})")
+            return " ".join(parts)
+
+        elif ability == 'CR':
+            old_ref = f"MSGIDX:{old_idx}" if old_idx is not None else "earlier"
+            new_ref = f"MSGIDX:{new_idx}" if new_idx is not None else "later"
+            return f'[Fact CHANGED {ftype}] {key}: {old_ref} said "{old_val}" → {new_ref} said "{value}"'
+
+        elif ability == 'TR':
+            old_ref = f"(MSGIDX:{old_idx})" if old_idx is not None else ""
+            new_ref = f"(MSGIDX:{new_idx})" if new_idx is not None else ""
+            line = f"[Fact TIMELINE {ftype}] {key}: {old_val} {old_ref} → {value} {new_ref}"
+            # Try to compute delta for date-like values
+            delta = self._compute_date_delta(old_val, value)
+            if delta is not None:
+                line += f" = {delta}"
+            return line
+
+        elif ability == 'EO':
+            idx = msg_idx or old_idx
+            if idx is not None:
+                return f"[Fact {ftype} MSGIDX:{idx}] {key}: {value}"
+            return f"[Fact {ftype}] {key}: {value}"
+
+        else:
+            return f"[Fact {ftype}] {key}: {value}"
+
+    @staticmethod
+    def _compute_date_delta(old_val: str, new_val: str):
+        """Try to compute days between two date-like strings. Returns string or None."""
+        from datetime import datetime
+        for fmt in ('%Y-%m-%d', '%B %d, %Y', '%B %d %Y', '%b %d, %Y', '%b %d %Y'):
+            try:
+                d1 = datetime.strptime(old_val.strip(), fmt)
+                d2 = datetime.strptime(new_val.strip(), fmt)
+                days = abs((d2 - d1).days)
+                if days >= 7:
+                    weeks = days // 7
+                    rem = days % 7
+                    if rem == 0:
+                        return f"{weeks} weeks"
+                    return f"{days} days ({weeks} weeks, {rem} days)"
+                return f"{days} days"
+            except (ValueError, AttributeError):
+                continue
+        return None
+
+    def _merge_memoria_results(self, primary: dict, secondary: dict) -> dict:
+        """Merge two MEMORIA result dicts, preferring primary source."""
+        p_ctx = primary.get("context", "")
+        s_ctx = secondary.get("context", "")
+
+        # Deduplicate context lines
+        seen_lines = set()
+        merged_lines = []
+        for line in (p_ctx + "\n" + s_ctx).split("\n"):
+            line = line.strip()
+            if line and line not in seen_lines:
+                seen_lines.add(line)
+                merged_lines.append(line)
+
+        p_facts = primary.get("facts", [])
+        s_facts = secondary.get("facts", [])
+        merged_facts = p_facts + [f for f in s_facts if f not in p_facts]
+
+        p_ids = set(primary.get("source_memory_ids", []))
+        s_ids = set(secondary.get("source_memory_ids", []))
+
+        p_source = primary.get("source", "fallback")
+        s_source = secondary.get("source", "fallback")
+        source = p_source if p_source != "fallback" else s_source
+
+        return {
+            "context": "\n".join(merged_lines),
+            "facts": merged_facts,
+            "source": source,
+            "source_memory_ids": list(p_ids | s_ids),
+        }
 
     def _memoria_timeline_retrieve(self, query: str, top_k: int = 10) -> dict:
         """Query memoria_timelines for chronological events matching query terms."""

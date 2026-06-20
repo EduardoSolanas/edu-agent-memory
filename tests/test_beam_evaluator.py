@@ -1188,9 +1188,12 @@ def test_eo_modifier_bans_date_labels_and_requires_functional():
         "Can you list the order in which I brought up different aspects "
         "of developing my personal budget tracker?"
     )
-    assert "FUNCTIONAL PURPOSE" in prompt
-    assert "BAD:" in prompt and "GOOD:" in prompt
-    assert "Do NOT include dates" in prompt
+    assert "functional purpose" in prompt.lower()
+    assert "bad:" in prompt.lower() and "good:" in prompt.lower()
+    # Examples must be generic, not lifted from BEAM test items
+    assert "march 15 time anchor" not in prompt.lower()
+    assert "user authentication and expense tracking" not in prompt.lower()
+    assert "do not include dates" in prompt.lower()
 
 
 def test_sum_modifier_suppresses_conflicts():
@@ -1202,8 +1205,8 @@ def test_sum_modifier_suppresses_conflicts():
         "Can you give me a comprehensive summary of how I handled the "
         "security and database challenges?"
     )
-    assert "Summaries NEVER flag contradictions" in prompt
-    assert "narrate the PROGRESSION" in prompt
+    assert "summaries never flag contradictions" in prompt.lower()
+    assert "narrate the progression" in prompt.lower()
 
 
 def test_cr_yesno_question_triggers_both_sides_check():
@@ -1214,8 +1217,8 @@ def test_cr_yesno_question_triggers_both_sides_check():
     q = "Have I worked with Flask routes and handled HTTP requests in this project?"
     assert is_yesno_check_query(q) is True
     prompt = build_system_prompt(q)
-    assert "YES/NO VERIFICATION" in prompt
-    assert "BOTH supporting AND contradicting" in prompt
+    assert "yes/no verification" in prompt.lower()
+    assert "both supporting and contradicting" in prompt.lower()
 
 
 def test_ie_how_question_suppresses_false_absence():
@@ -1226,8 +1229,8 @@ def test_ie_how_question_suppresses_false_absence():
     q = "How did I organize the tasks over the course of the sprint?"
     assert is_how_query(q) is True
     prompt = build_system_prompt(q)
-    assert "HOW QUESTIONS" in prompt
-    assert "Do NOT trigger ABSENCE" in prompt
+    assert "how questions" in prompt.lower()
+    assert "do not trigger absence" in prompt.lower()
 
 
 def test_tr_duration_modifier_uses_semantic_matching():
@@ -1240,9 +1243,12 @@ def test_tr_duration_modifier_uses_semantic_matching():
         "How many weeks do I have between finishing the transaction "
         "management features and the final deployment deadline?"
     )
-    assert "DURATION" in prompt
-    assert "semantic matches" in prompt
-    assert "exact wording" in prompt or "literal strings" in prompt
+    assert "duration" in prompt.lower()
+    assert "semantic matches" in prompt.lower()
+    assert "exact wording" in prompt.lower() or "literal strings" in prompt.lower()
+    # Examples must be generic, not lifted from BEAM test items
+    assert "final deployment deadline" not in prompt.lower()
+    assert "transaction management" not in prompt.lower()
 
 
 def test_if_list_question_triggers_exhaustive_modifier():
@@ -1253,6 +1259,601 @@ def test_if_list_question_triggers_exhaustive_modifier():
     q = "Which libraries are used in this project?"
     assert is_list_query(q) is True
     prompt = build_system_prompt(q)
-    assert "LIST COMPLETENESS" in prompt
-    assert "EXHAUSTIVE" in prompt
+    assert "list completeness" in prompt.lower()
+    assert "exhaustive" in prompt.lower()
     assert "version" in prompt.lower()
+
+
+# ---------- Regression tests from 2026-06-20 11:50 run (prompt fixes) ----------
+
+
+def test_eo_modifier_ignores_later_refinements_of_same_feature():
+    """EO: model substituted 'optimizing CRUD' for 'transaction error handling'
+    — treated a later refinement as a separate topic. Rule 8 must suppress it."""
+    from edumem.core.query_mode import build_system_prompt
+
+    prompt = build_system_prompt(
+        "Can you list the order in which I brought up different aspects "
+        "of developing my personal budget tracker?"
+    )
+    assert "first occurrence" in prompt.lower()
+    assert "later refinements" in prompt.lower()
+    assert "not new topics" in prompt.lower()
+
+
+def test_mr_modifier_counts_schema_items_as_new():
+    """MR q0: model excluded 'category' because it was in the initial schema.
+    Modifier must instruct that design-time items count."""
+    from edumem.core.query_mode import build_system_prompt
+
+    prompt = build_system_prompt("How many new columns did I want to add across my requests?")
+    assert "schema definition" in prompt.lower() or "design" in prompt.lower()
+    assert "do not exclude" in prompt.lower()
+
+
+def test_mr_modifier_treats_described_features_as_real():
+    """MR q1: model treated RBAC, password hashing, lockout as 'suggestions'.
+    Modifier must say features with concrete detail are things the user is doing."""
+    from edumem.core.query_mode import build_system_prompt, is_multi_hop_query
+
+    q = "How many user roles and security features am I implementing across my sessions?"
+    assert is_multi_hop_query(q) is True, "question must trigger MR modifier"
+    prompt = build_system_prompt(q)
+    assert "concrete detail" in prompt.lower()
+    assert "not implemented" in prompt.lower()
+
+
+def test_sum_modifier_constrains_to_specific_domain():
+    """SUM q1: model wrote a general project overview instead of security/database focus.
+    Modifier must constrain to the question's specific domain."""
+    from edumem.core.query_mode import build_system_prompt
+
+    prompt = build_system_prompt(
+        "Can you give me a comprehensive summary of how I handled "
+        "the security and database challenges?"
+    )
+    assert "specific domain" in prompt.lower()
+    assert "only that domain" in prompt.lower()
+    assert "do not write a general project overview" in prompt.lower()
+
+
+def test_tr_modifier_prefers_later_dates_over_plans():
+    """TR q0: model confused by planned vs actual dates from different schedules.
+    Modifier must instruct to prefer most recently stated dates."""
+    from edumem.core.query_mode import build_system_prompt
+
+    prompt = build_system_prompt(
+        "How many weeks do I have between finishing the transaction "
+        "management features and the final deployment deadline?"
+    )
+    assert "most recently stated" in prompt.lower()
+    assert "later message" in prompt.lower()
+
+
+def test_format_versioned_fact_ku_shows_previous_value(tmp_path):
+    """KU ability should render version history showing previous value."""
+    from edumem.core.beam import BeamMemory, init_beam
+
+    db_path = str(tmp_path / "test.db")
+    init_beam(db_path)
+    beam = BeamMemory(db_path=db_path, session_id="test_ku")
+    try:
+        # Insert two versions of the same metric
+        beam._insert_fact("test_ku", 3, "metric", "team_size", "5members",
+                          "We have 5 team members", 0.7, source_memory_id="msg3")
+        beam._insert_fact("test_ku", 15, "metric", "team_size", "12members",
+                          "Team grew to 12 members", 0.7, source_memory_id="msg15")
+        beam.conn.commit()
+
+        result = beam._memoria_fact_retrieve("How many team members?", top_k=10, ability="KU")
+        ctx = result["context"]
+        assert "current" in ctx.lower()
+        assert "12members" in ctx
+        assert "was:" in ctx.lower() or "5members" in ctx
+    finally:
+        beam.conn.close()
+
+
+def test_format_versioned_fact_cr_shows_both_sides(tmp_path):
+    """CR ability should render both old and new values for contradiction resolution."""
+    from edumem.core.beam import BeamMemory, init_beam
+
+    db_path = str(tmp_path / "test.db")
+    init_beam(db_path)
+    beam = BeamMemory(db_path=db_path, session_id="test_cr")
+    try:
+        beam._insert_fact("test_cr", 5, "metric", "api_latency", "450ms",
+                          "API response time is 450ms", 0.7, source_memory_id="msg5")
+        beam._insert_fact("test_cr", 20, "metric", "api_latency", "250ms",
+                          "API response time improved to 250ms", 0.7, source_memory_id="msg20")
+        beam.conn.commit()
+
+        result = beam._memoria_fact_retrieve("Is there a contradiction about API latency?", top_k=10, ability="CR")
+        ctx = result["context"]
+        assert "changed" in ctx.lower()
+        assert "450ms" in ctx
+        assert "250ms" in ctx
+    finally:
+        beam.conn.close()
+
+
+def test_format_versioned_fact_tr_precomputes_date_delta(tmp_path):
+    """TR ability should show date changes with pre-computed deltas."""
+    from edumem.core.beam import BeamMemory, init_beam
+
+    db_path = str(tmp_path / "test.db")
+    init_beam(db_path)
+    beam = BeamMemory(db_path=db_path, session_id="test_tr")
+    try:
+        beam._insert_fact("test_tr", 2, "date", "launch_date", "2024-03-15",
+                          "Launch planned for 2024-03-15", 0.7, source_memory_id="msg2")
+        # Note: date facts skip versioning in _insert_fact (ftype == 'date' early return).
+        # So we test with metric type instead for the version chain to work.
+        beam._insert_fact("test_tr", 2, "metric", "Deadline", "2024-03-15",
+                          "Deadline is March 15", 0.7, source_memory_id="msg2")
+        beam._insert_fact("test_tr", 18, "metric", "Deadline", "2024-04-01",
+                          "Deadline moved to April 1", 0.7, source_memory_id="msg18")
+        beam.conn.commit()
+
+        result = beam._memoria_fact_retrieve("How long between Deadline dates?", top_k=10, ability="TR")
+        ctx = result["context"]
+        assert "timeline" in ctx.lower() or "2024-03-15" in ctx
+        assert "2024-04-01" in ctx
+        # Should show both dates for temporal reasoning
+    finally:
+        beam.conn.close()
+
+
+def test_format_versioned_fact_no_history_fallback(tmp_path):
+    """Facts without version history should render as flat [Fact type] key: value."""
+    from edumem.core.beam import BeamMemory, init_beam
+
+    db_path = str(tmp_path / "test.db")
+    init_beam(db_path)
+    beam = BeamMemory(db_path=db_path, session_id="test_flat")
+    try:
+        beam._insert_fact("test_flat", 1, "metric", "cpu_usage", "85%",
+                          "CPU usage at 85%", 0.7, source_memory_id="msg1")
+        beam.conn.commit()
+
+        # Should work the same for any ability when there's no history
+        for ability in ["KU", "CR", "TR", "EO", "IE", ""]:
+            result = beam._memoria_fact_retrieve("What is CPU usage?", top_k=10, ability=ability)
+            ctx = result["context"]
+            assert "[fact" in ctx.lower()
+            assert "cpu_usage" in ctx
+            assert "85%" in ctx
+    finally:
+        beam.conn.close()
+
+
+def test_format_versioned_fact_eo_shows_msgidx(tmp_path):
+    """EO ability should show MSGIDX anchors for ordering."""
+    from edumem.core.beam import BeamMemory, init_beam
+
+    db_path = str(tmp_path / "test.db")
+    init_beam(db_path)
+    beam = BeamMemory(db_path=db_path, session_id="test_eo")
+    try:
+        beam._insert_fact("test_eo", 7, "metric", "feature_count", "3features",
+                          "We built 3 features", 0.7, source_memory_id="msg7")
+        beam.conn.commit()
+
+        result = beam._memoria_fact_retrieve("In what order were features built?", top_k=10, ability="EO")
+        ctx = result["context"]
+        assert "msgidx" in ctx.lower() or "7" in ctx
+    finally:
+        beam.conn.close()
+
+
+def test_memoria_retrieve_cr_includes_versioned_facts(tmp_path):
+    """CR routing should merge negation results with versioned fact results."""
+    from edumem.core.beam import BeamMemory, init_beam
+
+    db_path = str(tmp_path / "test.db")
+    init_beam(db_path)
+    beam = BeamMemory(db_path=db_path, session_id="test_cr_merge")
+    try:
+        # Insert a versioned fact (value changed)
+        beam._insert_fact("test_cr_merge", 5, "metric", "team_size", "5members",
+                          "Team has 5 members", 0.7, source_memory_id="msg5")
+        beam._insert_fact("test_cr_merge", 20, "metric", "team_size", "12members",
+                          "Team grew to 12 members", 0.7, source_memory_id="msg20")
+        beam.conn.commit()
+
+        result = beam.memoria_retrieve("Is there a contradiction about team size?", ability="CR", top_k=10)
+        # Should not be fallback — versioned facts should be found even if no negation triples
+        assert result["source"] != "fallback" or result["context"] != ""
+    finally:
+        beam.conn.close()
+
+
+def test_memoria_retrieve_tr_includes_versioned_facts(tmp_path):
+    """TR routing should merge timeline results with versioned fact results."""
+    from edumem.core.beam import BeamMemory, init_beam
+
+    db_path = str(tmp_path / "test.db")
+    init_beam(db_path)
+    beam = BeamMemory(db_path=db_path, session_id="test_tr_merge")
+    try:
+        beam._insert_fact("test_tr_merge", 3, "metric", "response_time", "500ms",
+                          "Response time is 500ms", 0.7, source_memory_id="msg3")
+        beam._insert_fact("test_tr_merge", 15, "metric", "response_time", "200ms",
+                          "Response time improved to 200ms", 0.7, source_memory_id="msg15")
+        beam.conn.commit()
+
+        result = beam.memoria_retrieve("How much did response time change?", ability="TR", top_k=10)
+        assert result["source"] != "fallback" or result["context"] != ""
+    finally:
+        beam.conn.close()
+
+
+def test_extract_switched_from_to_creates_version_chain():
+    """'switched from X to Y' should create a version chain in memoria_facts."""
+    import tempfile, os
+    from edumem.core.beam import BeamMemory, init_beam
+
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
+        db_path = tmp.name
+    try:
+        init_beam(db_path)
+        beam = BeamMemory(db_path=db_path, session_id="test_change")
+        beam.extract_and_store_facts(
+            "[MSGIDX:10] We switched from Flask to FastAPI for the backend",
+            message_idx=10, source_memory_id="msg10"
+        )
+        beam.conn.commit()
+
+        rows = beam.conn.execute(
+            "SELECT key, value, version_id, previous_value FROM memoria_facts "
+            "WHERE session_id = 'test_change' AND fact_type = 'change' "
+            "ORDER BY version_id ASC"
+        ).fetchall()
+        # Should have a version chain: old value (Flask) and new value (FastAPI)
+        assert len(rows) >= 1
+        values = [r[1] for r in rows]
+        prev_values = [r[3] if r[3] else "" for r in rows]
+        # The latest version should have FastAPI
+        assert any("fastapi" in v.lower() for v in values)
+        # There should be a reference to Flask (either as previous_value or as a row value)
+        all_text = " ".join(values + prev_values)
+        assert "flask" in all_text.lower()
+        beam.conn.close()
+    finally:
+        try:
+            os.unlink(db_path)
+        except:
+            pass
+
+
+def test_extract_increased_metric_creates_version_chain():
+    """'increased X from N to M' should create a metric version chain."""
+    import tempfile, os
+    from edumem.core.beam import BeamMemory, init_beam
+
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
+        db_path = tmp.name
+    try:
+        init_beam(db_path)
+        beam = BeamMemory(db_path=db_path, session_id="test_metric_change")
+        beam.extract_and_store_facts(
+            "[MSGIDX:8] We increased the team from 5 members to 12 members",
+            message_idx=8, source_memory_id="msg8"
+        )
+        beam.conn.commit()
+
+        rows = beam.conn.execute(
+            "SELECT key, value, version_id, previous_value, fact_type FROM memoria_facts "
+            "WHERE session_id = 'test_metric_change' "
+            "ORDER BY version_id ASC"
+        ).fetchall()
+        values = [r[1] for r in rows]
+        prev_values = [r[3] if r[3] else "" for r in rows]
+        # Should capture both 5 and 12
+        all_text = " ".join(values + prev_values)
+        assert "5" in all_text
+        assert "12" in all_text
+        beam.conn.close()
+    finally:
+        try:
+            os.unlink(db_path)
+        except:
+            pass
+
+
+def test_extract_moved_deadline_creates_version_chain():
+    """'moved deadline from D1 to D2' should create a date version chain."""
+    import tempfile, os
+    from edumem.core.beam import BeamMemory, init_beam
+
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
+        db_path = tmp.name
+    try:
+        init_beam(db_path)
+        beam = BeamMemory(db_path=db_path, session_id="test_date_change")
+        beam.extract_and_store_facts(
+            "[MSGIDX:15] We postponed the launch from 2024-03-15 to 2024-04-01",
+            message_idx=15, source_memory_id="msg15"
+        )
+        beam.conn.commit()
+
+        rows = beam.conn.execute(
+            "SELECT key, value, version_id, previous_value, fact_type FROM memoria_facts "
+            "WHERE session_id = 'test_date_change' "
+            "ORDER BY version_id ASC"
+        ).fetchall()
+        values = [r[1] for r in rows]
+        prev_values = [r[3] if r[3] else "" for r in rows]
+        all_text = " ".join(values + prev_values)
+        assert "2024-03-15" in all_text
+        assert "2024-04-01" in all_text
+        beam.conn.close()
+    finally:
+        try:
+            os.unlink(db_path)
+        except:
+            pass
+
+
+def test_ku_modifier_references_structured_facts():
+    """KU modifier should instruct LLM to use [Fact CURRENT ...] entries."""
+    from edumem.core.query_mode import build_system_prompt
+    prompt = build_system_prompt("What is the current team size?")
+    assert "fact current" in prompt.lower()
+
+
+def test_cr_modifier_references_structured_facts():
+    """CR modifier should instruct LLM to use [Fact CHANGED ...] entries."""
+    from edumem.core.query_mode import build_system_prompt
+    prompt = build_system_prompt("Is there a contradiction about the API?")
+    assert "fact changed" in prompt.lower()
+
+
+def test_duration_modifier_references_structured_facts():
+    """TR/Duration modifier should instruct LLM to use [Fact TIMELINE ...] entries."""
+    from edumem.core.query_mode import build_system_prompt
+    prompt = build_system_prompt("How many weeks between the start and the deadline?")
+    assert "fact timeline" in prompt.lower()
+
+
+def test_ordering_modifier_references_structured_facts():
+    """EO modifier should instruct LLM to use [Fact ... MSGIDX:N] entries."""
+    from edumem.core.query_mode import build_system_prompt
+    prompt = build_system_prompt("In what order were the features discussed?")
+    assert "fact" in prompt.lower() and "msgidx" in prompt.lower()
+
+
+# ---------------------------------------------------------------------------
+# BEAM Integration Tests — full ingest → extract → retrieve pipeline
+# Modeled on real failing cases from BEAM 100K case 0 (2026-06-20 11:00 run)
+# ---------------------------------------------------------------------------
+
+
+def _make_beam_for_integration(tmp_path, session_id="beam_integ"):
+    """Create a fresh BeamMemory with initialized schema for integration tests."""
+    from edumem.core.beam import BeamMemory, init_beam
+    db_path = str(tmp_path / f"{session_id}.db")
+    init_beam(db_path)
+    return BeamMemory(db_path=db_path, session_id=session_id)
+
+
+def test_beam_integ_ku_versioned_fact_prevents_false_conflict(tmp_path):
+    """BEAM KU q0 scored 0.0: AI said 'contradictory information' about response
+    time 800ms->300ms->250ms instead of answering '250ms'.
+
+    With versioned facts, _memoria_fact_retrieve(ability='KU') must render
+    [Fact CURRENT ...] format showing the latest value with 'was:' annotation,
+    so the LLM treats it as an UPDATE not a contradiction.
+
+    This test FAILS if _format_versioned_fact() is removed or doesn't handle KU."""
+    beam = _make_beam_for_integration(tmp_path, "ku_conflict")
+    try:
+        # Same key, three values — simulates response time being updated
+        beam._insert_fact("ku_conflict", 50, "metric", "response_time_ms",
+                          "800ms", "Response time is 800ms", 0.7,
+                          source_memory_id="msg50")
+        beam._insert_fact("ku_conflict", 80, "metric", "response_time_ms",
+                          "300ms", "Response time reduced to 300ms", 0.7,
+                          source_memory_id="msg80")
+        beam._insert_fact("ku_conflict", 100, "metric", "response_time_ms",
+                          "250ms", "Response time improved to 250ms", 0.7,
+                          source_memory_id="msg100")
+        beam.conn.commit()
+
+        result = beam._memoria_fact_retrieve(
+            "What is the response time?", top_k=10, ability="KU"
+        )
+        ctx = result["context"]
+        # Must contain CURRENT format (Phase 1 rendering)
+        assert "[fact current" in ctx.lower(), \
+            f"KU versioned fact must use [Fact CURRENT] format, got: {ctx}"
+        # Must show latest value
+        assert "250ms" in ctx
+        # Must reference previous value
+        assert "was:" in ctx.lower(), \
+            f"KU versioned fact must show 'was:' annotation, got: {ctx}"
+    finally:
+        beam.conn.close()
+
+
+def test_beam_integ_cr_versioned_fact_shows_both_sides(tmp_path):
+    """BEAM CR q0 scored 0.5: AI found contradiction about Flask routes but
+    only partially presented both sides.
+
+    With versioned facts, _memoria_fact_retrieve(ability='CR') must render
+    [Fact CHANGED ...] format showing both old and new values.
+
+    This test FAILS if _format_versioned_fact() doesn't handle CR."""
+    beam = _make_beam_for_integration(tmp_path, "cr_both")
+    try:
+        beam._insert_fact("cr_both", 30, "entity", "flask_usage",
+                          "never used", "Never written any Flask routes", 0.7,
+                          source_memory_id="msg30")
+        beam._insert_fact("cr_both", 85, "entity", "flask_usage",
+                          "implemented", "Implemented Flask route for login", 0.7,
+                          source_memory_id="msg85")
+        beam.conn.commit()
+
+        result = beam._memoria_fact_retrieve(
+            "Have I worked with Flask?", top_k=10, ability="CR"
+        )
+        ctx = result["context"]
+        # Must contain CHANGED format (Phase 1 rendering)
+        assert "[fact changed" in ctx.lower(), \
+            f"CR versioned fact must use [Fact CHANGED] format, got: {ctx}"
+        # Must show BOTH values
+        assert "never used" in ctx.lower()
+        assert "implemented" in ctx.lower()
+    finally:
+        beam.conn.close()
+
+
+def test_beam_integ_tr_versioned_fact_precomputes_delta(tmp_path):
+    """BEAM TR q0 scored 0.0: AI said 'contradictory information' about deadlines
+    instead of computing 4 weeks between Jan 15 and Mar 15.
+
+    With versioned facts, _memoria_fact_retrieve(ability='TR') must render
+    [Fact TIMELINE ...] format with pre-computed delta.
+
+    This test FAILS if _format_versioned_fact() doesn't handle TR."""
+    beam = _make_beam_for_integration(tmp_path, "tr_delta")
+    try:
+        # Insert facts with numeric values that will match Pass 1 (numbers search for 15, 01, 03, 2024)
+        # and will be found when querying with those numbers
+        beam._insert_fact("tr_delta", 10, "metric", "target_date_01_15",
+                          "2024-01-15", "Target date is January 15", 0.7,
+                          source_memory_id="msg10")
+        beam._insert_fact("tr_delta", 50, "metric", "target_date_01_15",
+                          "2024-03-15", "Deadline moved to March 15", 0.7,
+                          source_memory_id="msg50")
+        beam.conn.commit()
+
+        # Query with numbers that will be extracted by Pass 1 search (looking for '15')
+        result = beam._memoria_fact_retrieve(
+            "What happened to the 01-15 date in 2024?", top_k=10, ability="TR"
+        )
+        ctx = result["context"]
+        # Must contain TIMELINE format (Phase 1 rendering) when facts are retrieved
+        assert "[fact timeline" in ctx.lower(), \
+            f"TR versioned fact must use [Fact TIMELINE] format, got: {ctx}"
+        # Must show both dates
+        assert "2024-01-15" in ctx
+        assert "2024-03-15" in ctx
+        # Must have pre-computed delta
+        assert "weeks" in ctx.lower() or "days" in ctx.lower(), \
+            f"TR versioned fact must include pre-computed delta, got: {ctx}"
+    finally:
+        beam.conn.close()
+
+
+def test_beam_integ_eo_versioned_fact_shows_msgidx_anchor(tmp_path):
+    """EO scored 0.12-0.14: LLM used abstract labels instead of functional descriptions.
+
+    With versioned facts, _format_versioned_fact(ability='EO') must include
+    MSGIDX anchors so the LLM can order by first appearance.
+
+    This test FAILS if _format_versioned_fact() doesn't handle EO."""
+    beam = _make_beam_for_integration(tmp_path, "eo_anchor")
+    try:
+        beam._insert_fact("eo_anchor", 15, "metric", "sprint_feature",
+                          "3features", "Built 3 features in sprint 1", 0.7,
+                          source_memory_id="msg15")
+        beam.conn.commit()
+
+        result = beam._memoria_fact_retrieve(
+            "In what order did we build features?", top_k=10, ability="EO"
+        )
+        ctx = result["context"]
+        # Must contain MSGIDX anchor in fact line (Phase 1 rendering)
+        assert "msgidx:" in ctx.lower(), \
+            f"EO versioned fact must include MSGIDX anchor, got: {ctx}"
+        assert "15" in ctx  # The actual message index
+    finally:
+        beam.conn.close()
+
+
+def test_beam_integ_cr_routing_merges_versioned_facts(tmp_path):
+    """memoria_retrieve(ability='CR') must merge negation triples WITH versioned
+    fact results from _memoria_fact_retrieve.
+
+    This test FAILS if Phase 1.5 routing change is reverted (CR only going to
+    _memoria_negation_retrieve)."""
+    beam = _make_beam_for_integration(tmp_path, "cr_merge")
+    try:
+        # Insert a versioned fact (value changed) — this goes into memoria_facts
+        beam._insert_fact("cr_merge", 5, "metric", "db_choice",
+                          "SQLite", "Using SQLite for storage", 0.7,
+                          source_memory_id="msg5")
+        beam._insert_fact("cr_merge", 40, "metric", "db_choice",
+                          "PostgreSQL", "Switched to PostgreSQL", 0.7,
+                          source_memory_id="msg40")
+        beam.conn.commit()
+
+        result = beam.memoria_retrieve(
+            "Which database are we using?", ability="CR", top_k=10
+        )
+        ctx = result["context"].lower()
+        # CR routing must include versioned facts (not just negation triples)
+        # If routing is reverted, only _memoria_negation_retrieve runs,
+        # which won't find these metric facts
+        assert "sqlite" in ctx or "postgresql" in ctx, \
+            f"CR routing must include versioned facts, got: {result['context']}"
+    finally:
+        beam.conn.close()
+
+
+def test_beam_integ_tr_routing_merges_versioned_facts(tmp_path):
+    """memoria_retrieve(ability='TR') must merge timeline results WITH versioned
+    fact results from _memoria_fact_retrieve.
+
+    This test FAILS if Phase 1.5 routing change is reverted (TR only going to
+    _memoria_timeline_retrieve)."""
+    beam = _make_beam_for_integration(tmp_path, "tr_merge")
+    try:
+        beam._insert_fact("tr_merge", 10, "metric", "milestone_date",
+                          "2024-02-01", "Milestone set for Feb 1", 0.7,
+                          source_memory_id="msg10")
+        beam._insert_fact("tr_merge", 30, "metric", "milestone_date",
+                          "2024-03-15", "Milestone moved to Mar 15", 0.7,
+                          source_memory_id="msg30")
+        beam.conn.commit()
+
+        result = beam.memoria_retrieve(
+            "When was the milestone?", ability="TR", top_k=10
+        )
+        ctx = result["context"]
+        # TR routing must include versioned facts (not just timeline entries)
+        assert "2024" in ctx, \
+            f"TR routing must include versioned facts, got: {ctx}"
+    finally:
+        beam.conn.close()
+
+
+def test_beam_integ_default_ability_no_version_annotation(tmp_path):
+    """For IE and unrecognized abilities, versioned facts should render as
+    flat [Fact type] key: value (no CURRENT/CHANGED/TIMELINE annotations).
+
+    Ensures version-aware rendering is scoped to KU/CR/TR/EO only."""
+    beam = _make_beam_for_integration(tmp_path, "ie_flat")
+    try:
+        beam._insert_fact("ie_flat", 5, "metric", "sprint_length",
+                          "2weeks", "Sprint is 2 weeks", 0.7,
+                          source_memory_id="msg5")
+        beam._insert_fact("ie_flat", 20, "metric", "sprint_length",
+                          "3weeks", "Sprint extended to 3 weeks", 0.7,
+                          source_memory_id="msg20")
+        beam.conn.commit()
+
+        result = beam._memoria_fact_retrieve(
+            "How long is the sprint?", top_k=10, ability="IE"
+        )
+        ctx = result["context"].lower()
+        # IE should use flat format, NOT version-aware annotations
+        assert "[fact current" not in ctx, \
+            f"IE should not use CURRENT format, got: {result['context']}"
+        assert "[fact changed" not in ctx
+        assert "[fact timeline" not in ctx
+        # Should still show latest value
+        assert "3weeks" in ctx
+    finally:
+        beam.conn.close()

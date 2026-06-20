@@ -223,20 +223,26 @@ METHOD:
 3. Use ACTUAL descriptions from context; quote or paraphrase closely.
 4. Do NOT invent labels or merge distinct topics into summaries.
 5. Describe each item by its FUNCTIONAL PURPOSE (what was being built, fixed, or discussed), NOT by dates or timeline positions.
-   BAD: "Planning tasks and schedule with March 15 time anchor"
-   GOOD: "Setting up core functionality including user authentication and expense tracking"
+   BAD: "Tasks and planning for the week of Jan 10"
+   GOOD: "Implementing the login flow and session management"
 6. Do NOT include dates, date ranges, or MSGIDX numbers in the output — use them only internally for ordering.
-7. One clause per line, earliest first, no preamble."""
+7. One clause per line, earliest first, no preamble.
+8. If the same feature appears multiple times at different stages (building it, then later optimizing, refactoring, or debugging it), keep only the FIRST occurrence where that feature was introduced. Later refinements of an already-listed feature are NOT new topics. Treat the entire lifecycle of a feature as one item in the order.
+
+If the context includes [Fact ... MSGIDX:N] entries, use their MSGIDX values as ordering anchors. These are pre-extracted fact appearances that supplement the MSGIDX tags on full memories."""
 
 _DURATION_MODIFIER = """
 
 DURATION: This question asks for an amount of elapsed time between two specific events.
 Step 1: Identify the TWO specific events mentioned in the question.
 Step 2: For each event, find its date by reading the surrounding context — match the event description to the [MSGIDX:N] entry that discusses that specific event. Do NOT pick dates from unrelated events or different phases of the same topic.
-IMPORTANT: Match events by MEANING, not exact wording. "Final deployment deadline" might appear as "project deadline", "deployment date", "launch date", or simply a date associated with deployment. "Finishing transaction management" might appear as "transaction management complete" or a date marking the end of that phase. Look for semantic matches, not literal strings.
+IMPORTANT: Match events by MEANING, not exact wording. The question's phrasing may differ from how events appear in context — e.g., a "launch deadline" might be stored as "go-live date" or "release target." Look for semantic matches, not literal strings.
 If the question mentions a milestone, look for ANY date associated with that milestone in the context, even if the exact phrase differs.
+IMPORTANT: If the conversation contains multiple different dates for the same event (e.g., an early plan and a later update), prefer the MOST RECENTLY STATED dates. A date stated in a later message supersedes an earlier planned date. Use the actual timing from later messages, not the initial plan.
 Step 3: compute the difference between the two dates and state it explicitly (e.g. "2024-04-02 to 2024-05-03 = 31 days").
-Compute strictly from dates present in the context; do not estimate. End with the exact value the question asks for."""
+Compute strictly from dates present in the context; do not estimate. End with the exact value the question asks for.
+
+If the context includes [Fact TIMELINE ...] entries with pre-computed deltas (e.g., "= 17 days"), use these pre-computed values directly. They are authoritative."""
 
 _STATED_DURATION_MODIFIER = """
 
@@ -250,7 +256,9 @@ is the correct answer. Higher [MSGIDX:N] numbers mean the statement was made lat
 always prefer the value from the highest MSGIDX.
 CRITICAL: Do NOT flag value changes as contradictions. If an earlier message says "6 items" and a later
 message says "10 items", this is an UPDATE, not a contradiction. Answer with the latest value directly.
-State the current value, and if helpful, mention the change briefly (e.g., "10 project cards (updated from 6)")."""
+State the current value, and if helpful, mention the change briefly (e.g., "10 project cards (updated from 6)").
+
+If the context includes [Fact CURRENT ...] entries, these are pre-resolved value changes. The value shown is the current one; the "(was: ...)" part shows the superseded value. Use the current value as your answer directly."""
 
 _MR_MODIFIER = """
 
@@ -260,7 +268,15 @@ and fact B says "Y requires Z", then the answer to "what does X require?" is Z.
 Chain the facts step by step.
 
 When the question asks "how many" or requires counting across sessions, make sure to list
-ALL distinct items you found and then count them."""
+ALL distinct items you found and then count them.
+
+Items introduced during design, schema definition, or initial planning count the same as
+items added later. If a field, column, or component was named in a schema or plan, it is
+part of what was introduced — do not exclude it because it was defined early.
+
+Features the user describes with concrete detail (versions, implementation steps,
+configuration settings) are things the user is doing. Only treat a feature as "not done"
+or "not implemented" if the user explicitly said they were NOT going to do it."""
 
 _SUM_MODIFIER = """
 
@@ -268,7 +284,9 @@ CRITICAL OVERRIDE: Summaries NEVER flag contradictions. If the context shows evo
 
 SUMMARIZATION: This question asks for a summary of the conversation.
 If the question mentions progression, development, or resolution "over time", structure your answer as a CHRONOLOGICAL NARRATIVE — describe what happened first, what came next, and how things evolved. Use [MSGIDX:N] tags to determine the order. Do NOT organize by topic/category — organize by TIME.
-If the question asks for a general overview without temporal emphasis, cover ALL major themes and topics from the context. Structure as a comprehensive overview. Aim for completeness over brevity."""
+If the question asks for a general overview without temporal emphasis, cover ALL major themes and topics from the context. Structure as a comprehensive overview. Aim for completeness over brevity.
+
+If the question asks about a SPECIFIC domain, topic, or aspect (e.g., "security challenges", "database issues", "performance problems"), constrain your summary to ONLY that domain. Do NOT write a general project overview — cover only the aspects relevant to what was asked. Structure as a chronological narrative of how that specific domain evolved."""
 
 _CR_MODIFIER = """
 
@@ -277,7 +295,9 @@ Present BOTH sides of the contradiction clearly with their [MSGIDX:N] references
 Then RESOLVE the contradiction: the statement with the higher [MSGIDX:N] is more recent
 and should be treated as the current truth, unless the earlier statement was explicitly
 confirmed or the later statement was hypothetical. Always end with a clear resolution
-stating which value is current and why."""
+stating which value is current and why.
+
+If the context includes [Fact CHANGED ...] entries, these are pre-resolved contradictions showing both the old and new values with their MSGIDX timestamps. Present BOTH values and resolve using temporal ordering (higher MSGIDX = more recent)."""
 
 _YESNO_CHECK_MODIFIER = """
 
