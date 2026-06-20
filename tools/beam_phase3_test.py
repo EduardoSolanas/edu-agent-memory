@@ -42,8 +42,17 @@ def main():
         stats = ingest_conversation(beam, conv['messages'])
         print(f"  WM: {beam.get_working_stats()['total']}, EP: {beam.get_episodic_stats()['total']}, SP: {stats.get('sp_count', 0)}")
         
-        llm = LLMClient(model='nvidia/nemotron-3-super-120b-a12b:free')
-        judge_llm = LLMClient(model='nvidia/nemotron-3-super-120b-a12b:free')
+        # Create LLM clients
+        llm = LLMClient(
+            model='qwen3.6',
+            api_key=os.environ.get('NAN_APY_KEY', ''),
+            base_url='https://api.nan.builders/v1',
+        )
+        judge_llm = LLMClient(
+            model='deepseek-v4-flash',
+            api_key=os.environ.get('NAN_APY_KEY', ''),
+            base_url='https://api.nan.builders/v1',
+        )
         
         # Evaluate
         print("\n[3/3] Evaluating...")
@@ -73,7 +82,7 @@ def main():
         os.makedirs(RESULTS_FILE.parent, exist_ok=True)
         metadata = {
             "date": datetime.now(timezone.utc).isoformat(),
-            "model": "nvidia/nemotron-3-super-120b-a12b:free",
+            "model": "qwen3.6",
             "scales": ["100K"],
             "total_conversations": 1,
         }
