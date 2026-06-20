@@ -1,0 +1,256 @@
+[
+  {
+    "qid": "1:q0",
+    "ability": "ABS",
+    "question": "How did the user feedback influence the UI/UX improvements I made before the public launch?",
+    "baseline_score": 1.0,
+    "expectation": "hard",
+    "check": "absence",
+    "nuggets": []
+  },
+  {
+    "qid": "1:q1",
+    "ability": "ABS",
+    "question": "Can you tell me about my background and previous development projects?",
+    "baseline_score": 1.0,
+    "expectation": "xfail",
+    "check": "absence",
+    "nuggets": []
+  },
+  {
+    "qid": "1:q2",
+    "ability": "CR",
+    "question": "Have I worked with Flask routes and handled HTTP requests in this project?",
+    "baseline_score": 0.5,
+    "expectation": "xfail",
+    "check": "contains_all",
+    "nuggets": [
+      "contradictory",
+      "never written",
+      "flask routes",
+      "handled http requests",
+      "project",
+      "also mentioned implementing",
+      "basic homepage route",
+      "statement",
+      "correct"
+    ]
+  },
+  {
+    "qid": "1:q3",
+    "ability": "CR",
+    "question": "Have I integrated Flask-Login for session management in my project?",
+    "baseline_score": 0.25,
+    "expectation": "xfail",
+    "check": "contains_all",
+    "nuggets": [
+      "contradictory",
+      "never integrated flask",
+      "managed user sessions",
+      "project",
+      "also mentioned",
+      "flask login",
+      "integrated",
+      "session management",
+      "statement",
+      "correct"
+    ]
+  },
+  {
+    "qid": "1:q4",
+    "ability": "EO",
+    "question": "Can you list the order in which I brought up different aspects of developing my personal budget tracker throughout our conversations, in order? Mention ONLY and ONLY three items.",
+    "baseline_score": 0.12499999999999994,
+    "expectation": "xfail",
+    "check": "order",
+    "nuggets": [
+      "Core functionality",
+      "Transaction error handling",
+      "Security and deployment"
+    ]
+  },
+  {
+    "qid": "1:q5",
+    "ability": "EO",
+    "question": "Can you walk me through the order in which I brought up different aspects of my app development and deployment across our conversations? Mention ONLY and ONLY five items.",
+    "baseline_score": 0.14644660940672627,
+    "expectation": "xfail",
+    "check": "order",
+    "nuggets": [
+      "Initial project setup",
+      "Transaction CRUD implementation",
+      "Deployment configuration",
+      "Integration test coverage",
+      "Deployment and test improvements"
+    ]
+  },
+  {
+    "qid": "1:q6",
+    "ability": "IE",
+    "question": "When does my first sprint end?",
+    "baseline_score": 1.0,
+    "expectation": "hard",
+    "check": "contains_all",
+    "nuggets": [
+      "march 29"
+    ]
+  },
+  {
+    "qid": "1:q7",
+    "ability": "IE",
+    "question": "How did I organize the tasks over the course of the sprint to ensure both backend and frontend aspects of the features were completed on time?",
+    "baseline_score": 1.0,
+    "expectation": "xfail",
+    "check": "contains_all",
+    "nuggets": [
+      "organized",
+      "sprint",
+      "scheduling backend related",
+      "tasks such",
+      "setting",
+      "environment",
+      "defining",
+      "database schema",
+      "implementing registration",
+      "adding validation",
+      "writing unit tests",
+      "first week",
+      "frontend tasks like",
+      "adding forms",
+      "integrating frontend",
+      "backend",
+      "second week"
+    ]
+  },
+  {
+    "qid": "1:q8",
+    "ability": "IF",
+    "question": "Could you show me how to implement a login feature?",
+    "baseline_score": 1.0,
+    "expectation": "hard",
+    "check": "skip",
+    "nuggets": []
+  },
+  {
+    "qid": "1:q9",
+    "ability": "IF",
+    "question": "Which libraries are used in this project?",
+    "baseline_score": 1.0,
+    "expectation": "hard",
+    "check": "skip",
+    "nuggets": []
+  },
+  {
+    "qid": "1:q10",
+    "ability": "KU",
+    "question": "What is the average response time of the dashboard API?",
+    "baseline_score": 1.0,
+    "expectation": "hard",
+    "check": "contains_all",
+    "nuggets": [
+      "250ms"
+    ]
+  },
+  {
+    "qid": "1:q11",
+    "ability": "KU",
+    "question": "How many commits have been merged into the main branch of my Git repository?",
+    "baseline_score": 1.0,
+    "expectation": "hard",
+    "check": "contains_all",
+    "nuggets": [
+      "165 commits"
+    ]
+  },
+  {
+    "qid": "1:q12",
+    "ability": "MR",
+    "question": "How many new columns did I want to add to the transactions table across my requests?",
+    "baseline_score": 0.0,
+    "expectation": "xfail",
+    "check": "contains_all",
+    "nuggets": [
+      "two",
+      "columns",
+      "category"
+    ]
+  },
+  {
+    "qid": "1:q13",
+    "ability": "MR",
+    "question": "How many different user roles and security features am I trying to implement across my sessions?",
+    "baseline_score": 0.25,
+    "expectation": "xfail",
+    "check": "contains_all",
+    "nuggets": [
+      "three",
+      "password hashing",
+      "role based access",
+      "control",
+      "account lockout after",
+      "failed login attempts"
+    ]
+  },
+  {
+    "qid": "1:q14",
+    "ability": "PF",
+    "question": "I'm planning to add user login, income and expense tracking, and some basic analytics to my Flask app. What libraries or tools would you suggest I use to implement these features?",
+    "baseline_score": 1.0,
+    "expectation": "hard",
+    "check": "skip",
+    "nuggets": []
+  },
+  {
+    "qid": "1:q15",
+    "ability": "PF",
+    "question": "I'm looking to improve the security features of my app. What steps would you suggest I take?",
+    "baseline_score": 1.0,
+    "expectation": "hard",
+    "check": "skip",
+    "nuggets": []
+  },
+  {
+    "qid": "1:q16",
+    "ability": "SUM",
+    "question": "Can you provide a comprehensive summary of how my budget tracker project has progressed, including the key features implemented, the development timeline, security enhancements, and documentation efforts?",
+    "baseline_score": 0.8,
+    "expectation": "hard",
+    "check": "skip",
+    "nuggets": []
+  },
+  {
+    "qid": "1:q17",
+    "ability": "SUM",
+    "question": "Can you give me a comprehensive summary of how I handled the security and database challenges in my budget tracker app across our discussions?",
+    "baseline_score": 0.0,
+    "expectation": "xfail",
+    "check": "skip",
+    "nuggets": []
+  },
+  {
+    "qid": "1:q18",
+    "ability": "TR",
+    "question": "How many weeks do I have between finishing the transaction management features and the final deployment deadline?",
+    "baseline_score": 0.0,
+    "expectation": "xfail",
+    "check": "contains_all",
+    "nuggets": [
+      "january 15, 2024",
+      "march 15, 2024"
+    ],
+    "_note": "q18 (TR): dropped '8 weeks' nugget (contradicts ideal_answer '4 weeks' \u2014 known BEAM dataset bug); kept date-range nugget"
+  },
+  {
+    "qid": "1:q19",
+    "ability": "TR",
+    "question": "How many days were there between the end of my first sprint and the deadline for completing the analytics features in sprint 2?",
+    "baseline_score": 1.0,
+    "expectation": "hard",
+    "check": "contains_all",
+    "nuggets": [
+      "21 days",
+      "march 29",
+      "april 19"
+    ]
+  }
+]
