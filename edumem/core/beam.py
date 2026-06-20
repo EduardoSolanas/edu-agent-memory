@@ -4685,21 +4685,25 @@ class BeamMemory:
         if not ability:
             ability = self._classify_ability(query)
 
+        # Map BEAM ability codes to generic intent strings for core memory logic
+        _ABILITY_TO_INTENT = {'KU': 'current', 'CR': 'change', 'TR': 'timeline', 'EO': 'ordered'}
+        intent = _ABILITY_TO_INTENT.get(ability, '')
+
         if ability in ('IE', 'KU'):
-            return self._memoria_fact_retrieve(query, top_k, ability=ability)
+            return self._memoria_fact_retrieve(query, top_k, intent=intent)
         elif ability == 'TR':
             timeline = self._memoria_timeline_retrieve(query, top_k)
-            facts = self._memoria_fact_retrieve(query, top_k, ability='TR')
+            facts = self._memoria_fact_retrieve(query, top_k, intent=intent)
             return self._merge_memoria_results(timeline, facts)
         elif ability == 'CR':
             neg = self._memoria_negation_retrieve(query, top_k)
-            facts = self._memoria_fact_retrieve(query, top_k, ability='CR')
+            facts = self._memoria_fact_retrieve(query, top_k, intent=intent)
             return self._merge_memoria_results(neg, facts)
         elif ability == 'MR':
             return self._memoria_entity_retrieve(query, top_k)
         elif ability == 'EO':
             chrono = self._memoria_chrono_retrieve(query, top_k)
-            facts = self._memoria_fact_retrieve(query, top_k, ability='EO')
+            facts = self._memoria_fact_retrieve(query, top_k, intent=intent)
             return self._merge_memoria_results(chrono, facts)
         elif ability == 'IF':
             return self._memoria_instruction_retrieve(query, top_k)
@@ -4785,7 +4789,7 @@ class BeamMemory:
 
         return ''
 
-    def _memoria_fact_retrieve(self, query: str, top_k: int = 10, ability: str = '') -> dict:
+    def _memoria_fact_retrieve(self, query: str, top_k: int = 10, intent: str = '') -> dict:
         """Query memoria_facts table for exact metric/version/entity matches.
         Uses multi-pass strategy:
           Pass 1: numbers from query → search fact values
@@ -4935,12 +4939,86 @@ class BeamMemory:
                         })
                 newest['history'] = history
                 latest.append(newest)
+
+            # Direct singular metric questions need one definitive value, not
+            # every metric sharing the same unit. Rank metric facts against the
+            # query's subject words, then prefer the newest observed value in
+            # the best-matching subject cluster. Goals and thresholds are a
+            # separate intent: keep them out unless the question asks for one.
+            metric_facts = [f for f in latest if f.get('type') == 'metric']
+            target_markers = {
+                'aim', 'aimed', 'aiming', 'goal', 'target', 'targeted',
+                'targeting', 'threshold', 'limit', 'under', 'below',
+                'maximum', 'minimum', 'sla',
+            }
+            query_words = set(_re.findall(r'[a-z0-9]+', q_lower))
+            asks_for_target = bool(query_words & target_markers)
+            asks_for_history = bool(query_words & {
+                'before', 'earlier', 'initial', 'initially', 'old',
+                'original', 'originally', 'previous', 'previously', 'prior',
+            }) or q_lower.startswith(('what was', 'what were'))
+            broad_metric_question = any(phrase in q_lower for phrase in (
+                'all ', 'across ', 'different ', 'each ', 'list ',
+                'metrics', 'response times', 'values',
+            ))
+            direct_metric_question = (
+                bool(metric_facts)
+                and not asks_for_history
+                and not broad_metric_question
+                and (
+                    intent == 'current'
+                    or q_lower.startswith((
+                        'what is', "what's", 'how fast', 'how slow',
+                        'how much',
+                    ))
+                )
+            )
+
+            if direct_metric_question:
+                fact_stop_words = {
+                    'a', 'an', 'and', 'are', 'average', 'for', 'in', 'is',
+                    'my', 'of', 'on', 'the', 'to', 'was', 'what', 'which',
+                }
+                subject_words = query_words - fact_stop_words - target_markers
+
+                def _is_target_fact(fact: dict) -> bool:
+                    text = f"{fact.get('key', '')} {fact.get('context', '')}".lower()
+                    return bool(set(_re.findall(r'[a-z0-9]+', text)) & target_markers)
+
+                candidates = metric_facts
+                target_facts = [f for f in candidates if _is_target_fact(f)]
+                if asks_for_target:
+                    candidates = target_facts or candidates
+                else:
+                    candidates = [f for f in candidates if not _is_target_fact(f)]
+
+                def _metric_rank(fact: dict) -> tuple:
+                    text = f"{fact.get('key', '')} {fact.get('context', '')}".lower()
+                    fact_words = set(_re.findall(r'[a-z0-9]+', text))
+                    overlap = len(subject_words & fact_words)
+                    message_idx = (
+                        fact.get('message_idx')
+                        or fact.get('updated_msg_idx')
+                        or fact.get('valid_from_msg_idx')
+                        or -1
+                    )
+                    return overlap, message_idx
+
+                if candidates:
+                    best_overlap = max(_metric_rank(f)[0] for f in candidates)
+                    if best_overlap > 0:
+                        best_cluster = [
+                            f for f in candidates
+                            if _metric_rank(f)[0] == best_overlap
+                        ]
+                        latest = [max(best_cluster, key=_metric_rank)]
+
             # Sort by version_id descending so recently-updated facts are prominent
             latest.sort(key=lambda x: x.get('version_id', 0), reverse=True)
 
             ctx_lines = []
             for f in latest[:top_k]:
-                ctx_lines.append(self._format_versioned_fact(f, ability=ability))
+                ctx_lines.append(self._format_versioned_fact(f, intent=intent))
             return {
                 "context": "\n".join(ctx_lines),
                 "facts": latest[:top_k],
@@ -4952,8 +5030,16 @@ class BeamMemory:
             }
         return {"context": "", "facts": [], "source": "fallback"}
 
-    def _format_versioned_fact(self, fact: dict, ability: str = '') -> str:
-        """Render a fact with version-aware formatting based on query ability."""
+    def _format_versioned_fact(self, fact: dict, intent: str = '') -> str:
+        """Render a fact with version-aware formatting based on query intent.
+
+        Generic intent strings instead of BEAM ability codes:
+        - 'current': show current value with 'was:' annotation for old value
+        - 'change': show both old and new values for contradiction resolution
+        - 'timeline': show dates with pre-computed deltas
+        - 'ordered': show MSGIDX anchors for ordering
+        - '': flat format, no version annotations
+        """
         ftype = fact.get('type', '')
         key = fact.get('key', '')
         value = fact.get('value', '')
@@ -4965,7 +5051,7 @@ class BeamMemory:
         has_history = bool(history) or (previous_value is not None and previous_value != value)
 
         if not has_history:
-            if ability == 'EO' and msg_idx is not None:
+            if intent == 'ordered' and msg_idx is not None:
                 return f"[Fact {ftype} MSGIDX:{msg_idx}] {key}: {value}"
             return f"[Fact {ftype}] {key}: {value}"
 
@@ -4978,7 +5064,7 @@ class BeamMemory:
             old_idx = None
         new_idx = updated_msg_idx or msg_idx
 
-        if ability == 'KU':
+        if intent == 'current':
             parts = [f"[Fact CURRENT {ftype}] {key}: {value}"]
             was_parts = []
             if old_val and old_val != '?':
@@ -4991,12 +5077,12 @@ class BeamMemory:
                 parts.append(f"({', '.join(was_parts)})")
             return " ".join(parts)
 
-        elif ability == 'CR':
+        elif intent == 'change':
             old_ref = f"MSGIDX:{old_idx}" if old_idx is not None else "earlier"
             new_ref = f"MSGIDX:{new_idx}" if new_idx is not None else "later"
             return f'[Fact CHANGED {ftype}] {key}: {old_ref} said "{old_val}" → {new_ref} said "{value}"'
 
-        elif ability == 'TR':
+        elif intent == 'timeline':
             old_ref = f"(MSGIDX:{old_idx})" if old_idx is not None else ""
             new_ref = f"(MSGIDX:{new_idx})" if new_idx is not None else ""
             line = f"[Fact TIMELINE {ftype}] {key}: {old_val} {old_ref} → {value} {new_ref}"
@@ -5006,7 +5092,7 @@ class BeamMemory:
                 line += f" = {delta}"
             return line
 
-        elif ability == 'EO':
+        elif intent == 'ordered':
             idx = msg_idx or old_idx
             if idx is not None:
                 return f"[Fact {ftype} MSGIDX:{idx}] {key}: {value}"

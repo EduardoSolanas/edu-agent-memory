@@ -1345,7 +1345,7 @@ def test_format_versioned_fact_ku_shows_previous_value(tmp_path):
                           "Team grew to 12 members", 0.7, source_memory_id="msg15")
         beam.conn.commit()
 
-        result = beam._memoria_fact_retrieve("How many team members?", top_k=10, ability="KU")
+        result = beam._memoria_fact_retrieve("How many team members?", top_k=10, intent="current")
         ctx = result["context"]
         assert "current" in ctx.lower()
         assert "12members" in ctx
@@ -1368,7 +1368,7 @@ def test_format_versioned_fact_cr_shows_both_sides(tmp_path):
                           "API response time improved to 250ms", 0.7, source_memory_id="msg20")
         beam.conn.commit()
 
-        result = beam._memoria_fact_retrieve("Is there a contradiction about API latency?", top_k=10, ability="CR")
+        result = beam._memoria_fact_retrieve("Is there a contradiction about API latency?", top_k=10, intent="change")
         ctx = result["context"]
         assert "changed" in ctx.lower()
         assert "450ms" in ctx
@@ -1395,7 +1395,7 @@ def test_format_versioned_fact_tr_precomputes_date_delta(tmp_path):
                           "Deadline moved to April 1", 0.7, source_memory_id="msg18")
         beam.conn.commit()
 
-        result = beam._memoria_fact_retrieve("How long between Deadline dates?", top_k=10, ability="TR")
+        result = beam._memoria_fact_retrieve("How long between Deadline dates?", top_k=10, intent="timeline")
         ctx = result["context"]
         assert "timeline" in ctx.lower() or "2024-03-15" in ctx
         assert "2024-04-01" in ctx
@@ -1416,9 +1416,9 @@ def test_format_versioned_fact_no_history_fallback(tmp_path):
                           "CPU usage at 85%", 0.7, source_memory_id="msg1")
         beam.conn.commit()
 
-        # Should work the same for any ability when there's no history
-        for ability in ["KU", "CR", "TR", "EO", "IE", ""]:
-            result = beam._memoria_fact_retrieve("What is CPU usage?", top_k=10, ability=ability)
+        # Should work the same for any intent when there's no history
+        for intent in ["current", "change", "timeline", "ordered", "", ""]:
+            result = beam._memoria_fact_retrieve("What is CPU usage?", top_k=10, intent=intent)
             ctx = result["context"]
             assert "[fact" in ctx.lower()
             assert "cpu_usage" in ctx
@@ -1439,7 +1439,7 @@ def test_format_versioned_fact_eo_shows_msgidx(tmp_path):
                           "We built 3 features", 0.7, source_memory_id="msg7")
         beam.conn.commit()
 
-        result = beam._memoria_fact_retrieve("In what order were features built?", top_k=10, ability="EO")
+        result = beam._memoria_fact_retrieve("In what order were features built?", top_k=10, intent="ordered")
         ctx = result["context"]
         assert "msgidx" in ctx.lower() or "7" in ctx
     finally:
@@ -1661,7 +1661,7 @@ def test_beam_integ_ku_versioned_fact_prevents_false_conflict(tmp_path):
         beam.conn.commit()
 
         result = beam._memoria_fact_retrieve(
-            "What is the response time?", top_k=10, ability="KU"
+            "What is the response time?", top_k=10, intent="current"
         )
         ctx = result["context"]
         # Must contain CURRENT format (Phase 1 rendering)
@@ -1695,7 +1695,7 @@ def test_beam_integ_cr_versioned_fact_shows_both_sides(tmp_path):
         beam.conn.commit()
 
         result = beam._memoria_fact_retrieve(
-            "Have I worked with Flask?", top_k=10, ability="CR"
+            "Have I worked with Flask?", top_k=10, intent="change"
         )
         ctx = result["context"]
         # Must contain CHANGED format (Phase 1 rendering)
@@ -1730,7 +1730,7 @@ def test_beam_integ_tr_versioned_fact_precomputes_delta(tmp_path):
 
         # Query with numbers that will be extracted by Pass 1 search (looking for '15')
         result = beam._memoria_fact_retrieve(
-            "What happened to the 01-15 date in 2024?", top_k=10, ability="TR"
+            "What happened to the 01-15 date in 2024?", top_k=10, intent="timeline"
         )
         ctx = result["context"]
         # Must contain TIMELINE format (Phase 1 rendering) when facts are retrieved
@@ -1761,7 +1761,7 @@ def test_beam_integ_eo_versioned_fact_shows_msgidx_anchor(tmp_path):
         beam.conn.commit()
 
         result = beam._memoria_fact_retrieve(
-            "In what order did we build features?", top_k=10, ability="EO"
+            "In what order did we build features?", top_k=10, intent="ordered"
         )
         ctx = result["context"]
         # Must contain MSGIDX anchor in fact line (Phase 1 rendering)
@@ -1845,7 +1845,7 @@ def test_beam_integ_default_ability_no_version_annotation(tmp_path):
         beam.conn.commit()
 
         result = beam._memoria_fact_retrieve(
-            "How long is the sprint?", top_k=10, ability="IE"
+            "How long is the sprint?", top_k=10, intent=""
         )
         ctx = result["context"].lower()
         # IE should use flat format, NOT version-aware annotations
