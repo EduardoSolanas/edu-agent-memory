@@ -4492,7 +4492,7 @@ class BeamMemory:
         if existing and existing[1] != value:
             # Mark old row as replaced
             self.conn.execute(
-                "UPDATE memoria_facts SET valid_to_msg_idx = ?, previous_value = value "
+                "UPDATE memoria_facts SET valid_to_msg_idx = ? "
                 "WHERE id = ?",
                 (msg_idx, existing[0])
             )

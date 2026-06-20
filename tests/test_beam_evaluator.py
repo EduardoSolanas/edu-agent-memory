@@ -1637,6 +1637,39 @@ def _make_beam_for_integration(tmp_path, session_id="beam_integ"):
     return BeamMemory(db_path=db_path, session_id=session_id)
 
 
+def test_beam_integ_metric_history_preserves_previous_versions(tmp_path):
+    beam = _make_beam_for_integration(tmp_path, "metric_history")
+    try:
+        for message_idx, value in ((50, "800ms"), (80, "300ms"), (100, "250ms")):
+            beam._insert_fact(
+                "metric_history",
+                message_idx,
+                "metric",
+                "dashboard_api_response_time_ms",
+                value,
+                f"Dashboard API response time is {value}",
+                0.7,
+                source_memory_id=f"msg{message_idx}",
+            )
+        beam.conn.commit()
+
+        rows = beam.conn.execute(
+            "SELECT value, version_id, previous_value, valid_from_msg_idx, valid_to_msg_idx "
+            "FROM memoria_facts "
+            "WHERE session_id = ? AND fact_type = 'metric' AND key = ? "
+            "ORDER BY version_id",
+            ("metric_history", "dashboard_api_response_time_ms"),
+        ).fetchall()
+
+        assert [tuple(row) for row in rows] == [
+            ("800ms", 0, None, 50, 80),
+            ("300ms", 1, "800ms", 80, 100),
+            ("250ms", 2, "300ms", 100, None),
+        ]
+    finally:
+        beam.conn.close()
+
+
 def test_beam_integ_ku_versioned_fact_prevents_false_conflict(tmp_path):
     """BEAM KU q0 scored 0.0: AI said 'contradictory information' about response
     time 800ms->300ms->250ms instead of answering '250ms'.

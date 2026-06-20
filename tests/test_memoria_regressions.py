@@ -57,8 +57,8 @@ def test_memoria_fact_retrieve_keeps_only_current_value_in_context(tmp_path):
             "PostgreSQL 15",
         ]
         assert [entry["version_id"] for entry in fact["history"]] == [0, 1]
-        assert fact["history"][0]["previous_value"] == "PostgreSQL 14"
-        assert fact["history"][1]["previous_value"] == "PostgreSQL 15"
+        assert fact["history"][0]["previous_value"] is None
+        assert fact["history"][1]["previous_value"] == "PostgreSQL 14"
         assert fact["history"][1]["updated_msg_idx"] == 2
     finally:
         beam.conn.close()
