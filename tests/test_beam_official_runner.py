@@ -19,31 +19,31 @@ def _closed_local_port() -> int:
 def test_runner_helpers_build_expected_env_and_command():
     embedding_base_url, embedding_model, embedding_dim = runner._resolve_embedding_settings({})
     assert embedding_base_url == "http://localhost:3002"
-    assert embedding_model == "sentence-transformers/all-mpnet-base-v2"
+    assert embedding_model == "Alibaba-NLP/gte-modernbert-base"
     assert embedding_dim == 768
 
     env = runner._build_runner_env(
         {},
         base_url="https://api.nan.builders/v1",
         api_key="test-nan-key",
-        model="qwen3.6",
-        judge_model="qwen3.6/judge:2026-06-19",
+        model="deepseek-v4-flash",
+        judge_model="deepseek-v4-flash",
         reranker_url="http://localhost:3002/rerank",
         embedding_base_url=embedding_base_url,
         embedding_model=embedding_model,
         embedding_dim=embedding_dim,
     )
     assert env["OPENROUTER_BASE_URL"] == "https://api.nan.builders/v1"
-    assert env["EDUMEM_LLM_MODEL"] == "qwen3.6"
-    assert env["EDUMEM_JUDGE_MODEL"] == "qwen3.6/judge:2026-06-19"
+    assert env["EDUMEM_LLM_MODEL"] == "deepseek-v4-flash"
+    assert env["EDUMEM_JUDGE_MODEL"] == "deepseek-v4-flash"
     assert env["EDUMEM_RERANKER_URL"] == "http://localhost:3002/rerank"
-    assert env["EDUMEM_EMBEDDING_MODEL"] == "sentence-transformers/all-mpnet-base-v2"
+    assert env["EDUMEM_EMBEDDING_MODEL"] == "Alibaba-NLP/gte-modernbert-base"
     assert env["EDUMEM_EMBEDDING_DIM"] == "768"
 
     command = runner._build_evaluator_command(
         Path("/tmp/tools/evaluate_beam_end_to_end.py"),
-        model="qwen3.6",
-        judge_model="qwen3.6/judge:2026-06-19",
+        model="deepseek-v4-flash",
+        judge_model="deepseek-v4-flash",
         scales="100K",
         sample=1,
         dry_run=True,
@@ -52,8 +52,8 @@ def test_runner_helpers_build_expected_env_and_command():
     )
     assert command[0].endswith("python.exe") or command[0].endswith("python")
     assert command[1].endswith("evaluate_beam_end_to_end.py")
-    assert command[command.index("--model") + 1] == "qwen3.6"
-    assert command[command.index("--judge-model") + 1] == "qwen3.6/judge:2026-06-19"
+    assert command[command.index("--model") + 1] == "deepseek-v4-flash"
+    assert command[command.index("--judge-model") + 1] == "deepseek-v4-flash"
     assert "--pure-recall" in command
     assert command[command.index("--start-index") + 1] == "4"
     assert command[command.index("--case-index") + 1] == "7"
@@ -68,7 +68,7 @@ def test_runner_fails_on_closed_local_ports():
     reranker_url = f"{embedding_url}/rerank"
 
     with pytest.raises(RuntimeError, match="embedding preflight failed"):
-        runner._preflight_embedding(embedding_url, "sentence-transformers/all-mpnet-base-v2", 768)
+        runner._preflight_embedding(embedding_url, "Alibaba-NLP/gte-modernbert-base", 768)
 
     with pytest.raises(RuntimeError, match="reranker preflight failed"):
         runner._preflight_reranker(reranker_url)

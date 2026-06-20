@@ -12,7 +12,7 @@ BEAM benchmark protocol:
 Published SOTA (BEAM 10M):
   Hindsight: 64.1%   Honcho: 40.6%   LIGHT: 26.6%   RAG: 24.9%
 
-LLM: Nvidia API (deepseek-ai/deepseek-v4-pro) via OpenAI-compatible endpoint.
+LLM: Nvidia API (deepseek-v4-flash) via OpenAI-compatible endpoint.
      Fast, cheap (~$2/M tokens), no local GPU needed.
 
 Usage:
@@ -592,7 +592,7 @@ if not OPENROUTER_API_KEY:
             break
 NVIDIA_API_KEY = os.environ.get("NVIDIA_API_KEY", "")
 OPENROUTER_BASE_URL = os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
-DEFAULT_MODEL = "gpt-4o"
+DEFAULT_MODEL = "deepseek-v4-flash"
 CONSOLIDATION_MODEL = "deepseek/deepseek-v4-flash"  # Cheap model for LLM-based consolidation summaries
 FALLBACK_MODELS = []  # Disabled -- fallback cascade burned $30 in credits
 DEFAULT_TOP_K = 10  # Memories to retrieve per question
@@ -616,6 +616,18 @@ def _env_truthy(name: str) -> bool:
     Everything else (including 0, false, no, off, empty, garbage) is False.
     """
     return os.environ.get(name, "").strip().lower() in _ENV_TRUTHY_VALUES
+
+
+def _benchmark_pure_recall_enabled() -> bool:
+    """Return the benchmark's default recall mode.
+
+    Pure recall is the default unless the operator explicitly disables it with
+    EDUMEM_BENCHMARK_PURE_RECALL=0/false/no/off.
+    """
+    raw = os.environ.get("EDUMEM_BENCHMARK_PURE_RECALL")
+    if raw is None:
+        return True
+    return _env_truthy("EDUMEM_BENCHMARK_PURE_RECALL")
 BENCHMARK_QUERIES_PER_CONV = 50  # Max probing questions per conversation
 RESULTS_FILE = PROJECT_ROOT / "results" / "beam_e2e_results.json"
 PAIRED_OUTCOMES_FILE = PROJECT_ROOT / "results" / "paired_outcomes.jsonl"
@@ -2495,14 +2507,14 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
                       return_memories: bool = False):
     """Retrieve memories and have LLM answer, with context strategy based on conversation size.
 
-    Set `EDUMEM_BENCHMARK_PURE_RECALL=1` to disable the per-ability
-    bypass paths (TR oracle, CR contradiction injection, IE/KU
-    context→value side-index) AND the always-included RECENT
-    CONVERSATION raw-message prompt section. Pure-recall mode forces
-    every answer through the full edumem retrieval pipeline so the
-    BEAM-recovery experiment can measure each arm's recall quality
-    without contamination from harness-side oracles. Default behavior
-    (env unset or '0') preserves the existing benchmark mode.
+    Pure recall is the default. Set `EDUMEM_BENCHMARK_PURE_RECALL=0`
+    to re-enable the per-ability bypass paths (TR oracle, CR
+    contradiction injection, IE/KU context→value side-index) AND the
+    always-included RECENT CONVERSATION raw-message prompt section.
+    Pure-recall mode forces every answer through the full edumem
+    retrieval pipeline so the BEAM-recovery experiment can measure
+    each arm's recall quality without contamination from harness-side
+    oracles.
 
     Returns:
         str when `return_memories=False` (default -- backward-compat).
@@ -2518,13 +2530,13 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
         if return_memories:
             return answer, (memories or [])
         return answer
-    # E7/E8/E9 gate: when set, the harness disables every shortcut that
+    # E7/E8/E9 gate: when enabled, the harness disables every shortcut that
     # would let the LLM produce an answer without going through
     # BeamMemory.recall(). The bypasses were useful for measuring
     # LLM-ceiling-with-help on isolated abilities; the BEAM-recovery
     # experiment instead needs to compare Arm A vs Arm B vs Arm C on
     # the recall surface itself.
-    _pure_recall = _env_truthy("EDUMEM_BENCHMARK_PURE_RECALL")
+    _pure_recall = _benchmark_pure_recall_enabled()
     routing_ability = None if _pure_recall else ability
     if diag is not None:
         embed_diag = diag.setdefault("embedding", {
@@ -4068,23 +4080,6 @@ def main():
     scales = [s.strip() for s in args.scales.split(",")]
     sample_size = args.sample if args.sample > 0 else None
 
-    # ---- Preflight: refuse to run with harness oracles unless explicitly opted in.
-    # The TR/CR/IE/KU bypasses and the always-included RECENT CONVERSATION block
-    # produce answers WITHOUT going through BeamMemory.recall(), contaminating any
-    # arm-vs-arm comparison. Pure-recall mode disables all four. See
-    # docs/benchmarking.md for the full rationale.
-    _pr_active = args.pure_recall or _env_truthy("EDUMEM_BENCHMARK_PURE_RECALL")
-    if not _pr_active and not args.allow_harness_oracles:
-        print(
-            "ERROR: harness oracles are active by default but contaminate arm-vs-arm "
-            "comparisons. Pass --pure-recall (recommended) or set "
-            "EDUMEM_BENCHMARK_PURE_RECALL=1 to disable them. If you genuinely want "
-            "the legacy bypass behavior (e.g., for a ceiling test or reproducing pre-"
-            "fix results), pass --allow-harness-oracles explicitly.",
-            file=sys.stderr,
-        )
-        sys.exit(2)
-
     # Snapshot the full benchmark-relevant env-var surface so results JSON captures
     # exactly which configuration the run executed under. A toggle the operator
     # forgot to set is a silent confound otherwise.
@@ -4135,12 +4130,20 @@ def main():
               "Use --case-index to target one exact conversation.")
     print(f"  Model: {args.model}")
     print(f"  Judge: {args.judge_model or args.model}")
-    # Mode resolution + banner. Pure-recall overrides full-context
-    # because the bypass that full-context provides (raw conversation
-    # straight to LLM) is exactly what pure-recall is meant to forbid.
-    _pure_recall_env = _env_truthy("EDUMEM_BENCHMARK_PURE_RECALL")
-    if args.pure_recall or _pure_recall_env:
+    # Mode resolution + banner. Pure recall is the default; explicit harness
+    # oracles or full-context are the opt-in paths.
+    _pure_recall_env = os.environ.get("EDUMEM_BENCHMARK_PURE_RECALL")
+    _pure_recall = _benchmark_pure_recall_enabled()
+    if args.allow_harness_oracles:
+        _pure_recall = False
+        os.environ["EDUMEM_BENCHMARK_PURE_RECALL"] = "0"
+    elif args.pure_recall:
+        _pure_recall = True
         os.environ["EDUMEM_BENCHMARK_PURE_RECALL"] = "1"
+    elif _pure_recall_env is None:
+        os.environ["EDUMEM_BENCHMARK_PURE_RECALL"] = "1"
+
+    if _pure_recall:
         if args.full_context or _env_truthy("FULL_CONTEXT_MODE"):
             # Conflict: warn loudly so the operator isn't surprised.
             print("  Mode: PURE-RECALL (overrides FULL_CONTEXT/--full-context -- "
@@ -4371,7 +4374,7 @@ def main():
                 "selected_conversation_ids": selected_conversation_ids,
                 "config": {
                     "env": _benchmark_env_snapshot,
-                    "pure_recall": _pr_active,
+                    "pure_recall": _pure_recall,
                     "allow_harness_oracles": args.allow_harness_oracles,
                     "full_context": args.full_context,
                     "use_cloud": args.use_cloud,

@@ -106,7 +106,7 @@ def main():
         str(EDUMEM_ROOT / ".venv/lib/python3.13/site-packages/tools/evaluate_beam_end_to_end.py"),
         "--scales", scales_arg,
         "--sample", sample_arg,
-        "--model", "qwen3.6",
+        "--model", "deepseek-v4-flash",
         "--pure-recall"
     ]
     t0 = time.time()

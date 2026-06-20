@@ -2,8 +2,8 @@
 """Official BEAM benchmark runner for edumem.
 
 This runner keeps the official BEAM invocation in one place, wires the shipped
-OpenVINO reranker and embedding endpoint, and fails fast when the expected
-local services are not healthy.
+reranker and embedding endpoint, and fails fast when the expected local
+services are not healthy.
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ from urllib import request
 WORKDIR = Path(__file__).resolve().parents[1]
 SHIPPED_RERANKER_URL = "http://localhost:3002/rerank"
 SHIPPED_EMBEDDING_BASE_URL = "http://localhost:3002"
-SHIPPED_EMBEDDING_MODEL = "sentence-transformers/all-mpnet-base-v2"
+SHIPPED_EMBEDDING_MODEL = "Alibaba-NLP/gte-modernbert-base"
 SHIPPED_EMBEDDING_DIM = "768"
 
 
@@ -178,11 +178,11 @@ def main() -> None:
         "--provider",
         default="nan",
         choices=["nan", "openai", "openrouter", "gemini"],
-        help="LLM provider: nan (local Qwen), openai (official ChatGPT), openrouter (OpenRouter), or gemini (Google)",
+        help="LLM provider: nan (DeepSeek via NAN), openai (official ChatGPT), openrouter (OpenRouter), or gemini (Google)",
     )
     parser.add_argument(
         "--model",
-        help="Answering model (defaults: qwen3.6 for nan, gpt-4o for openai, openai/gpt-4o for openrouter, gemini-2.5-flash for gemini)",
+        help="Answering model (defaults: deepseek-v4-flash for nan, gpt-4o for openai, openai/gpt-4o for openrouter, gemini-2.5-flash for gemini)",
     )
     parser.add_argument("--judge-model", help="Judge model (defaults to --model)")
     parser.add_argument("--api-key", help="Override API key for the selected provider")
@@ -223,7 +223,7 @@ def main() -> None:
             sys.exit(1)
     else:
         base_url = dot_env.get("CHAT_MODEL_BASE_URL", "https://api.nan.builders/v1")
-        model = args.model or "qwen3.6"
+        model = args.model or "deepseek-v4-flash"
         api_key = (
             args.api_key
             or os.getenv("NAN_API_KEY")

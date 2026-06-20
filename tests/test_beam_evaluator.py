@@ -26,6 +26,7 @@ from tools.evaluate_beam_end_to_end import (
     _update_embedding_diagnostic,
     _summarize_recall_memories,
     _write_json_sanitized,
+    _benchmark_pure_recall_enabled,
     apply_rejudge_judgment_records,
     compute_ability_scores,
     compute_partial_credit_overall,
@@ -110,6 +111,21 @@ def test_env_snapshot_printer_redacts_sensitive_values(capsys):
     assert "EDUMEM_LLM_API_KEY=***redacted***" in out
     assert "sessionToken=***redacted***" in out
     assert "safe=ok" in out
+
+
+def test_benchmark_pure_recall_defaults_on_and_can_be_disabled():
+    saved = os.environ.get("EDUMEM_BENCHMARK_PURE_RECALL")
+    try:
+        os.environ.pop("EDUMEM_BENCHMARK_PURE_RECALL", None)
+        assert _benchmark_pure_recall_enabled() is True
+
+        os.environ["EDUMEM_BENCHMARK_PURE_RECALL"] = "0"
+        assert _benchmark_pure_recall_enabled() is False
+    finally:
+        if saved is None:
+            os.environ.pop("EDUMEM_BENCHMARK_PURE_RECALL", None)
+        else:
+            os.environ["EDUMEM_BENCHMARK_PURE_RECALL"] = saved
 
 
 def test_json_writer_redacts_sensitive_values(tmp_path):
@@ -715,14 +731,14 @@ def test_shipped_inference_service_smoke():
     assert health["status"] == "ok"
 
     info = _json_request(f"{base_url}/info")
-    assert info["model_id"] == "sentence-transformers/all-mpnet-base-v2"
+    assert info["model_id"] == "Alibaba-NLP/gte-modernbert-base"
     assert info["dimension"] == 768
 
     embedding = _json_request(
         f"{base_url}/v1/embeddings",
-        {"input": ["beam smoke"], "model": "sentence-transformers/all-mpnet-base-v2"},
+        {"input": ["beam smoke"], "model": "Alibaba-NLP/gte-modernbert-base"},
     )
-    assert embedding["model"] == "sentence-transformers/all-mpnet-base-v2"
+    assert embedding["model"] == "Alibaba-NLP/gte-modernbert-base"
     assert len(embedding["data"][0]["embedding"]) == 768
 
     rerank = _json_request(

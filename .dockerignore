@@ -3,6 +3,10 @@ node_modules
 .git
 .hermes
 results
+benchmarks
+tests
+docs
+package.json
 data_hf/benchmark
 data_hf/chat_history_32k
 data_hf/data/chat_history_32k
