@@ -71,6 +71,14 @@ class TestEdumemCore:
         assert parse_relative_date("yesterday", base_date) == "2024-03-11"
         assert parse_relative_date("tomorrow", base_date) == "2024-03-13"
         assert parse_relative_date("today", base_date) == "2024-03-12"
+
+        # Yearless named dates inherit the explicit reference year.
+        assert parse_relative_date("March 29", base_date) == "2024-03-29"
+        assert parse_relative_date("March 29th", base_date) == "2024-03-29"
+        assert parse_relative_date("29th of March", base_date) == "2024-03-29"
+
+        # The harness sentinel is storage compatibility, not a date reference.
+        assert parse_relative_date("next Tuesday", "1970-01-01T00:00:00Z") is None
         
         # Test ISO date pattern fallback
         assert parse_relative_date("it happened on 2023-05-15", base_date) == "2023-05-15"

@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Optional, Any, Set, Union
 from pathlib import Path
+from edumem.core.query_mode import is_duration_query
 
 
 logger = logging.getLogger(__name__)
@@ -8471,10 +8472,49 @@ class BeamMemory:
 def parse_relative_date(content: str, base_timestamp_str: str):
     import re
     from datetime import datetime, timedelta
-    
+
+    content_lower = content.lower()
+    iso_match = re.search(r'\b(\d{4}-\d{2}-\d{2})\b', content)
+    if iso_match:
+        return iso_match.group(1)
+
+    month_names = (
+        "january|february|march|april|may|june|july|august|"
+        "september|october|november|december|"
+        "jan|feb|mar|apr|jun|jul|aug|sep|oct|nov|dec"
+    )
+    month_map = {
+        "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+        "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+    }
+    named_match = re.search(
+        rf'\b(?P<month>{month_names})[a-z]*\s+'
+        rf'(?P<day>\d{{1,2}})(?:st|nd|rd|th)?'
+        rf'(?:,?\s*(?P<year>\d{{4}}))?\b',
+        content,
+        re.IGNORECASE,
+    )
+    day_first_match = re.search(
+        rf'\b(?P<day>\d{{1,2}})(?:st|nd|rd|th)?(?:\s+of)?\s+'
+        rf'(?P<month>{month_names})[a-z]*'
+        rf'(?:,?\s*(?P<year>\d{{4}}))?\b',
+        content,
+        re.IGNORECASE,
+    )
+    explicit_named = named_match or day_first_match
+    if explicit_named and explicit_named.group("year"):
+        try:
+            return datetime(
+                int(explicit_named.group("year")),
+                month_map[explicit_named.group("month")[:3].lower()],
+                int(explicit_named.group("day")),
+            ).strftime("%Y-%m-%d")
+        except ValueError:
+            return None
+
     if not base_timestamp_str:
         return None
-        
+
     try:
         if 'T' in base_timestamp_str:
             base_date = datetime.strptime(base_timestamp_str.split('T')[0], "%Y-%m-%d")
@@ -8482,8 +8522,21 @@ def parse_relative_date(content: str, base_timestamp_str: str):
             base_date = datetime.strptime(base_timestamp_str, "%Y-%m-%d")
     except Exception:
         return None
-        
-    content_lower = content.lower()
+
+    # The benchmark's 1970 timestamp is a compatibility sentinel, not a
+    # trustworthy calendar reference for relative or yearless expressions.
+    if base_date.year == 1970:
+        return None
+
+    if explicit_named:
+        try:
+            return datetime(
+                base_date.year,
+                month_map[explicit_named.group("month")[:3].lower()],
+                int(explicit_named.group("day")),
+            ).strftime("%Y-%m-%d")
+        except ValueError:
+            return None
     
     weekdays = {
         "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
@@ -8569,21 +8622,12 @@ def parse_relative_date(content: str, base_timestamp_str: str):
     if "last winter" in content_lower:
         return f"{base_date.year - 1}-01-01"
 
-    iso_match = re.search(r'\b(\d{4}-\d{2}-\d{2})\b', content)
-    if iso_match:
-        return iso_match.group(1)
-
     return None
 
 def generate_derived_temporal_facts(mems, query: str):
-    import re
     from datetime import datetime
-    
-    query_lower = query.lower()
-    temporal_cues = ["how long", "when", "duration", "before", "after", "since", "between", "days", "weeks", "months", "years", "time"]
-    is_temporal = any(cue in query_lower for cue in temporal_cues) or re.search(r'\b\d{4}\b', query_lower)
-    
-    if not is_temporal:
+
+    if not is_duration_query(query):
         return []
         
     dated_mems = []

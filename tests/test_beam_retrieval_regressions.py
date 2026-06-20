@@ -58,6 +58,129 @@ def test_stated_duration_questions_do_not_enable_negation_recall(tmp_path, monke
         beam.conn.close()
 
 
+def test_point_in_time_when_question_does_not_generate_date_pair_memories(
+    tmp_path,
+    monkeypatch,
+):
+    """Regression for BEAM 100K conversation 1, q6."""
+    monkeypatch.setenv("EDUMEM_NO_EMBEDDINGS", "1")
+    beam = _make_beam(tmp_path)
+    try:
+        beam.remember_batch(
+            [
+                {
+                    "content": (
+                        "I'm working on a project with scheduled two-week sprints, "
+                        "and the first sprint ends on March 29, focusing on user "
+                        "registration and login."
+                    ),
+                    "source": "beam_user",
+                    "occurred_at": "2024-03-29",
+                },
+                {
+                    "content": (
+                        "I'm working on sprint 2 which targets analytics by April 19, "
+                        "and I've already completed sprint 1 on March 29 with user auth "
+                        "and basic transaction CRUD, so I need to implement analytics "
+                        "features, can you help me with that?"
+                    ),
+                    "source": "beam_user",
+                    "occurred_at": "2024-04-19",
+                },
+            ],
+        )
+
+        memories = beam.recall("When does my first sprint end?", top_k=10)
+
+        assert any("March 29" in memory["content"] for memory in memories)
+        assert not any(
+            memory.get("source") == "derived_temporal" for memory in memories
+        )
+    finally:
+        beam.conn.close()
+
+
+def test_q6_time_anchor_normalizes_and_retrieves_yearless_sprint_date(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("EDUMEM_NO_EMBEDDINGS", "1")
+    beam = _make_beam(tmp_path)
+    try:
+        ingest_conversation(
+            beam,
+            [
+                {
+                    "role": "user",
+                    "time_anchor": "March-15-2024",
+                    "content": (
+                        "I'm working on a project with a Time Anchor of March 15, "
+                        "2024, and I need to plan my tasks accordingly."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        "I'm working on a project with scheduled two-week sprints, "
+                        "and the first sprint ends on March 29, focusing on user "
+                        "registration and login."
+                    ),
+                },
+            ],
+        )
+
+        stored = beam.conn.execute(
+            "SELECT content, occurred_at, recorded_at FROM working_memory "
+            "WHERE message_index = 1"
+        ).fetchone()
+        assert stored["recorded_at"].startswith("2024-03-15")
+        assert stored["occurred_at"] == "2024-03-29"
+        assert "first sprint ends on March 29" in stored["content"]
+        assert "[ISO_DATES: 2024-03-29]" in stored["content"]
+        assert "datetok20240329" in stored["content"]
+
+        memories = beam.recall("When does my first sprint end?", top_k=10)
+        assert any(
+            memory.get("occurred_at") == "2024-03-29"
+            and "first sprint ends on March 29" in memory["content"]
+            for memory in memories
+        )
+    finally:
+        beam.conn.close()
+
+
+def test_time_anchor_normalizes_relative_weekday_during_real_ingestion(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("EDUMEM_NO_EMBEDDINGS", "1")
+    beam = _make_beam(tmp_path)
+    try:
+        ingest_conversation(
+            beam,
+            [
+                {
+                    "role": "user",
+                    "time_anchor": "March-15-2024",
+                    "content": "The planning reference date is March 15, 2024.",
+                },
+                {
+                    "role": "user",
+                    "content": "I will review the sprint backlog next Tuesday.",
+                },
+            ],
+        )
+
+        stored = beam.conn.execute(
+            "SELECT content, occurred_at FROM working_memory WHERE message_index = 1"
+        ).fetchone()
+        assert stored["occurred_at"] == "2024-03-19"
+        assert "[ISO_DATES: 2024-03-19]" in stored["content"]
+        assert "datetok20240319" in stored["content"]
+    finally:
+        beam.conn.close()
+
+
 @pytest.mark.parametrize(
     "question, expected_mr",
     [

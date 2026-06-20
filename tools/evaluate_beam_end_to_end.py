@@ -56,7 +56,7 @@ import urllib.request
 import urllib.error
 import numpy as np
 
-from edumem.core.beam import BeamMemory, init_beam, _embeddings, _vec_available, _vec_insert, _fts_search_working, _generate_id
+from edumem.core.beam import BeamMemory, init_beam, _embeddings, _vec_available, _vec_insert, _fts_search_working, _generate_id, parse_relative_date
 from edumem.core.query_mode import build_system_prompt, is_temporal_query, needs_second_pass, is_ordering_query, is_duration_query, is_aggregation_query, is_date_interval_query, is_stated_duration_query, is_summarization_query
 
 
@@ -246,6 +246,19 @@ def _extract_shared_date_spans(text: str) -> list[dict]:
             continue
 
     return spans
+
+
+def _normalize_time_anchor(value) -> str | None:
+    """Return a dataset time anchor as an ISO date, or None when invalid."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    raw = value.strip()
+    for fmt in ("%B-%d-%Y", "%b-%d-%Y", "%Y-%m-%d", "%B %d, %Y", "%b %d, %Y"):
+        try:
+            return datetime.strptime(raw, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    return None
 
 
 def _query_wants_if_pf(question: str) -> bool:
@@ -898,11 +911,23 @@ def load_beam_dataset(scales: list[str], max_conversations: int = None) -> dict:
                             if isinstance(block, list):
                                 for msg in block:
                                     if isinstance(msg, dict):
-                                        all_messages.append({
+                                        loaded_message = {
                                             "role": msg.get("role", "unknown"),
                                             "content": msg.get("content", ""),
                                             "index": len(all_messages),
-                                        })
+                                        }
+                                        if msg.get("time_anchor"):
+                                            loaded_message["time_anchor"] = msg["time_anchor"]
+                                        all_messages.append(loaded_message)
+                            elif isinstance(block, dict):
+                                loaded_message = {
+                                    "role": block.get("role", "unknown"),
+                                    "content": block.get("content", ""),
+                                    "index": len(all_messages),
+                                }
+                                if block.get("time_anchor"):
+                                    loaded_message["time_anchor"] = block["time_anchor"]
+                                all_messages.append(loaded_message)
 
                     conversations.append({
                         "id": sample.get("conversation_id", str(i)),
@@ -957,18 +982,24 @@ def load_beam_dataset(scales: list[str], max_conversations: int = None) -> dict:
                         if isinstance(block, list):
                             for msg in block:
                                 if isinstance(msg, dict):
-                                    messages.append({
+                                    loaded_message = {
                                         "role": msg.get("role", "unknown"),
                                         "content": msg.get("content", ""),
                                         "index": len(messages),
-                                    })
+                                    }
+                                    if msg.get("time_anchor"):
+                                        loaded_message["time_anchor"] = msg["time_anchor"]
+                                    messages.append(loaded_message)
                         elif isinstance(block, dict):
                             # Flat format: chat is a list of dicts directly
-                            messages.append({
+                            loaded_message = {
                                 "role": block.get("role", "unknown"),
                                 "content": block.get("content", ""),
                                 "index": len(messages),
-                            })
+                            }
+                            if block.get("time_anchor"):
+                                loaded_message["time_anchor"] = block["time_anchor"]
+                            messages.append(loaded_message)
 
                     conversations.append({
                         "id": sample.get("conversation_id", str(i)),
@@ -1189,6 +1220,7 @@ def ingest_conversation(beam: BeamMemory, messages: list[dict], diag: dict | Non
         context_facts = beam._context_facts
 
     BATCH_SIZE = 500
+    current_time_anchor = None
 
     for batch_start in range(0, len(messages), BATCH_SIZE):
         batch_msgs = messages[batch_start:batch_start + BATCH_SIZE]
@@ -1198,18 +1230,31 @@ def ingest_conversation(beam: BeamMemory, messages: list[dict], diag: dict | Non
             raw_content = msg.get("content", "")
             if not raw_content.strip():
                 continue
+            normalized_anchor = _normalize_time_anchor(msg.get("time_anchor"))
+            if normalized_anchor:
+                current_time_anchor = normalized_anchor
+            recorded_at = (
+                f"{current_time_anchor}T00:00:00Z"
+                if current_time_anchor
+                else msg.get("timestamp") or "1970-01-01T00:00:00Z"
+            )
+            occurred_at = parse_relative_date(raw_content, current_time_anchor)
             content = raw_content
             # Temporal tag injection: bake date strings into content so
-            # FTS5 can find them during recall. Preserve raw date text
-            # and only generate datetok tokens for explicit ISO dates.
+            # FTS5 can find them during recall. Preserve raw date text while
+            # adding separately-derived canonical dates when an anchor exists.
             import re as _re_tags
             date_spans = _extract_shared_date_spans(content)
             if date_spans:
                 raw_dates = [span["raw"] for span in date_spans]
                 content = f"{content} [DATES: {', '.join(raw_dates)}]"
-                datetok_strs = [f"datetok{span['iso'].replace('-', '')}" for span in date_spans if span.get("iso")]
-                if datetok_strs:
-                    content = f"{content} datetokens: {' '.join(datetok_strs)}"
+            canonical_dates = [span["iso"] for span in date_spans if span.get("iso")]
+            if occurred_at and occurred_at not in canonical_dates:
+                canonical_dates.append(occurred_at)
+            if canonical_dates:
+                content = f"{content} [ISO_DATES: {', '.join(canonical_dates)}]"
+                datetok_strs = [f"datetok{date.replace('-', '')}" for date in canonical_dates]
+                content = f"{content} datetokens: {' '.join(datetok_strs)}"
             durations = _re_tags.findall(r'\b\d+\s(?:days|weeks|months|years)\b', content, _re_tags.IGNORECASE)
             if durations:
                 content = f"{content} [DURATIONS: {', '.join(durations)}]"
@@ -1229,7 +1274,8 @@ def ingest_conversation(beam: BeamMemory, messages: list[dict], diag: dict | Non
                 "content": content,
                 "source": f"beam_{msg.get('role', 'unknown')}",
                 "importance": 0.5,
-                "timestamp": msg.get("timestamp") or "1970-01-01T00:00:00Z",
+                "timestamp": recorded_at,
+                "occurred_at": occurred_at,
                 "message_index": batch_start + i,
             })
             stats["total_chars"] += len(content)
