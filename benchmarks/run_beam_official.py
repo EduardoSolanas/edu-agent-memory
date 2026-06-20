@@ -123,6 +123,7 @@ def _build_runner_env(
             "EDUMEM_EMBEDDING_API_URL": embedding_base_url,
             "EDUMEM_EMBEDDING_MODEL": embedding_model,
             "EDUMEM_EMBEDDING_DIM": str(embedding_dim),
+            "PYTHONUNBUFFERED": "1",
             "PYTHONPATH": f"{WORKDIR}:{WORKDIR / 'benchmarks'}",
         }
     )
@@ -142,6 +143,7 @@ def _build_evaluator_command(
 ) -> list[str]:
     cmd = [
         sys.executable,
+        "-u",
         str(script_path),
         "--scales",
         scales,

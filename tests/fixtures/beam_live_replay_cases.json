@@ -1,0 +1,52 @@
+{
+  "cases": [
+    {
+      "qid": "3:q6",
+      "ability": "IE",
+      "question": "How long did I say the entire project is expected to take?",
+      "context_evidence": [
+        "The entire project is expected to take 3 sprints of 2 weeks each, totaling 6 weeks."
+      ],
+      "expected_terms": ["6 weeks"],
+      "rubric": [
+        "The answer should state that the entire project is expected to take 6 weeks."
+      ]
+    },
+    {
+      "qid": "3:q10",
+      "ability": "KU",
+      "question": "What is the deadline for completing the first sprint focused on the basic layout and navigation?",
+      "context_evidence": [
+        "The deadline for completing the first sprint focused on the basic layout and navigation is April 5, 2024."
+      ],
+      "expected_terms": ["April 5, 2024"],
+      "rubric": [
+        "The answer should state that the deadline is April 5, 2024."
+      ]
+    },
+    {
+      "qid": "3:q11",
+      "ability": "KU",
+      "question": "How many project cards are included in my gallery using Bootstrap 5.3.0?",
+      "context_evidence": [
+        "My gallery using Bootstrap 5.3.0 includes 10 project cards."
+      ],
+      "expected_terms": ["10"],
+      "rubric": [
+        "The answer should state that the gallery includes 10 project cards."
+      ]
+    },
+    {
+      "qid": "3:q19",
+      "ability": "TR",
+      "question": "How many days passed between when I planned the peer review and when I completed the final code review for my project?",
+      "context_evidence": [
+        "I planned the peer review on April 2, 2024 and completed the final code review on May 3, 2024."
+      ],
+      "expected_terms": ["31 days"],
+      "rubric": [
+        "The answer should state that 31 days passed between April 2, 2024 and May 3, 2024."
+      ]
+    }
+  ]
+}

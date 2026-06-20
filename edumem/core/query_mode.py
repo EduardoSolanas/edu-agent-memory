@@ -32,19 +32,44 @@ _DURATION_KEYWORDS = (
     "how old", "between",  # broad, but base prompt safely handles any misroute
 )
 
+_STATED_DURATION_KEYWORDS = (
+    "did i say", "did we say", "i said", "we said", "i mentioned", "we mentioned",
+    "expected to take", "supposed to take", "planned to take", "estimated to take",
+    "would take", "would last", "would need", "was expected to take",
+    "is expected to take", "was supposed to take", "is supposed to take",
+    "what duration did i", "what duration did we",
+)
+
+_DATE_INTERVAL_KEYWORDS = (
+    "passed between",
+    "elapsed between",
+    "between when",
+    "between the time",
+    "from when",
+    "since when",
+    "from the time",
+    "start and the end",
+    "beginning and the end",
+)
+
 _KU_KEYWORDS = (
     "current", "latest", "updated", "changed to", "switched to",
     "now using", "most recent",
 )
 
 _MR_KEYWORDS = (
-    "across", "combining", "together", "relationship between",
+    "across", "combining", "combined", "together", "relationship between",
     "connect", "related to",
 )
 
 _SUM_KEYWORDS = (
     "summarize", "summary", "overview", "main topics",
     "key themes", "recap", "highlights", "gist",
+)
+
+_CR_KEYWORDS = (
+    "contradict", "contradiction", "conflict", "conflicting",
+    "both said", "inconsistent", "disagree", "disagreement",
 )
 
 _AGGREGATION_KEYWORDS = (
@@ -60,9 +85,42 @@ def is_ordering_query(question: str) -> bool:
     return any(k in q for k in _ORDERING_KEYWORDS)
 
 
+def is_stated_duration_query(question: str) -> bool:
+    q = question.lower()
+    return any(k in q for k in _STATED_DURATION_KEYWORDS)
+
+
+def _has_explicit_date_text(q: str) -> bool:
+    import re
+
+    if re.search(r"\b\d{4}-\d{2}-\d{2}\b", q):
+        return True
+    month_names = (
+        "january|february|march|april|may|june|july|august|"
+        "september|october|november|december|"
+        "jan|feb|mar|apr|jun|jul|aug|sep|oct|nov|dec"
+    )
+    if re.search(rf"\b(?:{month_names})[a-z]*\s+\d{{1,2}}(?:st|nd|rd|th)?(?:,?\s*\d{{4}})?\b", q):
+        return True
+    return False
+
+
+def _has_event_pair_interval_language(q: str) -> bool:
+    return any(k in q for k in _DATE_INTERVAL_KEYWORDS)
+
+
 def is_duration_query(question: str) -> bool:
     q = question.lower()
-    return any(k in q for k in _DURATION_KEYWORDS)
+    return not is_stated_duration_query(q) and any(k in q for k in _DURATION_KEYWORDS)
+
+
+def is_date_interval_query(question: str) -> bool:
+    q = question.lower()
+    if is_stated_duration_query(q) or is_ordering_query(q):
+        return False
+    if not is_duration_query(q):
+        return False
+    return _has_explicit_date_text(q) or _has_event_pair_interval_language(q)
 
 
 def is_knowledge_update_query(question: str) -> bool:
@@ -85,8 +143,14 @@ def is_aggregation_query(question: str) -> bool:
     return any(k in q for k in _AGGREGATION_KEYWORDS)
 
 
+def is_contradiction_query(question: str) -> bool:
+    q = question.lower()
+    return any(k in q for k in _CR_KEYWORDS)
+
+
 def is_temporal_query(question: str) -> bool:
     return is_ordering_query(question) or is_duration_query(question)
+
 
 def needs_second_pass(question: str) -> bool:
     """Ordering/duration questions benefit from gap-analysis re-retrieval."""
@@ -99,8 +163,8 @@ _BASE_PROMPT = """You are a precise memory assistant. Answer the question using 
 
 Reason through these internally, then output only the final answer:
 1. FACTS — gather every relevant fact from the context (dates, numbers, names, events, statements) and note when each was said.
-2. CONFLICTS — if the context contains statements that contradict each other about the same thing, you MUST surface BOTH explicitly. Start your answer with 'The conversation contains contradictory information:' and present both sides. Do NOT silently pick one side.
-3. CHANGE OVER TIME — if a fact, preference, or instruction was updated, the most recent value is the current answer.
+2. CHANGE OVER TIME — if a fact, preference, or instruction was updated, the most recent value is the current answer. If the later statement is clearly an update or correction of the earlier one, treat it as a CHANGE OVER TIME, not a conflict.
+3. CONFLICTS — if the context contains statements that contradict each other about the SAME fact at the SAME point in time and genuinely disagree, you MUST surface BOTH explicitly. Start your answer with 'The conversation contains contradictory information:' and present both sides. Do NOT silently pick one side. However, do NOT flag simple updates or value changes as conflicts — only flag genuine disagreements where two statements cannot both be true at the same moment.
 4. ABSENCE — if the specific topic of the question does not appear anywhere in the context, say clearly that the conversation does not contain that information. Never guess or use outside knowledge.
 5. ANSWER — give a direct, complete answer grounded only in the context.
 
@@ -110,18 +174,31 @@ Output the final answer only: no step labels, no JSON, no preamble, no commentar
 
 _ORDERING_MODIFIER = """
 
-ORDERING: This question asks for the order in which topics or events were DISCUSSED in the conversation — the order they were mentioned, NOT when they happened in real life. CRITICAL: Each memory has a [MSGIDX:N] tag showing its message index (position in the conversation). Order by the LOWEST MSGIDX where each topic FIRST appears, NOT by real-world dates. If topic A first appears at MSGIDX:5 and topic B at MSGIDX:20, A comes before B regardless of chronological dates. List them one item per line as short clauses, earliest first. No preamble."""
+ORDERING: This question asks for the order in which topics or events were DISCUSSED in the conversation — the order they were mentioned, NOT when they happened in real life. CRITICAL: Each memory has a [MSGIDX:N] tag showing its message index (position in the conversation). Order by the LOWEST MSGIDX where each topic FIRST appears, NOT by real-world dates. If topic A first appears at MSGIDX:5 and topic B at MSGIDX:20, A comes before B regardless of chronological dates.
+
+IMPORTANT: Use the ACTUAL topic descriptions from the context, not your own abstractions. Quote or closely paraphrase what was actually discussed at each point. Do NOT invent category labels or merge multiple distinct topics into one abstract summary.
+
+List them one item per line as short clauses, earliest first. No preamble."""
 
 _DURATION_MODIFIER = """
 
-DURATION: This question asks for an amount of elapsed time, or which event came earlier/later. Identify the two absolute dates from the context, compute the difference, and state the result explicitly (e.g. "2024-03-12 to 2024-06-20 = 100 days"). Compute strictly from dates present in the context; do not estimate. End with the exact value the question asks for."""
+DURATION: This question asks for an amount of elapsed time between two specific events.
+Step 1: Identify the TWO specific events mentioned in the question.
+Step 2: For each event, find its date by reading the surrounding context — match the event description to the [MSGIDX:N] entry that discusses that specific event. Do NOT pick dates from unrelated events or different phases of the same topic.
+Step 3: compute the difference between the two dates and state it explicitly (e.g. "2024-04-02 to 2024-05-03 = 31 days").
+Compute strictly from dates present in the context; do not estimate. End with the exact value the question asks for."""
+
+_STATED_DURATION_MODIFIER = """
+
+STATED DURATION: This question asks for a duration that was explicitly stated in the conversation. Answer that stated duration directly from the context. Do not calculate elapsed time from dates, and do not replace the stated amount with a computed interval. If the context contains multiple durations, choose the one that directly answers the question."""
 
 _KU_MODIFIER = """
 
 KNOWLEDGE UPDATE: This question asks about the CURRENT state of something that may have changed.
 If the context shows multiple values for the same thing at different times, the MOST RECENT value
-is the correct answer. State the current value directly. If you can identify when it changed,
-mention the change briefly (e.g., "Previously X, now Y as of [date]")."""
+is the correct answer. Higher [MSGIDX:N] numbers mean the statement was made later in the conversation —
+always prefer the value from the highest MSGIDX. State the current value directly. If you can identify
+when it changed, mention the change briefly (e.g., "Previously X, now Y as of [date]")."""
 
 _MR_MODIFIER = """
 
@@ -135,11 +212,18 @@ ALL distinct items you found and then count them."""
 
 _SUM_MODIFIER = """
 
-SUMMARIZATION: This question asks for a broad summary of the conversation topics.
-Cover ALL major themes and topics discussed, not just the most recent ones.
-Structure your answer as a comprehensive overview organized by topic.
-For each topic, mention key details (names, technologies, decisions, outcomes).
-Aim for completeness — missing a topic is worse than being slightly verbose."""
+SUMMARIZATION: This question asks for a summary of the conversation.
+If the question mentions progression, development, or resolution "over time", structure your answer as a CHRONOLOGICAL NARRATIVE — describe what happened first, what came next, and how things evolved. Use [MSGIDX:N] tags to determine the order. Do NOT organize by topic/category — organize by TIME.
+If the question asks for a general overview without temporal emphasis, cover ALL major themes and topics from the context. Structure as a comprehensive overview. Aim for completeness over brevity."""
+
+_CR_MODIFIER = """
+
+CONTRADICTION RESOLUTION: This question involves potentially contradictory statements.
+Present BOTH sides of the contradiction clearly with their [MSGIDX:N] references.
+Then RESOLVE the contradiction: the statement with the higher [MSGIDX:N] is more recent
+and should be treated as the current truth, unless the earlier statement was explicitly
+confirmed or the later statement was hypothetical. Always end with a clear resolution
+stating which value is current and why."""
 
 
 def build_system_prompt(question: str) -> str:
@@ -147,8 +231,12 @@ def build_system_prompt(question: str) -> str:
     prompt = _BASE_PROMPT
     if is_ordering_query(question):
         prompt += _ORDERING_MODIFIER
-    if is_duration_query(question):
+    if is_stated_duration_query(question):
+        prompt += _STATED_DURATION_MODIFIER
+    elif is_duration_query(question):
         prompt += _DURATION_MODIFIER
+    if is_contradiction_query(question):
+        prompt += _CR_MODIFIER
     if is_knowledge_update_query(question):
         prompt += _KU_MODIFIER
     if is_multi_hop_query(question):

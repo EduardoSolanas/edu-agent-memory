@@ -4790,22 +4790,31 @@ class BeamMemory:
             for key, versions in by_key.items():
                 versions.sort(key=lambda x: x.get('version_id', 0), reverse=True)
                 newest = versions[0]
+                history = []
                 if len(versions) > 1:
-                    # Build a compact evolution chain
-                    prevs = [v['value'] for v in versions[1:]]
-                    newest['evolution'] = ' -> '.join(reversed(prevs)) + f" -> {newest['value']}"
+                    # Preserve the full prior chain in metadata without
+                    # surfacing it in answer-facing context. This lets the
+                    # caller inspect how the fact evolved while keeping the
+                    # final prompt focused on the current value only.
+                    for prior in reversed(versions[1:]):
+                        history.append({
+                            'type': prior.get('type'),
+                            'key': prior.get('key'),
+                            'value': prior.get('value'),
+                            'context': prior.get('context'),
+                            'previous_value': prior.get('previous_value'),
+                            'updated_msg_idx': prior.get('updated_msg_idx'),
+                            'version_id': prior.get('version_id', 0),
+                            'source_memory_id': prior.get('source_memory_id'),
+                        })
+                newest['history'] = history
                 latest.append(newest)
             # Sort by version_id descending so recently-updated facts are prominent
             latest.sort(key=lambda x: x.get('version_id', 0), reverse=True)
 
             ctx_lines = []
             for f in latest[:top_k]:
-                line = f"[Fact {f['type']}] {f['key']}: {f['value']}"
-                if f.get('evolution'):
-                    line += f" (evolved: {f['evolution']})"
-                elif f.get('previous_value') and f.get('version_id', 0) > 0:
-                    line += f" (was: {f['previous_value']}, updated at msg_idx {f.get('updated_msg_idx', '?')})"
-                ctx_lines.append(line)
+                ctx_lines.append(f"[Fact {f['type']}] {f['key']}: {f['value']}")
             return {
                 "context": "\n".join(ctx_lines),
                 "facts": latest[:top_k],

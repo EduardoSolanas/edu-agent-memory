@@ -38,6 +38,7 @@ import os
 import sys
 import tempfile
 import time
+import subprocess
 from copy import deepcopy
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
@@ -56,13 +57,38 @@ import urllib.error
 import numpy as np
 
 from edumem.core.beam import BeamMemory, init_beam, _embeddings, _vec_available, _vec_insert, _fts_search_working, _generate_id
-from edumem.core.query_mode import build_system_prompt, is_temporal_query, needs_second_pass, is_ordering_query, is_duration_query, is_aggregation_query
+from edumem.core.query_mode import build_system_prompt, is_temporal_query, needs_second_pass, is_ordering_query, is_duration_query, is_aggregation_query, is_date_interval_query, is_stated_duration_query, is_summarization_query
 
 
 def _is_calculator_question(question: str) -> bool:
     """True only for DURATION questions (compute a number). Ordering questions
     must NOT use the calculator prompt — they need an ordered list, not a number."""
-    return is_duration_query(question) and not is_ordering_query(question)
+    return is_date_interval_query(question)
+
+
+def _wants_broad_aggregation_retrieval(question: str) -> bool:
+    """Return True only when aggregation language is explicitly broad."""
+    q = (question or "").lower()
+    if not is_aggregation_query(question):
+        return False
+    broad_markers = (
+        "combination",
+        "combined",
+        "combine",
+        "across",
+        "total",
+        "altogether",
+        "in total",
+    )
+    return any(marker in q for marker in broad_markers)
+
+
+def _wants_negation_retrieval(question: str) -> bool:
+    """Return True only when the question is actually asking about negation."""
+    q = (question or "").lower()
+    if is_duration_query(question) or is_stated_duration_query(question):
+        return False
+    return any(w in q for w in ["have i", "did i", "do i", "am i", "has"]) or "contradict" in q or "conflict" in q
 
 
 def _tr_python_answer_is_trustworthy(py_answer: str, timeline_size: int,
@@ -238,6 +264,7 @@ def _query_wants_if_pf(question: str) -> bool:
         r'\bshould\b',
         r'\balways\b',
         r'\bnever\b',
+        r'\bhelp me\s+(?:set up|build|create|organize)\b',
     )
     return any(re.search(p, q) for p in patterns)
 
@@ -521,6 +548,60 @@ def _build_paired_outcome_rows(conv_result: dict, config_id: str, run_started_at
     return paired_rows
 
 
+def _build_question_validation_rows(conv_result: dict, config_id: str, run_started_at: str) -> list[dict]:
+    """Build per-question validation rows with full prompts, answers, and judge payloads."""
+    validation_rows = []
+    for question in conv_result.get("results", []):
+        try:
+            score = float(question.get("score", 0.0))
+        except (TypeError, ValueError):
+            score = 0.0
+
+        is_skipped = _is_skipped_question_result(question)
+        validation_rows.append({
+            "config_id": config_id,
+            "run_started_at": run_started_at,
+            "scale": conv_result.get("scale"),
+            "conversation_id": conv_result.get("conversation_id"),
+            "qid": question.get("qid"),
+            "ability": question.get("ability"),
+            "validation_status": "skipped" if is_skipped else "evaluated",
+            "validation_passed": None if is_skipped else score >= 0.5,
+            "skip_reason": question.get("skip_reason"),
+            "score": question.get("score"),
+            "official_score": question.get("official_score"),
+            "partial_credit_score": question.get("partial_credit_score"),
+            "parse_status": question.get("parse_status"),
+            "judge_status": question.get("judge_status"),
+            "judge_failure_class": question.get("judge_failure_class"),
+            "judge_failure_message": question.get("judge_failure_message", ""),
+            "question": question.get("question"),
+            "question_full": question.get("question_full"),
+            "ideal_answer": question.get("ideal_answer"),
+            "ideal_answer_full": question.get("ideal_answer_full"),
+            "ai_answer": question.get("ai_answer"),
+            "ai_answer_full": question.get("ai_answer_full"),
+            "ai_answer_excerpt": question.get("ai_answer_excerpt"),
+            "assessment": question.get("assessment"),
+            "judge_assessment": question.get("judge_assessment"),
+            "answer_model": question.get("answer_model"),
+            "judge_model": question.get("judge_model"),
+            "answer_time_ms": question.get("answer_time_ms"),
+            "judge_time_ms": question.get("judge_time_ms"),
+            "judge_finish_reason": question.get("judge_finish_reason"),
+            "judge_response_had_content": question.get("judge_response_had_content"),
+            "judge_retry_count": question.get("judge_retry_count"),
+            "judge_raw_response": question.get("judge_raw_response"),
+            "judge_raw_result": question.get("judge_raw_result"),
+            "judge_raw_payload": question.get("judge_raw_payload"),
+            "retrieval_diagnostics": question.get("retrieval_diagnostics", {}),
+            "answer_api_diagnostics": question.get("answer_api_diagnostics", {}),
+            "nuggets": question.get("nuggets", []),
+            "recall_provenance": question.get("recall_provenance", {}),
+        })
+    return validation_rows
+
+
 def _finalize_reranker_run_health(preflight: dict | None, call_diag: dict | None = None) -> dict:
     """Combine reranker preflight state with call-time health."""
     finalized = deepcopy(call_diag or {})
@@ -631,6 +712,7 @@ def _benchmark_pure_recall_enabled() -> bool:
 BENCHMARK_QUERIES_PER_CONV = 50  # Max probing questions per conversation
 RESULTS_FILE = PROJECT_ROOT / "results" / "beam_e2e_results.json"
 PAIRED_OUTCOMES_FILE = PROJECT_ROOT / "results" / "paired_outcomes.jsonl"
+QUESTION_VALIDATIONS_FILE = PROJECT_ROOT / "results" / "beam_question_validations.jsonl"
 
 # Memory abilities tested by BEAM (10 dimensions)
 BEAM_ABILITIES = [
@@ -979,42 +1061,40 @@ def _extract_facts(content: str, source: str = "unknown") -> list[dict]:
     return facts[:20]  # Cap per message
 
 
-def _detect_instruction(content: str) -> bool:
-    """Detect if content contains a user instruction about response format."""
-    import re
-    q = content.lower()
-    patterns = [
-        r'\balways\b.*\bwhen\b',
-        r'\bnever\b.*\bwhen\b',
-        r'\bmake sure\b.*\bformat\b',
-        r'\bformat\b.*\bas\b',
-        r'\binclude\b.*\bwhen\b',
-        r'\buse\b.*\bformat\b',
-        r'\bprovide\b.*\bwith\b.*\bevery\b',
-        r'\balways\b.*\binclude\b',
-        r'\balways\b.*\bformat\b',
-        r'\balways\b.*\bprovide\b',
-        r'\balways\b.*\buse\b',
-    ]
-    return any(re.search(p, q) for p in patterns)
+def _classify_message_llm(llm, content: str) -> set:
+    """Classify a message using LLM into INSTRUCTION, PREFERENCE, or FACT tags."""
+    if llm is None:
+        return set()
+
+    prompt = f"""Classify this user message. Reply with one or more labels (comma-separated): INSTRUCTION, PREFERENCE, or FACT.
+
+INSTRUCTION = user telling the system what to do, how to behave, formatting rules, technical requirements, imperatives
+PREFERENCE = user expressing likes, dislikes, style choices, priorities, personal taste
+FACT = plain information sharing, no directive intent
+
+Message: {content}
+
+Labels:"""
+
+    try:
+        response = llm.chat([{"role": "user", "content": prompt}], temperature=0.0, max_tokens=32)
+        if not response or "[LLM_ERROR" in response:
+            return set()
+
+        # Parse response: extract INSTRUCTION, PREFERENCE, FACT tags
+        response_upper = response.upper()
+        tags = set()
+        if "INSTRUCTION" in response_upper:
+            tags.add("INSTRUCTION")
+        if "PREFERENCE" in response_upper:
+            tags.add("PREFERENCE")
+        if "FACT" in response_upper:
+            tags.add("FACT")
+        return tags
+    except Exception:
+        return set()
 
 
-def _detect_preference(content: str) -> bool:
-    """Detect if content contains a user preference."""
-    import re
-    q = content.lower()
-    patterns = [
-        r'\bi prefer\b',
-        r'\bi like to keep\b',
-        r'\bi want .* to be\b',
-        r'\bmy preference\b',
-        r'\bi favor\b',
-        r'\bi\'d rather\b',
-        r'\bkeep (?:it |things )?(?:simple|minimal|lightweight)\b',
-        r'\bi prioritize\b',
-        r'\bi value\b.*\bover\b',
-    ]
-    return any(re.search(p, q) for p in patterns)
 
 
 def _update_embedding_diagnostic(
@@ -1057,7 +1137,7 @@ def _update_embedding_diagnostic(
     return updated
 
 
-def ingest_conversation(beam: BeamMemory, messages: list[dict], diag: dict | None = None) -> dict:
+def ingest_conversation(beam: BeamMemory, messages: list[dict], diag: dict | None = None, llm=None) -> dict:
     """Ingest conversation messages into edumem BEAM tiers.
     Also builds an in-memory facts index for fact-boosted retrieval."""
     start_time = time.perf_counter()
@@ -1128,10 +1208,12 @@ def ingest_conversation(beam: BeamMemory, messages: list[dict], diag: dict | Non
             content = f"[MSGIDX:{batch_start + i}] {content}"
 
             # Detect and tag instructions and preferences for IF/PF abilities
-            if msg.get("role", "").lower() == "user" and _detect_instruction(raw_content):
-                content = f"{content} [INSTRUCTION]"
-            if msg.get("role", "").lower() == "user" and _detect_preference(raw_content):
-                content = f"{content} [PREFERENCE]"
+            if msg.get("role", "").lower() == "user" and llm is not None:
+                tags = _classify_message_llm(llm, raw_content)
+                if "INSTRUCTION" in tags:
+                    content = f"{content} [INSTRUCTION]"
+                if "PREFERENCE" in tags:
+                    content = f"{content} [PREFERENCE]"
 
             batch_items.append({
                 "content": content,
@@ -1553,9 +1635,14 @@ def _multi_strategy_recall(beam: BeamMemory, question: str, top_k: int = DEFAULT
 
     # MR: Raise candidate depth for aggregation queries
     # Aggregation questions need broader retrieval to find items across multiple sessions
-    if is_aggregation_query(question):
+    if _wants_broad_aggregation_retrieval(question):
         top_k = top_k * 3
         _mark("MR")
+
+    # SUM: Summarization needs broad retrieval to cover all conversation themes
+    if is_summarization_query(question):
+        top_k = top_k * 3
+        _mark("SUM")
 
     # Detect temporal questions by ability type or keywords
     temporal_keywords = ['when', 'date', 'deadline', 'sprint', 'day', 'week', 'month',
@@ -1570,14 +1657,17 @@ def _multi_strategy_recall(beam: BeamMemory, question: str, top_k: int = DEFAULT
     _mark("S1")
     _candidate_mems = _recall_safe(beam, question, top_k * 2, temporal_weight=temporal_weight)
     _note_add("S1", len(_candidate_mems), _add_unique(_candidate_mems, "S1"))
-    
+
+    # Always create the negation bucket so skipped negation routing is explicit.
+    _strategy_bucket("S2")
+
     # Strategy 2: Negation search for contradiction detection
-    if any(w in question.lower() for w in ["have i", "did i", "do i", "am i", "has"]):
+    if _wants_negation_retrieval(question):
+        _mark("S2")
         # 2a: Search for [NEG] tagged content via FTS5
         _neg_terms = _extract_search_terms(question)
         for term in _neg_terms[:3]:
             if len(term) > 2:
-                _mark("S2")
                 _candidate_mems = _recall_safe(beam, f"NEG {term}", max(5, top_k // 2))
                 _note_add("S2", len(_candidate_mems), _add_unique(_candidate_mems, "S2"))
 
@@ -1742,6 +1832,16 @@ def _multi_strategy_recall(beam: BeamMemory, question: str, top_k: int = DEFAULT
                     ).fetchall()
                 else:
                     tag_rows = []
+                # Fallback: if term matching found nothing, retrieve by tag alone
+                if not tag_rows:
+                    tag_rows = beam.conn.execute(
+                        "SELECT id, content FROM working_memory "
+                        "WHERE session_id = ? AND superseded_by IS NULL "
+                        "AND content LIKE ? "
+                        "ORDER BY message_index DESC, timestamp DESC, rowid DESC "
+                        "LIMIT 5",
+                        [beam.session_id, f"%[{tag}]%"],
+                    ).fetchall()
                 for row in tag_rows:
                     content = row["content"]
                     strategy_name = "IF" if tag == "INSTRUCTION" else "PF"
@@ -1750,7 +1850,7 @@ def _multi_strategy_recall(beam: BeamMemory, question: str, top_k: int = DEFAULT
         pass
 
     # Strategy: Multi-query expansion for aggregation (MR ability)
-    if is_aggregation_query(question):
+    if _wants_broad_aggregation_retrieval(question):
         import re
         # Extract key noun phrases from the question for broader retrieval
         _mr_terms = re.findall(r'\b[a-z]{4,}\b', question.lower())
@@ -2818,7 +2918,7 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
         # statements because "never"/"not"/"haven't" are stop-words or
         # don't co-occur with query terms in the same FTS5 token window.
         # LIKE-based exact substring search catches what FTS5 misses.
-        if "contradict" in question.lower() or "conflict" in question.lower() or any(w in question.lower() for w in ["have i", "did i", "do i"]):
+        if _wants_negation_retrieval(question):
             import re as _re_cr_neg
             # Extract key noun phrases from the question.
             # Use word boundaries to also catch all-caps acronyms (HTTP, API, SQL)
@@ -3091,6 +3191,13 @@ Follow this format strictly:
         _if_pf_prefix += "\nUSER INSTRUCTIONS (follow these when answering):\n" + "\n".join(f"- {inst}" for inst in _instructions) + "\n"
     if _preferences:
         _if_pf_prefix += "\nUSER PREFERENCES (respect these in your answer):\n" + "\n".join(f"- {pref}" for pref in _preferences) + "\n"
+    if _instructions or _preferences:
+        _if_pf_prefix += (
+            "\nIMPORTANT: The user has previously given instructions or preferences listed above. "
+            "When answering the question, APPLY these instructions and preferences to shape your response. "
+            "Do NOT say the conversation lacks information if the user's instructions are relevant to the question — "
+            "use them to guide your answer.\n"
+        )
 
     # All queries use build_system_prompt() dynamically, which appends
     # light format modifiers to an always-on base prompt for EO/TR queries.
@@ -3101,7 +3208,8 @@ Follow this format strictly:
         {"role": "user", "content": f"{_if_pf_prefix}{_temporal_cheat}{_cr_prefix_ret}{context}\n\nQUESTION: {question}\n\nANSWER:"},
     ]
 
-    ans = llm.chat(messages, temperature=0.1, max_tokens=2048)
+    _answer_max_tokens = 8192 if ability in ("CR", "SUM", "MR") else 2048
+    ans = llm.chat(messages, temperature=0.1, max_tokens=_answer_max_tokens)
     try:
         from edumem.core.beam import clean_and_format_sequence
         ans = clean_and_format_sequence(question, ans)
@@ -3189,6 +3297,68 @@ def _judge_client_snapshot(llm: LLMClient) -> dict:
     }
 
 
+_OFFICIAL_GRADER_IMPORT_CACHE: tuple[object | None, str | None] | None = None
+_OFFICIAL_GRADER_IMPORT_ATTEMPTS = 0
+_OFFICIAL_GRADER_REPO_URL = "https://github.com/mohammadtavakoli78/BEAM.git"
+_OFFICIAL_GRADER_CANDIDATE_ROOTS = (
+    Path(os.environ.get("BEAM_OFFICIAL_REPO_PATH", "")) if os.environ.get("BEAM_OFFICIAL_REPO_PATH") else None,
+    Path("/opt/BEAM_official"),
+    PROJECT_ROOT / ".cache" / "BEAM_official",
+)
+
+
+def _resolve_official_grader_root() -> Path | None:
+    """Find or fetch the official BEAM repo that contains src/evaluation/compute_metrics.py."""
+    for root in _OFFICIAL_GRADER_CANDIDATE_ROOTS:
+        if root and (root / "src" / "evaluation" / "compute_metrics.py").exists():
+            return root
+
+    cache_root = PROJECT_ROOT / ".cache" / "BEAM_official"
+    cache_root.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        if not cache_root.exists():
+            subprocess.run(
+                ["git", "clone", "--depth", "1", _OFFICIAL_GRADER_REPO_URL, str(cache_root)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+    except Exception as exc:
+        return None
+
+    if (cache_root / "src" / "evaluation" / "compute_metrics.py").exists():
+        return cache_root
+    return None
+
+
+def _load_official_compute_metrics() -> tuple[object | None, str | None]:
+    """Load the official BEAM grader module once and cache failures."""
+    global _OFFICIAL_GRADER_IMPORT_CACHE
+    global _OFFICIAL_GRADER_IMPORT_ATTEMPTS
+
+    if _OFFICIAL_GRADER_IMPORT_CACHE is not None:
+        return _OFFICIAL_GRADER_IMPORT_CACHE
+
+    _OFFICIAL_GRADER_IMPORT_ATTEMPTS += 1
+    try:
+        grader_root = _resolve_official_grader_root()
+        if grader_root is None:
+            raise FileNotFoundError(
+                "official BEAM repo not found locally and clone failed; "
+                f"expected {PROJECT_ROOT / '.cache' / 'BEAM_official'} or /opt/BEAM_official"
+            )
+        if str(grader_root) not in sys.path:
+            sys.path.insert(0, str(grader_root))
+
+        import importlib
+        compute_metrics = importlib.import_module("src.evaluation.compute_metrics")
+        _OFFICIAL_GRADER_IMPORT_CACHE = (compute_metrics, None)
+    except Exception as exc:
+        _OFFICIAL_GRADER_IMPORT_CACHE = (None, str(exc))
+
+    return _OFFICIAL_GRADER_IMPORT_CACHE
+
+
 def _llm_client_snapshot(llm: LLMClient) -> dict:
     """Capture answer-side API diagnostics without secrets."""
     return {
@@ -3222,27 +3392,28 @@ def judge_with_rubrics(llm: LLMClient, question: str, rubric: list, ai_answer: s
     if not func_name:
         return _legacy_judge_with_rubrics(llm, question, rubric, ai_answer)
 
-    try:
-        import sys
-        if "/opt/BEAM_official" not in sys.path:
-            sys.path.append("/opt/BEAM_official")
+    compute_metrics, probe_error = _load_official_compute_metrics()
+    if compute_metrics is None:
+        return _legacy_judge_with_rubrics(llm, question, rubric, ai_answer)
 
+    try:
         import os
         if "OPENAI_API_KEY" not in os.environ:
             os.environ["OPENAI_API_KEY"] = "dummy"
 
-        import importlib
-        compute_metrics = importlib.import_module("src.evaluation.compute_metrics")
         eval_func = getattr(compute_metrics, func_name, None)
 
         if not eval_func:
             raise ImportError(f"{func_name} not found in compute_metrics")
 
         class LangchainLLMWrapper:
-            def __init__(self, client):
+            def __init__(self, client, question_text):
                 self.client = client
-            
+                self._question_text = question_text
+
             def invoke(self, prompt):
+                if isinstance(prompt, str) and "<question>" in prompt:
+                    prompt = prompt.replace("<question>", self._question_text)
                 if isinstance(prompt, list):
                     messages = prompt
                 else:
@@ -3257,7 +3428,7 @@ def judge_with_rubrics(llm: LLMClient, question: str, rubric: list, ai_answer: s
                         self.content = content
                 return Response(res or "")
 
-        wrapped_model = LangchainLLMWrapper(llm)
+        wrapped_model = LangchainLLMWrapper(llm, question)
 
         print(f"      [Grader-Swap] Running official {func_name}...")
         eval_result = eval_func(rubric=rubric, llm_response=ai_answer, probing_question=question, model=wrapped_model)
@@ -3310,8 +3481,7 @@ def judge_with_rubrics(llm: LLMClient, question: str, rubric: list, ai_answer: s
             "raw_result": eval_result,
         }
 
-    except Exception as e:
-        print(f"      [Grader-Swap] Official grader unavailable, using local fallback for {ability}: {e}")
+    except Exception:
         return _legacy_judge_with_rubrics(llm, question, rubric, ai_answer)
 
 
@@ -4241,7 +4411,7 @@ def main():
                 # Ingest (includes per-batch consolidation via beam.sleep())
                 os.environ["BEAM_CURRENT_SCALE"] = scale
                 t0 = time.perf_counter()
-                stats = ingest_conversation(beam, conv["messages"], diag=conv_diag)
+                stats = ingest_conversation(beam, conv["messages"], diag=conv_diag, llm=llm)
                 ingest_time = time.perf_counter() - t0
                 conv_diag["ingest_diagnostics_batch"] = getattr(beam, "_last_ingest_diagnostics_batch", None)
 
@@ -4343,6 +4513,9 @@ def main():
             with open(PAIRED_OUTCOMES_FILE, "a") as paired_f:
                 for paired_row in _build_paired_outcome_rows(conv_result, _config_id, _run_started_at):
                     paired_f.write(_json_dumps_sanitized(paired_row) + "\n")
+            with open(QUESTION_VALIDATIONS_FILE, "a") as validation_f:
+                for validation_row in _build_question_validation_rows(conv_result, _config_id, _run_started_at):
+                    validation_f.write(_json_dumps_sanitized(validation_row) + "\n")
             _recall_diag = None
             _extraction_diag = None
             try:
@@ -4432,6 +4605,9 @@ def main():
     if PAIRED_OUTCOMES_FILE.exists():
         print(f"  Paired outcomes appended to: {PAIRED_OUTCOMES_FILE}")
         print(f"    (filter by config_id={_config_id!r} for this run's rows)")
+    if QUESTION_VALIDATIONS_FILE.exists():
+        print(f"  Question validations appended to: {QUESTION_VALIDATIONS_FILE}")
+        print(f"    (full question/answer/judge rows for config_id={_config_id!r})")
 
 
 if __name__ == "__main__":
