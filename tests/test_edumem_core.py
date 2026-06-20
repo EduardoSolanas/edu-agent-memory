@@ -1436,7 +1436,7 @@ class TestEOAndSUMPrompts:
         from edumem.core.query_mode import build_system_prompt
         prompt = build_system_prompt("In what order did I discuss the features?")
         assert "MSGIDX" in prompt or "message index" in prompt
-        assert "one item per line" in prompt.lower() or "one per line" in prompt.lower()
+        assert "one item per line" in prompt.lower() or "one per line" in prompt.lower() or "one clause per line" in prompt.lower()
 
 
 class TestNegationRecall:

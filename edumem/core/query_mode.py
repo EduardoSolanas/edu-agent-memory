@@ -55,6 +55,8 @@ _DATE_INTERVAL_KEYWORDS = (
 _KU_KEYWORDS = (
     "current", "latest", "updated", "changed to", "switched to",
     "now using", "most recent",
+    "how many", "included", "do i have", "are there",
+    "deadline",
 )
 
 _MR_KEYWORDS = (
@@ -176,9 +178,18 @@ _ORDERING_MODIFIER = """
 
 ORDERING: This question asks for the order in which topics or events were DISCUSSED in the conversation — the order they were mentioned, NOT when they happened in real life. CRITICAL: Each memory has a [MSGIDX:N] tag showing its message index (position in the conversation). Order by the LOWEST MSGIDX where each topic FIRST appears, NOT by real-world dates. If topic A first appears at MSGIDX:5 and topic B at MSGIDX:20, A comes before B regardless of chronological dates.
 
-IMPORTANT: Use the ACTUAL topic descriptions from the context, not your own abstractions. Quote or closely paraphrase what was actually discussed at each point. Do NOT invent category labels or merge multiple distinct topics into one abstract summary.
+CRITICAL OVERRIDES FOR FRAGMENTED CONTEXT:
+These overrides suppress the base prompt's ABSENCE and CONFLICTS rules:
+- DO NOT say "the conversation does not contain that information" if [MSGIDX:N] tags are present. Tags are the ordering signal.
+- DO NOT flag fragmented snippets as contradictory. Fragments are normal when memories span multiple messages.
+- ALWAYS reconstruct order using [MSGIDX:N] tags, even if context is sparse or scattered.
 
-List them one item per line as short clauses, earliest first. No preamble."""
+METHOD:
+1. For each distinct topic/aspect mentioned, find its FIRST [MSGIDX:N].
+2. Sort by LOWEST MSGIDX (earliest mention = first in list).
+3. Use ACTUAL descriptions from context; quote or paraphrase closely.
+4. Do NOT invent labels or merge distinct topics into summaries.
+5. One clause per line, earliest first, no preamble."""
 
 _DURATION_MODIFIER = """
 
@@ -197,8 +208,10 @@ _KU_MODIFIER = """
 KNOWLEDGE UPDATE: This question asks about the CURRENT state of something that may have changed.
 If the context shows multiple values for the same thing at different times, the MOST RECENT value
 is the correct answer. Higher [MSGIDX:N] numbers mean the statement was made later in the conversation —
-always prefer the value from the highest MSGIDX. State the current value directly. If you can identify
-when it changed, mention the change briefly (e.g., "Previously X, now Y as of [date]")."""
+always prefer the value from the highest MSGIDX.
+CRITICAL: Do NOT flag value changes as contradictions. If an earlier message says "6 items" and a later
+message says "10 items", this is an UPDATE, not a contradiction. Answer with the latest value directly.
+State the current value, and if helpful, mention the change briefly (e.g., "10 project cards (updated from 6)")."""
 
 _MR_MODIFIER = """
 

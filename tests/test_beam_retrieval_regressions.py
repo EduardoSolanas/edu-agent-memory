@@ -97,3 +97,205 @@ def test_project_card_counts_only_expand_for_broad_aggregation_language(
         assert diag["strategies"].get("MR", {}).get("activated", False) is expected_mr
     finally:
         beam.conn.close()
+
+
+def test_ku_question_triggers_knowledge_update_modifier():
+    """Verify that KU questions trigger the KU modifier with MSGIDX tags."""
+    from edumem.core.query_mode import build_system_prompt, is_knowledge_update_query
+
+    question = "What is the deadline for completing the first sprint?"
+
+    # Test that the question is recognized as a knowledge update query
+    assert is_knowledge_update_query(question) is True
+
+    # Test that the prompt contains the KU modifier
+    prompt = build_system_prompt(question)
+    assert "KNOWLEDGE UPDATE" in prompt
+    assert "MSGIDX" in prompt
+
+
+def test_ku_updated_fact_supersedes_old_in_retrieval(tmp_path, monkeypatch):
+    """Verify that KU retrieval surfaces both old and new facts for comparison."""
+    from edumem.core.query_mode import is_knowledge_update_query
+    from datetime import datetime, timezone
+
+    monkeypatch.setenv("EDUMEM_NO_EMBEDDINGS", "1")
+    beam = _make_beam(tmp_path)
+    try:
+        # Insert two working_memory rows with different message indices
+        # The higher MSGIDX represents more recent information
+        now = datetime.now(timezone.utc).isoformat()
+        beam.conn.execute(
+            """INSERT INTO working_memory
+               (id, message_index, content, veracity, created_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            ("old-sprint-deadline", 13,
+             "[MSGIDX:13] The first sprint deadline is April 1, 2024.",
+             "known", now)
+        )
+        beam.conn.execute(
+            """INSERT INTO working_memory
+               (id, message_index, content, veracity, created_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            ("new-sprint-deadline", 95,
+             "[MSGIDX:95] The deadline for the first sprint has been updated to April 5, 2024.",
+             "known", now)
+        )
+        beam.conn.commit()
+
+        question = "What is the deadline for the first sprint?"
+        assert is_knowledge_update_query(question) is True
+
+        diag = {}
+        memories = _multi_strategy_recall(
+            beam,
+            question,
+            top_k=5,
+            ability=None,
+            diag=diag,
+        )
+
+        # Both memories should be retrieved so the LLM can see the update
+        assert len(memories) >= 2, f"Expected at least 2 memories, got {len(memories)}"
+        contents = [m.get("content", "") for m in memories]
+        assert any("MSGIDX:13" in c and "April 1" in c for c in contents), \
+            f"Old deadline not found in contents: {contents}"
+        assert any("MSGIDX:95" in c and "April 5" in c for c in contents), \
+            f"Updated deadline not found in contents: {contents}"
+    finally:
+        beam.conn.close()
+
+
+def test_ku_contradictory_counts_resolved_by_msgidx(tmp_path, monkeypatch):
+    """Verify that contradictory counts are both retrieved with MSGIDX for resolution."""
+    from edumem.core.query_mode import is_knowledge_update_query
+    from datetime import datetime, timezone
+
+    monkeypatch.setenv("EDUMEM_NO_EMBEDDINGS", "1")
+    beam = _make_beam(tmp_path)
+    try:
+        # Insert two contradictory facts about project cards count
+        now = datetime.now(timezone.utc).isoformat()
+        beam.conn.execute(
+            """INSERT INTO working_memory
+               (id, message_index, content, veracity, created_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            ("project-cards-initial", 48,
+             "[MSGIDX:48] The project gallery has 6 items in the MVP.",
+             "known", now)
+        )
+        beam.conn.execute(
+            """INSERT INTO working_memory
+               (id, message_index, content, veracity, created_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            ("project-cards-updated", 116,
+             "[MSGIDX:116] I now have 10 project cards after adding two new projects.",
+             "known", now)
+        )
+        beam.conn.commit()
+
+        question = "How many project cards do I have?"
+        assert is_knowledge_update_query(question) is True
+
+        diag = {}
+        memories = _multi_strategy_recall(
+            beam,
+            question,
+            top_k=5,
+            ability=None,
+            diag=diag,
+        )
+
+        # Both contradictory memories should be retrieved
+        assert len(memories) >= 2, f"Expected at least 2 memories, got {len(memories)}"
+        contents = [m.get("content", "") for m in memories]
+        assert any("MSGIDX:48" in c and "6 items" in c for c in contents), \
+            f"Initial count not found: {contents}"
+        assert any("MSGIDX:116" in c and "10 project cards" in c for c in contents), \
+            f"Updated count not found: {contents}"
+    finally:
+        beam.conn.close()
+
+
+def test_eo_question_triggers_ordering_modifier_with_msgidx():
+    """Verify that EO questions trigger the ordering modifier with MSGIDX."""
+    from edumem.core.query_mode import build_system_prompt, is_ordering_query
+
+    question = "Can you list the order in which I brought up different aspects?"
+
+    # Test that the question is recognized as an ordering query
+    assert is_ordering_query(question) is True
+
+    # Test that the prompt contains the ordering modifier and MSGIDX reference
+    prompt = build_system_prompt(question)
+    assert "ORDERING" in prompt
+    assert "MSGIDX" in prompt
+
+
+def test_eo_retrieval_preserves_msgidx_tags(tmp_path, monkeypatch):
+    """Verify that EO retrieval preserves MSGIDX tags for LLM ordering."""
+    from edumem.core.query_mode import is_ordering_query
+    import re
+
+    monkeypatch.setenv("EDUMEM_NO_EMBEDDINGS", "1")
+    beam = _make_beam(tmp_path)
+    try:
+        # Ingest messages which will get proper MSGIDX tags and FTS5 indexing
+        ingest_conversation(
+            beam,
+            [
+                {"role": "user", "content": "We discussed the project timeline first."},
+                {"role": "user", "content": "Then we talked about resource allocation."},
+                {"role": "user", "content": "Finally, we addressed budget constraints."},
+            ],
+        )
+
+        question = "In what order did I bring up the different aspects of the project?"
+        assert is_ordering_query(question) is True
+
+        diag = {}
+        memories = _multi_strategy_recall(
+            beam,
+            question,
+            top_k=10,
+            ability=None,
+            diag=diag,
+        )
+
+        # Ordering queries should retrieve memories (at least 1)
+        assert len(memories) >= 1, f"Expected at least 1 memory, got {len(memories)}"
+        contents = [m.get("content", "") for m in memories]
+
+        # Verify MSGIDX tags are present in retrieved memories
+        msgidx_tags = []
+        for content in contents:
+            matches = re.findall(r'\[MSGIDX:(\d+)\]', content)
+            msgidx_tags.extend(matches)
+        assert len(msgidx_tags) > 0, \
+            f"No MSGIDX tags found in retrieved memories: {contents}"
+
+        # Verify the EO modifier was activated (top_k multiplied for ordering queries)
+        assert diag["strategies"].get("EO", {}).get("activated") is True, \
+            "EO strategy should be activated for ordering queries"
+    finally:
+        beam.conn.close()
+
+
+def test_change_over_time_precedes_conflicts_in_prompt():
+    """Verify that CHANGE OVER TIME appears before CONFLICTS in the prompt."""
+    from edumem.core.query_mode import build_system_prompt
+
+    # Any question works; we're checking prompt structure
+    question = "What is the current status?"
+    prompt = build_system_prompt(question)
+
+    # Both should be in the base prompt
+    assert "CHANGE OVER TIME" in prompt
+    assert "CONFLICTS" in prompt
+
+    # Verify ordering: CHANGE OVER TIME should come before CONFLICTS
+    change_pos = prompt.find("CHANGE OVER TIME")
+    conflicts_pos = prompt.find("CONFLICTS")
+    assert change_pos < conflicts_pos, \
+        f"CHANGE OVER TIME should appear before CONFLICTS in prompt. " \
+        f"CHANGE OVER TIME at {change_pos}, CONFLICTS at {conflicts_pos}"
