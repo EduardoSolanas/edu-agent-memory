@@ -91,6 +91,7 @@ RUN set -eux; \
 
 # Copy only the runtime application sources.
 COPY server.py /app/server.py
+COPY server_text.py /app/server_text.py
 COPY server_nvidia.py /app/server_nvidia.py
 COPY entrypoint.sh /app/entrypoint.sh
 
