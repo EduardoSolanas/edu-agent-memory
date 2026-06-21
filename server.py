@@ -16,12 +16,16 @@ import threading
 import os
 from collections import OrderedDict
 
+from server_text import sanitize_rerank_text
+
 EMBED_MODEL_PATH = os.getenv("EMBED_MODEL_PATH", "/root/openvino-server/models/gte-modernbert-ov")
 RERANK_MODEL_PATH = os.getenv("RERANK_MODEL_PATH", "/root/openvino-server/models/ettin-17m-ov")
 RERANK_TOP_N = int(os.getenv("RERANK_TOP_N", "512"))
 LLM_MODEL_PATH = os.getenv("LLM_MODEL_PATH", "/root/openvino-server/models/Phi-4-mini-instruct-fp16-ov").strip(' \t\n\r"\'')
 CACHE_DIR = os.getenv("CACHE_DIR", "/root/openvino-server/models/model_cache")
 RERANK_CACHE_SIZE = int(os.getenv("RERANK_CACHE_SIZE", "128"))
+RERANK_QUERY_MAX_BYTES = int(os.getenv("RERANK_QUERY_MAX_BYTES", "128"))
+RERANK_TEXT_MAX_BYTES = int(os.getenv("RERANK_TEXT_MAX_BYTES", "352"))
 
 print("Starting OpenVINO Inference Server (Native GenAI)...", flush=True)
 
@@ -176,7 +180,7 @@ async def load_models():
 
 
 @app.post("/v1/embeddings")
-async def openai_embeddings(request: OpenAIEmbeddingRequest):
+def openai_embeddings(request: OpenAIEmbeddingRequest):
     try:
         start = time.time()
         inputs = request.input if isinstance(request.input, list) else [request.input]
@@ -240,35 +244,19 @@ def rerank_in_length_buckets(query: str, texts: List[str]):
     combined.sort(key=lambda item: item[1], reverse=True)
     return combined
 
-def sanitize_text(text: str) -> str:
-    if not text:
-        return "empty"
-    # 1. Collapse consecutive identical characters of length > 2 (e.g. === -> ==)
-    # This completely eliminates compiled tokenizer buffer overflow assertions.
-    import re
-    text = re.sub(r'(.)\1{2,}', r'\1\1', text)
-    
-    # 2. Keep ALL words. No arbitrary limits on total word count.
-    # Truncate only individual continuous terms longer than 40 characters (like giant hex hashes)
-    # to protect the pre-allocated subword segmentation buffers.
-    words = text.split()
-    cleaned_words = []
-    for w in words:
-        if len(w) > 40:
-            w = w[:40]
-        cleaned_words.append(w)
-    text = " ".join(cleaned_words)
-    return text if text else "empty"
-
-
 @app.post("/rerank")
-async def rerank(request: RerankRequest):
+def rerank(request: RerankRequest):
     try:
         start = time.time()
 
         # Sanitize query and texts to prevent OpenVINO Tokenizer crash on empty/whitespace/repeated inputs
-        query = sanitize_text(request.query)
-        texts = [sanitize_text(t) for t in request.texts]
+        query = sanitize_rerank_text(
+            request.query, max_utf8_bytes=RERANK_QUERY_MAX_BYTES
+        )
+        texts = [
+            sanitize_rerank_text(text, max_utf8_bytes=RERANK_TEXT_MAX_BYTES)
+            for text in request.texts
+        ]
 
         cache_key = (query, tuple(texts))
         with rerank_cache_lock:
@@ -349,7 +337,7 @@ def parse_text_to_tool_calls(text: str) -> list[dict]:
     return []
 
 @app.post("/v1/chat/completions")
-async def chat_completions(request: ChatCompletionRequest):
+def chat_completions(request: ChatCompletionRequest):
     if llm_pipeline is None:
         raise HTTPException(status_code=400, detail="Local LLM is disabled. Set LLM_MODEL_PATH to enable.")
     try:
