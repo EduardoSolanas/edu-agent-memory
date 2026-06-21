@@ -240,16 +240,27 @@ def rerank_in_length_buckets(query: str, texts: List[str]):
     combined.sort(key=lambda item: item[1], reverse=True)
     return combined
 
+def sanitize_text(text: str) -> str:
+    if not text:
+        return "empty"
+    # Collapse multiple whitespaces/newlines to single space
+    text = " ".join(text.split())
+    if not text:
+        return "empty"
+    # Collapse consecutive identical characters of length > 3 (e.g. === -> ==)
+    import re
+    text = re.sub(r'(.)\1{3,}', r'\1\1\1', text)
+    return text
+
+
 @app.post("/rerank")
 async def rerank(request: RerankRequest):
     try:
         start = time.time()
 
-        # Sanitize query and texts to prevent OpenVINO Tokenizer crash on empty/whitespace inputs
-        query = request.query.strip() if request.query else "empty"
-        if not query:
-            query = "empty"
-        texts = [t.strip() if (t and t.strip()) else "empty" for t in request.texts]
+        # Sanitize query and texts to prevent OpenVINO Tokenizer crash on empty/whitespace/repeated inputs
+        query = sanitize_text(request.query)
+        texts = [sanitize_text(t) for t in request.texts]
 
         cache_key = (query, tuple(texts))
         with rerank_cache_lock:
