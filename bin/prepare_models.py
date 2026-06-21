@@ -183,6 +183,44 @@ def main():
     else:
         print(f"Skipping GTE ModernBERT export (already exists at {GTE_DIR})")
         
+def fallback_export_ovc(model_name, out_dir):
+    """Fallback path: download ONNX FP16 artifact from HF and convert with ovc.
+    This avoids Optimum custom-export requirements for unsupported custom model types.
+    """
+    print(f"Falling back to direct ONNX+ovc export for {model_name} -> {out_dir}")
+    os.makedirs(out_dir, exist_ok=True)
+    # Attempt common ONNX path on HF: onnx/model_fp16.onnx
+    onnx_url = f"https://huggingface.co/{model_name}/resolve/main/onnx/model_fp16.onnx"
+    local_onnx = os.path.join("/tmp", os.path.basename(model_name).replace('/', '_') + "_fp16.onnx")
+    try:
+        print(f"Downloading ONNX from {onnx_url} to {local_onnx}...")
+        subprocess.run(["curl", "-fL", "-o", local_onnx, onnx_url], check=True)
+    except subprocess.CalledProcessError:
+        print(f"Failed to download ONNX from {onnx_url}. Aborting fallback.", file=sys.stderr)
+        raise
+    # Run ovc if available
+    ovc = shutil.which("ovc") or shutil.which("mo")
+    if not ovc:
+        print("ovc not found in PATH; cannot convert ONNX to OpenVINO IR.", file=sys.stderr)
+        raise RuntimeError("ovc binary not found")
+    cmd = [ovc, local_onnx, "--output_model", out_dir]
+    print("Executing:", " ".join(cmd))
+    try:
+        subprocess.run(cmd, check=True)
+        print(f"ovc conversion completed, IR placed under {out_dir}")
+    except subprocess.CalledProcessError as e:
+        print(f"ovc conversion failed: {e}", file=sys.stderr)
+        raise
+
+    # Clean up local onnx
+    try:
+        os.remove(local_onnx)
+    except Exception:
+        pass
+
+    return
+
+
     if need_ettin:
         if os.path.exists(ETTIN_DIR):
             print(f"Removing existing directory: {ETTIN_DIR}")
@@ -197,7 +235,15 @@ def main():
         print(f"Ettin export task chosen: {ettin_task}")
         # Allow passing custom export configs via env var (path or comma-separated list)
         custom_cfg = os.environ.get("CUSTOM_EXPORT_CONFIGS")
-        run_export(optimum_cli, ETTIN_MODEL, ettin_task, ETTIN_DIR, hf_token, custom_cfg)
+        try:
+            run_export(optimum_cli, ETTIN_MODEL, ettin_task, ETTIN_DIR, hf_token, custom_cfg)
+        except SystemExit:
+            # run_export calls sys.exit(1) on failure; translate to exception to try fallback
+            print("optimum-cli export failed for Ettin; attempting direct ONNX+ovc fallback...")
+            fallback_export_ovc(ETTIN_MODEL, ETTIN_DIR)
+        except Exception as e:
+            print(f"Unexpected error during optimum export: {e}; attempting fallback...", file=sys.stderr)
+            fallback_export_ovc(ETTIN_MODEL, ETTIN_DIR)
     else:
         print(f"Skipping Ettin Reranker export (already exists at {ETTIN_DIR})")
         
