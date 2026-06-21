@@ -176,7 +176,7 @@ async def load_models():
 
 
 @app.post("/v1/embeddings")
-def openai_embeddings(request: OpenAIEmbeddingRequest):
+async def openai_embeddings(request: OpenAIEmbeddingRequest):
     try:
         start = time.time()
         inputs = request.input if isinstance(request.input, list) else [request.input]
@@ -241,7 +241,7 @@ def rerank_in_length_buckets(query: str, texts: List[str]):
     return combined
 
 @app.post("/rerank")
-def rerank(request: RerankRequest):
+async def rerank(request: RerankRequest):
     try:
         start = time.time()
 
@@ -324,7 +324,7 @@ def parse_text_to_tool_calls(text: str) -> list[dict]:
     return []
 
 @app.post("/v1/chat/completions")
-def chat_completions(request: ChatCompletionRequest):
+async def chat_completions(request: ChatCompletionRequest):
     if llm_pipeline is None:
         raise HTTPException(status_code=400, detail="Local LLM is disabled. Set LLM_MODEL_PATH to enable.")
     try:
