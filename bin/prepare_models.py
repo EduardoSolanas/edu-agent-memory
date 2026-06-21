@@ -18,7 +18,7 @@ MODELS_DIR = os.path.join(PROJECT_ROOT, "models")
 GTE_MODEL = "sentence-transformers/all-mpnet-base-v2"
 GTE_DIR = os.path.join(MODELS_DIR, "gte-modernbert-ov")
 
-ETTIN_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+ETTIN_MODEL = "jhu-clsp/ettin-encoder-17m"
 ETTIN_DIR = os.path.join(MODELS_DIR, "ettin-17m-ov")
 
 def load_hf_token():
