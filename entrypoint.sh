@@ -27,7 +27,6 @@ if [ "${SYSTEM_MODE}" = "intel" ]; then
     echo "[Entrypoint] Intel mode: Starting OpenVINO Inference Server..."
     export EMBED_MODEL_PATH=/app/models/gte-modernbert-ov
     export RERANK_MODEL_PATH=/app/models/ettin-17m-ov
-    export LLM_MODEL_PATH=""
     python server.py &
 elif [ "${SYSTEM_MODE}" = "nvidia" ]; then
     echo "[Entrypoint] NVIDIA mode: Starting ONNX Runtime Inference Server..."

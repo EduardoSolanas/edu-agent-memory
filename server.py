@@ -21,7 +21,6 @@ from server_text import sanitize_rerank_text
 EMBED_MODEL_PATH = os.getenv("EMBED_MODEL_PATH", "/root/openvino-server/models/gte-modernbert-ov")
 RERANK_MODEL_PATH = os.getenv("RERANK_MODEL_PATH", "/root/openvino-server/models/ettin-17m-ov")
 RERANK_TOP_N = int(os.getenv("RERANK_TOP_N", "512"))
-LLM_MODEL_PATH = os.getenv("LLM_MODEL_PATH", "/root/openvino-server/models/Phi-4-mini-instruct-fp16-ov").strip(' \t\n\r"\'')
 CACHE_DIR = os.getenv("CACHE_DIR", "/root/openvino-server/models/model_cache")
 RERANK_CACHE_SIZE = int(os.getenv("RERANK_CACHE_SIZE", "128"))
 RERANK_QUERY_MAX_BYTES = int(os.getenv("RERANK_QUERY_MAX_BYTES", "128"))
@@ -34,14 +33,12 @@ app = FastAPI(title="OpenVINO Inference Server (Native GenAI)")
 # Models will be loaded on startup
 embed_pipeline = None
 rerank_pipeline = None
-llm_pipeline = None
 device = "CPU"
 
 # Single GPU/CPU lock prevents embed/rerank overlap
 gpu_lock = threading.Lock()
 embed_lock = gpu_lock
 rerank_lock = gpu_lock
-llm_lock = threading.Lock()
 rerank_cache_lock = threading.Lock()
 rerank_cache = OrderedDict()
 
@@ -64,29 +61,13 @@ class RerankResponse(BaseModel):
     index: int
     score: float
 
-class ChatMessage(BaseModel):
-    role: str
-    content: Optional[str] = None
-    tool_calls: Optional[List[Any]] = None
-    tool_call_id: Optional[str] = None
-
-class ChatCompletionRequest(BaseModel):
-    model: str
-    messages: List[ChatMessage]
-    temperature: Optional[float] = 0.0
-    top_p: Optional[float] = 1.0
-    max_tokens: Optional[int] = 1024
-    stream: Optional[bool] = False
-    tools: Optional[List[Dict[str, Any]]] = None
-    tool_choice: Optional[Any] = None
-
 def inverse_sigmoid(p: float) -> float:
     p = max(1e-15, min(1.0 - 1e-15, p))
     return math.log(p / (1.0 - p))
 
 @app.on_event("startup")
 async def load_models():
-    global embed_pipeline, rerank_pipeline, llm_pipeline, device
+    global embed_pipeline, rerank_pipeline, device
     
     try:
         core = openvino.Core()
@@ -150,31 +131,7 @@ async def load_models():
     except Exception as e:
         print(f"✗ Failed to load reranker model: {e}", flush=True)
         raise
-        
-    if LLM_MODEL_PATH and os.path.exists(LLM_MODEL_PATH):
-        try:
-            print(f"Loading LLM model ({LLM_MODEL_PATH}) on {device}...", flush=True)
-            try:
-                llm_pipeline = openvino_genai.LLMPipeline(
-                    LLM_MODEL_PATH,
-                    device,
-                    PERFORMANCE_HINT="LATENCY",
-                    NUM_STREAMS="1",
-                    CACHE_DIR=CACHE_DIR
-                )
-            except Exception as hints_err:
-                print(f"Note: Standard loading due to hints error: {hints_err}", flush=True)
-                llm_pipeline = openvino_genai.LLMPipeline(
-                    LLM_MODEL_PATH,
-                    device
-                )
-            print(f"✓ LLM model ({os.path.basename(LLM_MODEL_PATH)}) loaded on {device} successfully", flush=True)
-        except Exception as e:
-            print(f"✗ Failed to load LLM model: {e}", flush=True)
-            raise
-    else:
-        print("Skipping local LLM loading (LLM_MODEL_PATH is empty/not set or does not exist)", flush=True)
-    
+
     print("All models loaded successfully!", flush=True)
 
 
@@ -293,167 +250,6 @@ def rerank(request: RerankRequest):
         print(f"Rerank error: {e}", flush=True)
         raise HTTPException(status_code=500, detail=str(e))
 
-import re
-import json
-
-def parse_text_to_tool_calls(text: str) -> list[dict]:
-    tool_names = ['search_observations', 'search_world_facts', 'recall', 'search_opinions']
-    
-    for tool in tool_names:
-        pattern = rf"{tool}\((.*?)\)"
-        match = re.search(pattern, text)
-        if match:
-            args_str = match.group(1).strip()
-            arguments = {}
-            
-            if (args_str.startswith("'") and args_str.endswith("'")) or (args_str.startswith('"') and args_str.endswith('"')):
-                query_val = args_str[1:-1]
-                arguments = {"query": query_val}
-            else:
-                pairs = re.findall(r"(\w+)\s*=\s*(?:'([^']*)'|\"([^\"]*)\"|(\w+))", args_str)
-                if pairs:
-                    for k, v1, v2, v3 in pairs:
-                        val = v1 or v2 or v3
-                        if val.isdigit():
-                            arguments[k] = int(val)
-                        else:
-                            arguments[k] = val
-                else:
-                    arguments["query"] = args_str
-            
-            if "query" not in arguments and args_str:
-                arguments["query"] = args_str
-                
-            return [
-                {
-                    "id": f"call_{int(time.time())}",
-                    "type": "function",
-                    "function": {
-                        "name": tool,
-                        "arguments": json.dumps(arguments)
-                    }
-                }
-            ]
-    return []
-
-@app.post("/v1/chat/completions")
-def chat_completions(request: ChatCompletionRequest):
-    if llm_pipeline is None:
-        raise HTTPException(status_code=400, detail="Local LLM is disabled. Set LLM_MODEL_PATH to enable.")
-    try:
-        start = time.time()
-        
-        tools_instruction = ""
-        if request.tools:
-            tools_instruction = (
-                "\n\nYou have access to the following search tools. If the user's query requires "
-                "retrieving memories, observations, or facts to answer, you MUST output a single tool call "
-                "matching this exact syntax (and nothing else):\n"
-                "search_observations(query='your query string')\n\n"
-                "Available tools:\n"
-            )
-            for tool in request.tools:
-                name = tool.get("function", {}).get("name")
-                desc = tool.get("function", {}).get("description", "")
-                tools_instruction += f"- {name}(query='...'): {desc}\n"
-            
-            tools_instruction += (
-                "\nCRITICAL: If you do not have the necessary information in your context yet, "
-                "you MUST call one of these tools first. Do NOT make up information or refuse "
-                "if a tool call could retrieve it."
-            )
-            
-        messages_to_send = []
-        has_system = False
-        
-        for msg in request.messages:
-            role = msg.role
-            content = msg.content
-            
-            if role == "tool":
-                role = "user"
-                content = f"Tool result:\n{content}"
-            elif role == "assistant" and not content and msg.tool_calls:
-                try:
-                    tc = msg.tool_calls[0]
-                    tc_name = tc.get("function", {}).get("name") if isinstance(tc, dict) else getattr(getattr(tc, "function", None), "name", None)
-                    tc_args = tc.get("function", {}).get("arguments") if isinstance(tc, dict) else getattr(getattr(tc, "function", None), "arguments", None)
-                    
-                    if isinstance(tc_args, str):
-                        try:
-                            args_dict = json.loads(tc_args)
-                            args_str = ", ".join(f"{k}='{v}'" for k, v in args_dict.items())
-                        except Exception:
-                            args_str = f"query='{tc_args}'"
-                    elif isinstance(tc_args, dict):
-                        args_str = ", ".join(f"{k}='{v}'" for k, v in tc_args.items())
-                    else:
-                        args_str = ""
-                    content = f"{tc_name}({args_str})"
-                except Exception as e:
-                    content = f"search_observations(query='{msg.content}')"
-                    
-            if role == "system" and tools_instruction:
-                content = (content or "") + tools_instruction
-                has_system = True
-                
-            messages_to_send.append({"role": role, "content": content})
-            
-        if not has_system and tools_instruction:
-            messages_to_send.insert(0, {"role": "system", "content": tools_instruction})
-            
-        history = openvino_genai.ChatHistory()
-        for msg in messages_to_send:
-            if msg["role"] in ("user", "assistant", "system"):
-                history.append({"role": msg["role"], "content": msg["content"] or ""})
-        
-        config = openvino_genai.GenerationConfig()
-        config.max_new_tokens = request.max_tokens
-        if request.temperature > 0:
-            config.temperature = request.temperature
-            config.do_sample = True
-            config.top_p = request.top_p
-        else:
-            config.do_sample = False  # Greedy decoding
-            
-        with llm_lock:
-            res = llm_pipeline.generate(history, generation_config=config)
-            
-        output_text = res.texts[0]
-        latency = (time.time() - start) * 1000
-        print(f"LLM (Phi-4-mini): {len(request.messages)} messages, {latency:.1f}ms", flush=True)
-        
-        tool_calls = parse_text_to_tool_calls(output_text)
-        
-        message_payload = {
-            "role": "assistant",
-            "content": output_text if not tool_calls else None
-        }
-        if tool_calls:
-            message_payload["tool_calls"] = tool_calls
-            
-        return {
-            "id": f"chatcmpl-{int(time.time())}",
-            "object": "chat.completion",
-            "created": int(time.time()),
-            "model": request.model,
-            "choices": [
-                {
-                    "index": 0,
-                    "message": message_payload,
-                    "finish_reason": "tool_calls" if tool_calls else "stop"
-                }
-            ],
-            "usage": {
-                "prompt_tokens": 0,
-                "completion_tokens": 0,
-                "total_tokens": 0
-            }
-        }
-        
-    except Exception as e:
-        print(f"LLM error: {e}", flush=True)
-        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/health")
 async def health():
