@@ -4198,6 +4198,8 @@ class BeamMemory:
             'humidity', 'chance', 'regenrisiko', 'zum', 'heute', 'morgen',
             'gestern', 'today', 'tomorrow', 'yesterday', 'week', 'month'
         )
+        # Collect metric candidates for batch canonicalization
+        metric_candidates = []
         for m in _metric_re_iter[:10]:
             num = m.group(1)
             unit = m.group(2)
@@ -4244,10 +4246,23 @@ class BeamMemory:
                 key = key.replace('_%', '_pct')
                 if not key.endswith('_pct'):
                     key = f"{prefix}_pct" if prefix else 'pct'
-            if self._insert_fact(session, message_idx, 'metric', key, val,
-                                 self._context_snippet(content, m.start()), 0.65,
-                                 source_memory_id=source_memory_id):
-                counts["metric"] += 1
+            # Collect as a candidate for LLM consolidation
+            metric_candidates.append({
+                "raw_key": key,
+                "value": val,
+                "context": self._context_snippet(content, m.start()),
+                "msg_idx": message_idx
+            })
+
+        # Batch canonicalize all metrics via LLM (or fallback to raw_keys)
+        if metric_candidates:
+            canonical_keys = self._llm_canonicalize_facts(session, metric_candidates)
+            for i, cand in enumerate(metric_candidates):
+                canon_key = canonical_keys[i]
+                if self._insert_fact(session, cand["msg_idx"], 'metric', canon_key,
+                                     cand["value"], cand["context"], 0.65,
+                                     source_memory_id=source_memory_id):
+                    counts["metric"] += 1
 
         # ISO Dates — require event context within 100 chars to avoid
         # file paths, report dates, and passing mentions as timeline entries
@@ -4456,6 +4471,133 @@ class BeamMemory:
         self.conn.commit()
         counts["_lang"] = lang  # Tag extraction with detected language
         return counts
+
+    def _build_canonicalize_prompt(self, existing, candidates) -> str:
+        """Build a prompt for LLM-assisted metric key canonicalization.
+
+        Args:
+            existing: list of (key, value) tuples (current session metric facts)
+            candidates: list of {"context": str, "value": str, "raw_key": str}
+
+        Returns:
+            A prompt string requesting canonical keys in JSON array format.
+        """
+        existing_block = "\n".join(
+            f"- {key}: {value}" for key, value in existing
+        ) if existing else "(no existing facts)"
+
+        observations_block = "\n".join(
+            f"{i}. \"{cand['context']}\" => {cand['value']}"
+            for i, cand in enumerate(candidates)
+        )
+
+        prompt = f"""You are a fact consolidation expert. Your task is to assign canonical metric keys to new observations, reusing existing keys when appropriate.
+
+Existing metrics in the session:
+{existing_block}
+
+New observations (context snippet, then observed value):
+{observations_block}
+
+Rules:
+1. If an observation describes the SAME real-world metric as an existing key (even if phrased differently), assign that existing key.
+2. If it is a different metric, create a new canonical key in snake_case ending with the unit.
+3. Return ONLY a JSON array with one element per observation:
+[{{"index": N, "canonical_key": "key_name", "is_update": bool}}, ...]
+
+Example:
+If observation 0 is "response time is 250ms" and you have existing key "response_time_ms", return:
+[{{"index": 0, "canonical_key": "response_time_ms", "is_update": true}}]
+
+Now respond with ONLY the JSON array, no explanation."""
+        return prompt
+
+    def _parse_canonicalize_response(self, raw: str, n: int) -> list:
+        """Parse LLM response into a list of canonical keys.
+
+        Args:
+            raw: raw LLM output (may contain JSON fences)
+            n: expected number of keys (length of candidates list)
+
+        Returns:
+            list of length n of canonical keys (str) or None if missing/unparseable
+        """
+        import re as _re
+        try:
+            # Extract JSON array from potential fences
+            json_match = _re.search(r'\[.*\]', raw, _re.DOTALL)
+            if not json_match:
+                return [None] * n
+
+            json_str = json_match.group(0)
+            data = json.loads(json_str)
+
+            if not isinstance(data, list):
+                return [None] * n
+
+            result = [None] * n
+            for item in data:
+                if isinstance(item, dict) and "index" in item and "canonical_key" in item:
+                    idx = item["index"]
+                    if 0 <= idx < n:
+                        result[idx] = item["canonical_key"]
+
+            return result
+        except Exception:
+            return [None] * n
+
+    def _llm_canonicalize_facts(self, session, candidates) -> list:
+        """Consolidate metric keys using LLM or fall back to raw_keys.
+
+        Args:
+            session: session_id
+            candidates: list of {"raw_key": str, "value": str, "context": str, ...}
+
+        Returns:
+            list of canonical keys (str) matching candidate order
+        """
+        # Consolidation is enabled by default; canonical false values disable it.
+        consolidation_enabled = (
+            os.environ.get("EDUMEM_LLM_FACT_CONSOLIDATION", "1").strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
+        if self._llm_client is None or not consolidation_enabled:
+            return [c["raw_key"] for c in candidates]
+
+        try:
+            # Load existing metric facts for this session
+            existing = self.conn.execute(
+                "SELECT key, value FROM memoria_facts "
+                "WHERE session_id = ? AND fact_type = 'metric' "
+                "GROUP BY key ORDER BY key",
+                (session,)
+            ).fetchall()
+
+            # Exact matches are already canonical. This common update path does
+            # not need an LLM round trip; novel phrasings still do.
+            existing_keys = {row[0] for row in existing}
+            if candidates and all(c["raw_key"] in existing_keys for c in candidates):
+                return [c["raw_key"] for c in candidates]
+
+            # Build prompt and call LLM
+            prompt = self._build_canonicalize_prompt(existing, candidates)
+            response = self._llm_client.chat(
+                [{"role": "user", "content": prompt}],
+                temperature=0.0
+            )
+
+            # Parse response
+            canonical_keys = self._parse_canonicalize_response(response, len(candidates))
+
+            # Use canonical key if present, else fallback to raw_key
+            result = []
+            for i, cand in enumerate(candidates):
+                key = canonical_keys[i] if canonical_keys[i] is not None else cand["raw_key"]
+                result.append(key)
+            return result
+        except Exception:
+            # Any error → fallback to raw keys
+            return [c["raw_key"] for c in candidates]
 
     def _insert_fact(self, session: str, msg_idx: int, ftype: str,
                      key: str, value: str, ctx: str, importance: float,
@@ -4675,10 +4817,18 @@ class BeamMemory:
     # ------------------------------------------------------------------
     # MEMORIA: Structured Fact Retrieval (Phase 2)
     # ------------------------------------------------------------------
-    def memoria_retrieve(self, query: str, ability: str = None, top_k: int = 10) -> dict:
+    def memoria_retrieve(self, query: str, ability: str = None, top_k: int = 10, intent: str | None = None) -> dict:
         """Route a query to the appropriate MEMORIA specialist table.
         Returns dict with keys: context (str), facts (list), source (str).
-        Falls back to {'context': '', 'facts': [], 'source': 'fallback'} when empty."""
+        Falls back to {'context': '', 'facts': [], 'source': 'fallback'} when empty.
+
+        Args:
+            query: The query string.
+            ability: BEAM ability code (KU, CR, TR, EO, IE, MR, IF, PF). If None, auto-classified.
+            top_k: Number of results to return.
+            intent: Generic intent string ('current', 'change', 'timeline', 'ordered', or '').
+                    If None, derived from ability code via _ABILITY_TO_INTENT mapping.
+                    If provided explicitly, takes precedence."""
         result = {"context": "", "facts": [], "source": "fallback"}
 
         # Determine ability from query if not provided
@@ -4687,30 +4837,36 @@ class BeamMemory:
 
         # Map BEAM ability codes to generic intent strings for core memory logic
         _ABILITY_TO_INTENT = {'KU': 'current', 'CR': 'change', 'TR': 'timeline', 'EO': 'ordered'}
-        intent = _ABILITY_TO_INTENT.get(ability, '')
+        # Resolve intent: explicit intent parameter takes precedence, else derive from ability
+        if intent is None:
+            intent = _ABILITY_TO_INTENT.get(ability, '')
+        # else: intent is explicitly provided; use as-is
 
-        if ability in ('IE', 'KU'):
-            return self._memoria_fact_retrieve(query, top_k, intent=intent)
-        elif ability == 'TR':
+        # Route on the RESOLVED intent, not the raw ability
+        if intent == 'timeline':
             timeline = self._memoria_timeline_retrieve(query, top_k)
-            facts = self._memoria_fact_retrieve(query, top_k, intent=intent)
+            facts = self._memoria_fact_retrieve(query, top_k, intent='timeline')
             return self._merge_memoria_results(timeline, facts)
-        elif ability == 'CR':
+        elif intent == 'change':
             neg = self._memoria_negation_retrieve(query, top_k)
-            facts = self._memoria_fact_retrieve(query, top_k, intent=intent)
+            facts = self._memoria_fact_retrieve(query, top_k, intent='change')
             return self._merge_memoria_results(neg, facts)
-        elif ability == 'MR':
-            return self._memoria_entity_retrieve(query, top_k)
-        elif ability == 'EO':
+        elif intent == 'ordered':
             chrono = self._memoria_chrono_retrieve(query, top_k)
-            facts = self._memoria_fact_retrieve(query, top_k, intent=intent)
+            facts = self._memoria_fact_retrieve(query, top_k, intent='ordered')
             return self._merge_memoria_results(chrono, facts)
-        elif ability == 'IF':
-            return self._memoria_instruction_retrieve(query, top_k)
-        elif ability == 'PF':
-            return self._memoria_preference_retrieve(query, top_k)
         else:
-            return result
+            # Default path (intent='current', intent='', or unrecognized)
+            # Also handles ability-only paths (MR, IE, IF, PF) that don't have intent variants
+            if ability == 'MR':
+                return self._memoria_entity_retrieve(query, top_k)
+            elif ability == 'IF':
+                return self._memoria_instruction_retrieve(query, top_k)
+            elif ability == 'PF':
+                return self._memoria_preference_retrieve(query, top_k)
+            else:
+                # IE, KU, or unclassified: use generic fact retrieval with resolved intent
+                return self._memoria_fact_retrieve(query, top_k, intent=intent)
 
     @staticmethod
     def _classify_ability(query: str) -> str:
@@ -5252,7 +5408,12 @@ class BeamMemory:
         return {"context": "", "facts": [], "source": "fallback"}
 
     def _memoria_chrono_retrieve(self, query: str, top_k: int = 10) -> dict:
-        """Query memoria_facts for sequence markers, ordered by message_idx."""
+        """Return broad conversation evidence in message order.
+
+        Explicit sequence facts are useful, but ordinary topic introductions do
+        not contain words such as "first" or "then". Include chronological user
+        memories as well so ordered queries can see those introductions.
+        """
         cursor = self.conn
         rows = cursor.execute(
             "SELECT value, message_idx FROM memoria_facts "
@@ -5260,10 +5421,73 @@ class BeamMemory:
             "ORDER BY message_idx ASC LIMIT ?",
             (self.session_id, top_k)
         ).fetchall()
-        if rows:
-            facts = [dict(zip(['sequence', 'msg_idx'], r)) for r in rows]
-            ctx_lines = [f"[{i+1}] {r[0]}" for i, r in enumerate(rows)]
-            return {"context": "\n".join(ctx_lines), "facts": facts, "source": "memoria_sequences"}
+        entries = [
+            (r[1], f"[MSGIDX:{r[1]}] {r[0]}",
+             dict(zip(['sequence', 'msg_idx'], r)), None)
+            for r in rows
+        ]
+
+        # Ordered questions need coverage across the conversation before they
+        # can select and sort topics. Four times the requested answer depth is
+        # enough breadth for normal queries while keeping the context bounded.
+        memory_limit = min(max(top_k * 4, top_k), 120)
+        memory_rows = cursor.execute(
+            "SELECT id, content, message_index FROM working_memory "
+            "WHERE session_id = ? AND superseded_by IS NULL "
+            "AND (source = 'conversation' OR source = 'user' OR source LIKE '%user%') "
+            "ORDER BY message_index ASC LIMIT ?",
+            (self.session_id, memory_limit),
+        ).fetchall()
+
+        import re as _re
+        ordering_words = {
+            'about', 'aspects', 'brought', 'conversations', 'different',
+            'order', 'ordered', 'project', 'throughout', 'which',
+        }
+        query_terms = {
+            word for word in _re.findall(r'[a-zA-Z]{4,}', query.lower())
+            if word not in ordering_words
+        }
+
+        for memory_id, content, message_index in memory_rows:
+            if message_index is None:
+                continue
+            clean_content = _re.sub(r'^\[MSGIDX:\d+\]\s*', '', content).strip()
+            content_terms = set(_re.findall(r'[a-zA-Z]{4,}', clean_content.lower()))
+            if len(query_terms & content_terms) >= 2:
+                snippet = clean_content[:300]
+            elif len(clean_content) <= 105:
+                snippet = clean_content
+            else:
+                # Preserve both the subject and the first detail clause. Long
+                # code-heavy turns otherwise consume the entire ordering budget.
+                snippet = f"{clean_content[:50]} ... {clean_content[125:175]}"
+            line = f"[MSGIDX:{message_index}] {snippet}"
+            fact = {"content": snippet, "msg_idx": message_index}
+            entries.append((message_index, line, fact, memory_id))
+
+        if entries:
+            entries.sort(key=lambda entry: entry[0])
+            context_budget = 15_500
+            ctx_lines = []
+            facts = []
+            source_ids = []
+            used_chars = 0
+            for _, line, fact, source_id in entries:
+                added_chars = len(line) + (1 if ctx_lines else 0)
+                if used_chars + added_chars > context_budget:
+                    continue
+                ctx_lines.append(line)
+                facts.append(fact)
+                used_chars += added_chars
+                if source_id:
+                    source_ids.append(source_id)
+            return {
+                "context": "\n".join(ctx_lines),
+                "facts": facts,
+                "source": "memoria_sequences",
+                "source_memory_ids": source_ids,
+            }
         return {"context": "", "facts": [], "source": "fallback"}
 
     def _memoria_instruction_retrieve(self, query: str, top_k: int = 10) -> dict:

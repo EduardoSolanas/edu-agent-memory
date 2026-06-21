@@ -1233,6 +1233,76 @@ def test_ie_how_question_suppresses_false_absence():
     assert "do not trigger absence" in prompt.lower()
 
 
+def test_case1_q7_how_prompt_overrides_unrelated_conflict_framing():
+    from edumem.core.query_mode import build_system_prompt
+
+    question = (
+        "How did I organize the tasks over the course of the sprint to ensure "
+        "both backend and frontend aspects of the features were completed on time?"
+    )
+    prompt = build_system_prompt(question).lower()
+
+    assert "do not start with 'the conversation contains contradictory information:'" in prompt
+    assert "different sprints" in prompt
+    assert "answer from the relevant actions" in prompt
+    assert "you must surface both explicitly" not in prompt
+
+
+def test_explicit_how_conflict_question_keeps_contradiction_resolution():
+    from edumem.core.query_mode import build_system_prompt
+
+    prompt = build_system_prompt(
+        "How did I handle the conflicting sprint deadlines?"
+    ).lower()
+
+    assert "contradiction resolution" in prompt
+    assert "present both sides" in prompt
+
+
+def test_case1_q7_procedural_recall_keeps_sprint_plan_out_of_negation_route(tmp_path):
+    """100K case 1 q7: a procedural ``How did I`` query is not a CR query."""
+    saved_no_embeddings = os.environ.get("EDUMEM_NO_EMBEDDINGS")
+    os.environ["EDUMEM_NO_EMBEDDINGS"] = "1"
+    beam = _make_beam(tmp_path)
+    question = (
+        "How did I organize the tasks over the course of the sprint to ensure "
+        "both backend and frontend aspects of the features were completed on time?"
+    )
+    sprint_plan = (
+        "Sprint 1 ends March 29. Week 1: set up the development environment, "
+        "define the database schema, implement registration and login, add "
+        "validation, and write unit tests. Week 2: add frontend forms, integrate "
+        "the frontend with the backend, add security, and finish testing."
+    )
+    try:
+        ingest_conversation(
+            beam,
+            [
+                {"role": "user", "content": "The analytics sprint did not include frontend work."},
+                {"role": "assistant", "content": "That later sprint was backend-only."},
+                {"role": "assistant", "content": sprint_plan},
+            ],
+        )
+        diag = {}
+
+        memories = _multi_strategy_recall(
+            beam, question, top_k=10, ability=None, diag=diag,
+        )
+
+        assert diag["strategies"]["S2"]["activated"] is False
+        assert any(
+            "define the database schema" in memory.get("content", "")
+            and "add frontend forms" in memory.get("content", "")
+            for memory in memories
+        )
+    finally:
+        beam.conn.close()
+        if saved_no_embeddings is None:
+            os.environ.pop("EDUMEM_NO_EMBEDDINGS", None)
+        else:
+            os.environ["EDUMEM_NO_EMBEDDINGS"] = saved_no_embeddings
+
+
 def test_tr_duration_modifier_uses_semantic_matching():
     """TR q0: 'Weeks between transaction management and final deployment
     deadline' — model couldn't find 'final deployment deadline'. Duration
@@ -1883,10 +1953,272 @@ def test_beam_integ_default_ability_no_version_annotation(tmp_path):
         ctx = result["context"].lower()
         # IE should use flat format, NOT version-aware annotations
         assert "[fact current" not in ctx, \
-            f"IE should not use CURRENT format, got: {result['context']}"
+            f"IE should not use CURRENT format, got: {result['content']}"
         assert "[fact changed" not in ctx
         assert "[fact timeline" not in ctx
         # Should still show latest value
         assert "3weeks" in ctx
+    finally:
+        beam.conn.close()
+
+
+# ============================================================================
+# NEW TESTS: Intent-Derived Routing (Pure-Recall / Label-Free)
+# ============================================================================
+# These tests verify that memoria_retrieve(ability=None, intent=<derived>) activates
+# versioned-fact surfacing in pure-recall (label-free) mode.
+
+
+def test_memoria_retrieve_intent_current_activates_under_no_ability(tmp_path):
+    """With ability=None, explicit intent='current' must activate versioned KU surfacing.
+
+    This test FAILS if intent parameter is ignored or not routed correctly."""
+    beam = _make_beam_for_integration(tmp_path, "test_intent_current")
+    try:
+        # Insert a version chain (KU-style)
+        beam._insert_fact("test_intent_current", 30, "metric", "api_response_time",
+                          "500ms", "API response time was 500ms", 0.7,
+                          source_memory_id="msg30")
+        beam._insert_fact("test_intent_current", 70, "metric", "api_response_time",
+                          "200ms", "API response time is now 200ms", 0.7,
+                          source_memory_id="msg70")
+        beam.conn.commit()
+
+        # Call with ability=None but explicit intent='current'
+        result = beam.memoria_retrieve(
+            "What is the current API response time?", ability=None, intent="current", top_k=10
+        )
+        ctx = result["context"]
+        # Must NOT be fallback
+        assert result.get("source") != "fallback", \
+            f"Intent='current' should activate retrieval, got fallback"
+        # Must contain CURRENT format
+        assert "[fact current" in ctx.lower(), \
+            f"Intent='current' must activate CURRENT format, got: {ctx}"
+        # Must show latest value
+        assert "200ms" in ctx
+    finally:
+        beam.conn.close()
+
+
+def test_memoria_retrieve_intent_change_activates_under_no_ability(tmp_path):
+    """With ability=None, explicit intent='change' must activate versioned CR surfacing.
+
+    This test FAILS if intent parameter is ignored or not routed correctly."""
+    beam = _make_beam_for_integration(tmp_path, "test_intent_change")
+    try:
+        # Insert a version chain (CR-style) using key that matches query term
+        beam._insert_fact("test_intent_change", 20, "entity", "Frontend_framework",
+                          "jQuery", "Used jQuery for UI", 0.7,
+                          source_memory_id="msg20")
+        beam._insert_fact("test_intent_change", 60, "entity", "Frontend_framework",
+                          "React", "Switched to React", 0.7,
+                          source_memory_id="msg60")
+        beam.conn.commit()
+
+        # Call with ability=None but explicit intent='change'
+        result = beam.memoria_retrieve(
+            "Have I changed the Frontend framework?", ability=None, intent="change", top_k=10
+        )
+        ctx = result["context"]
+        # Must NOT be fallback
+        assert result.get("source") != "fallback", \
+            f"Intent='change' should activate retrieval, got fallback"
+        # Must contain CHANGED format
+        assert "[fact changed" in ctx.lower(), \
+            f"Intent='change' must activate CHANGED format, got: {ctx}"
+        # Must show both old and new values
+        assert "jquery" in ctx.lower()
+        assert "react" in ctx.lower()
+    finally:
+        beam.conn.close()
+
+
+def test_memoria_retrieve_intent_timeline_activates_under_no_ability(tmp_path):
+    """With ability=None, explicit intent='timeline' must activate versioned TR surfacing.
+
+    This test FAILS if intent parameter is ignored or not routed correctly."""
+    beam = _make_beam_for_integration(tmp_path, "test_intent_timeline")
+    try:
+        # Insert a version chain with dates (TR-style)
+        # Use metric type and numeric key for Pass 1 search to work
+        beam._insert_fact("test_intent_timeline", 10, "metric", "deadline_01_15",
+                          "2024-02-01", "Original deadline Feb 1", 0.7,
+                          source_memory_id="msg10")
+        beam._insert_fact("test_intent_timeline", 45, "metric", "deadline_01_15",
+                          "2024-03-15", "Deadline extended to Mar 15", 0.7,
+                          source_memory_id="msg45")
+        beam.conn.commit()
+
+        # Call with ability=None but explicit intent='timeline'
+        # Query with numbers that will trigger Pass 1 search
+        result = beam.memoria_retrieve(
+            "What happened to the deadline between 01-15 and 2024?", ability=None, intent="timeline", top_k=10
+        )
+        ctx = result["context"]
+        # Must NOT be fallback
+        assert result.get("source") != "fallback", \
+            f"Intent='timeline' should activate retrieval, got fallback"
+        # Must contain TIMELINE format
+        assert "[fact timeline" in ctx.lower(), \
+            f"Intent='timeline' must activate TIMELINE format, got: {ctx}"
+        # Must show both dates
+        assert "2024-02-01" in ctx
+        assert "2024-03-15" in ctx
+    finally:
+        beam.conn.close()
+
+
+def test_intent_from_question_maps_text_to_intent():
+    """_intent_from_question() must derive correct intent from question text only.
+
+    This test FAILS if the intent mapper doesn't recognize question patterns."""
+    from tools.evaluate_beam_end_to_end import _intent_from_question
+
+    # Current (KU) questions
+    assert _intent_from_question("What is the current API version?") == "current"
+    assert _intent_from_question("What is the latest status?") == "current"
+    assert _intent_from_question("How many items do I have?") == "current"
+
+    # Timeline (TR) questions
+    assert _intent_from_question("How long between Jan 1 and Feb 15?") == "timeline"
+    assert _intent_from_question("How many weeks did that take?") == "timeline"
+    assert _intent_from_question("How many days between the two dates?") == "timeline"
+
+    # Change (CR) questions — explicit contradiction wording AND yes/no checks
+    assert _intent_from_question("Is there a contradiction in my answers?") == "change"
+    assert _intent_from_question("Did I mention conflicting information?") == "change"
+    assert _intent_from_question("Have I worked with Flask routes?") == "change"
+
+    # Ordered (EO) questions
+    assert _intent_from_question("In what order did I implement them?") == "ordered"
+    assert _intent_from_question("What sequence did we follow?") == "ordered"
+    assert _intent_from_question("Walk me through the steps.") == "ordered"
+
+    # Default: value-seeking questions fall through to 'current' (KU questions
+    # rarely carry explicit keywords; current-rendering is harmless without history)
+    assert _intent_from_question("What is the average response time?") == "current"
+    assert _intent_from_question("Tell me about your experience.") == "current"
+
+
+# ============================================================
+#  LLM-Assisted Canonical Metric Key Consolidation Tests
+# ============================================================
+
+def test_canonical_metric_keys_collapse_and_chain(tmp_path):
+    """Prove that canonical keys enable version chaining via existing _insert_fact.
+
+    Manually insert three metric facts under the SAME key "response_time_ms"
+    with different values at increasing msg_idx. Assert the invariant:
+    exactly one live row for that key, with previous_value chain.
+
+    This should PASS even before implementing the LLM consolidation feature,
+    proving that _insert_fact already chains versions correctly.
+    """
+    beam = _make_beam_for_integration(tmp_path, "canonical_chain")
+    try:
+        # Three observations of the same metric, same canonical key
+        beam._insert_fact("canonical_chain", 50, "metric", "response_time_ms",
+                          "800ms", "Response time is 800ms", 0.65,
+                          source_memory_id="msg50")
+        beam._insert_fact("canonical_chain", 80, "metric", "response_time_ms",
+                          "300ms", "Response time reduced to 300ms", 0.65,
+                          source_memory_id="msg80")
+        beam._insert_fact("canonical_chain", 100, "metric", "response_time_ms",
+                          "250ms", "Response time improved to 250ms", 0.65,
+                          source_memory_id="msg100")
+        beam.conn.commit()
+
+        # Query the metric fact table
+        rows = beam.conn.execute(
+            "SELECT key, value, previous_value, version_id FROM memoria_facts "
+            "WHERE session_id = ? AND fact_type = 'metric' AND key = ? AND valid_to_msg_idx IS NULL",
+            ("canonical_chain", "response_time_ms")
+        ).fetchall()
+
+        # Should have exactly one live row (the latest)
+        assert len(rows) == 1, f"Expected 1 live row, got {len(rows)}"
+        key, value, previous_value, version_id = rows[0]
+        assert value == "250ms", f"Expected latest value '250ms', got '{value}'"
+        assert previous_value == "300ms", f"Expected previous_value '300ms', got '{previous_value}'"
+        assert version_id == 2, f"Expected version_id=2, got {version_id}"
+    finally:
+        beam.conn.close()
+
+
+def test_build_canonicalize_prompt_lists_existing_and_observations(tmp_path):
+    """Test that _build_canonicalize_prompt generates a well-formed LLM prompt.
+
+    The prompt should list existing facts and new observations,
+    requesting canonical keys in JSON format.
+    """
+    beam = _make_beam_for_integration(tmp_path, "prompt_test")
+    try:
+        existing = [("response_time_ms", "300ms")]
+        candidates = [{
+            "context": "dashboard API response time of",
+            "value": "250ms",
+            "raw_key": "api_response_of_ms"
+        }]
+
+        prompt = beam._build_canonicalize_prompt(existing, candidates)
+
+        # Prompt should mention existing facts and observations
+        assert "response_time_ms" in prompt, "Prompt should list existing key"
+        assert "300ms" in prompt, "Prompt should list existing value"
+        assert "250ms" in prompt, "Prompt should list observation value"
+        assert "dashboard API response time" in prompt, "Prompt should include context"
+        # Should ask for JSON response
+        assert "json" in prompt.lower() or "JSON" in prompt, "Prompt should ask for JSON"
+    finally:
+        beam.conn.close()
+
+
+def test_parse_canonicalize_response_handles_json_and_fences(tmp_path):
+    """Test that _parse_canonicalize_response correctly parses LLM output.
+
+    Should handle JSON fences and extract canonical keys from array.
+    """
+    beam = _make_beam_for_integration(tmp_path, "parse_test")
+    try:
+        # Test with JSON fences
+        raw = '''```json
+[{"index": 0, "canonical_key": "response_time_ms", "is_update": true}]
+```'''
+        result = beam._parse_canonicalize_response(raw, 1)
+        assert result == ["response_time_ms"], f"Expected ['response_time_ms'], got {result}"
+
+        # Test with invalid JSON
+        bad_raw = "this is not json"
+        result = beam._parse_canonicalize_response(bad_raw, 2)
+        assert result == [None, None], f"Expected [None, None] for invalid JSON, got {result}"
+    finally:
+        beam.conn.close()
+
+
+def test_consolidation_falls_back_to_regex_without_llm(tmp_path):
+    """Test that without llm_client, _llm_canonicalize_facts returns raw_keys.
+
+    Should preserve current behavior when no LLM is available.
+    """
+    beam = _make_beam_for_integration(tmp_path, "no_llm")
+    try:
+        # Verify beam has no llm_client
+        assert beam._llm_client is None, "Test setup: beam should have no llm_client"
+
+        candidates = [
+            {"raw_key": "a_ms", "value": "1ms", "context": "x"},
+            {"raw_key": "b_ms", "value": "2ms", "context": "y"},
+        ]
+
+        result = beam._llm_canonicalize_facts("no_llm", candidates)
+        assert result == ["a_ms", "b_ms"], f"Expected raw keys, got {result}"
+
+        # Also test that extract_and_store_facts still works (doesn't raise)
+        # with the current metric loop
+        content = "The API response time is 250ms and latency was 300ms."
+        counts = beam.extract_and_store_facts(content, message_idx=0)
+        assert counts["metric"] >= 0, "extract_and_store_facts should not raise"
+        beam.conn.commit()
     finally:
         beam.conn.close()

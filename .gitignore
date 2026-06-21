@@ -16,6 +16,7 @@ node_modules/
 package-lock.json
 
 # Datasets and Caches
+.cache/
 data/
 *.db
 *.db-journal

@@ -168,8 +168,8 @@ def is_contradiction_query(question: str) -> bool:
 
 
 def is_yesno_check_query(question: str) -> bool:
-    q = question.lower()
-    return any(q.startswith(k) or f" {k}" in q for k in _YESNO_CHECK_KEYWORDS)
+    q = question.lower().lstrip()
+    return any(q.startswith(k) for k in _YESNO_CHECK_KEYWORDS)
 
 
 def is_how_query(question: str) -> bool:
@@ -308,27 +308,43 @@ Do NOT answer with only one side if the other side also has evidence in the cont
 
 _HOW_MODIFIER = """
 
-HOW QUESTIONS: This question asks HOW something was done, organized, structured, or approached. The answer is often the sequence of WHAT was actually done — the actions taken, decisions made, and their order implicitly describe the approach. Do NOT trigger ABSENCE just because there is no explicit meta-statement about methodology or strategy. If the context contains the actual tasks, steps, or actions that were performed, describe them as the answer to "how". List the sequence of activities and decisions, which together show HOW the thing was accomplished."""
+HOW QUESTIONS: This question asks HOW something was done, organized, structured, or approached. The answer is often the sequence of WHAT was actually done — the actions taken, decisions made, and their order implicitly describe the approach. Do NOT trigger ABSENCE just because there is no explicit meta-statement about methodology or strategy. If the context contains the actual tasks, steps, or actions that were performed, describe them as the answer to "how". List the sequence of activities and decisions, which together show HOW the thing was accomplished.
+
+PROCEDURAL CONFLICT OVERRIDE: This overrides base rule 3. Unless the question explicitly asks about a contradiction or conflict, IGNORE the CONFLICTS rule entirely and do not start with 'The conversation contains contradictory information:'. Negative or contradictory snippets about different sprints, features, or time periods are not conflicts about the procedure being asked about. Answer from the relevant actions, tasks, and decisions; ignore unrelated negative snippets."""
 
 _LIST_MODIFIER = """
 
 LIST COMPLETENESS: This question asks for a list of items. Be EXHAUSTIVE — include EVERY item found in the context with ALL available details (versions, configurations, purposes). Do not truncate or summarize. If versions are mentioned, always include the exact version number next to each item. Format as a bullet list or comma-separated list with details. Do NOT cut off your answer early — provide a complete enumeration."""
 
 
+def _procedural_base_prompt() -> str:
+    """Replace conflict-first behavior with relevance-first behavior for HOW queries."""
+    start = _BASE_PROMPT.index("3. CONFLICTS")
+    end = _BASE_PROMPT.index("4. ABSENCE")
+    relevance_rule = (
+        "3. RELEVANCE — use facts about the specific procedure, task, or approach "
+        "asked about. Ignore unrelated statements about other work.\n"
+    )
+    return _BASE_PROMPT[:start] + relevance_rule + _BASE_PROMPT[end:]
+
+
 def build_system_prompt(question: str) -> str:
     """Base behavior always; append format guidance only when the question asks for it."""
-    prompt = _BASE_PROMPT
+    yesno_query = is_yesno_check_query(question)
+    how_query = is_how_query(question) and not yesno_query
+    contradiction_query = is_contradiction_query(question)
+    prompt = _procedural_base_prompt() if how_query and not contradiction_query else _BASE_PROMPT
     if is_ordering_query(question):
         prompt += _ORDERING_MODIFIER
     if is_stated_duration_query(question):
         prompt += _STATED_DURATION_MODIFIER
     elif is_duration_query(question):
         prompt += _DURATION_MODIFIER
-    if is_contradiction_query(question):
+    if contradiction_query:
         prompt += _CR_MODIFIER
-    if is_yesno_check_query(question):
+    if yesno_query:
         prompt += _YESNO_CHECK_MODIFIER
-    if is_how_query(question):
+    if how_query:
         prompt += _HOW_MODIFIER
     if is_knowledge_update_query(question):
         prompt += _KU_MODIFIER

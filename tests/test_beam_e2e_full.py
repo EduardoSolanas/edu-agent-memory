@@ -146,6 +146,63 @@ def _order(answer: str, nuggets: list[str]) -> tuple[bool, str]:
     return True, f"keywords in order: {keywords}"
 
 
+def _format_metric_chain(key: str, previous_value: str, value: str, version_id: int) -> str:
+    """Render metric history with an ASCII arrow for Windows consoles."""
+    return f"  {key}: {previous_value} -> {value} (version {version_id})"
+
+
+def _llm_errors(answers: dict[str, str]) -> dict[str, str]:
+    """Return transport/model failures separately from answer-quality failures."""
+    return {
+        qid: answer
+        for qid, answer in answers.items()
+        if answer.lstrip().startswith("[LLM_ERROR:")
+    }
+
+
+def _case_outcome(case: dict, answer: str) -> dict:
+    check = case["check"]
+    if answer.lstrip().startswith("[LLM_ERROR:"):
+        return {"outcome": "llm_error", "detail": answer}
+    if check == "skip":
+        return {"outcome": "ungraded", "detail": "not statically gradable"}
+    if check == "contains_all":
+        ok, missing = _contains_all(answer, case.get("nuggets", []))
+        return {"outcome": "passed" if ok else "failed", "missing": missing}
+    if check == "absence":
+        ok = _absence(answer)
+        return {"outcome": "passed" if ok else "failed"}
+    if check == "order":
+        ok, detail = _order(answer, case.get("nuggets", []))
+        return {"outcome": "passed" if ok else "failed", "detail": detail}
+    return {"outcome": "ungraded", "detail": f"unknown check: {check}"}
+
+
+def _build_e2e_artifact(cases: list[dict], answers: dict[str, str]) -> dict:
+    """Build a credential-free artifact from generated answers and static checks."""
+    rows = []
+    for case in cases:
+        answer = answers.get(case["qid"], "")
+        row = {
+            "qid": case["qid"],
+            "ability": case["ability"],
+            "expectation": case["expectation"],
+            "check": case["check"],
+            **_case_outcome(case, answer),
+            "answer": answer,
+        }
+        rows.append(row)
+    return {"cases": rows}
+
+
+def _write_e2e_artifact(path: Path, artifact: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(artifact, indent=2, ensure_ascii=True) + "\n",
+        encoding="utf-8",
+    )
+
+
 @pytest.fixture(scope="module")
 def e2e_answers():
     """
@@ -225,6 +282,13 @@ def e2e_answers():
 
         print(f"\n[E2E] Answer generation complete. Generated: {len(answers)}")
 
+        output_path = Path(os.environ.get(
+            "EDUMEM_E2E_OUTPUT_PATH",
+            str(Path(tempfile.gettempdir()) / "edumem_beam_e2e_case1.json"),
+        ))
+        _write_e2e_artifact(output_path, _build_e2e_artifact(_FIXTURE_CASES, answers))
+        print(f"[E2E] Results artifact: {output_path}")
+
         yield {"answers": answers, "beam": beam}
 
     finally:
@@ -297,6 +361,12 @@ def test_beam_e2e_answer_meets_static_expectation(case, e2e_answers):
         )
 
 
+def test_beam_e2e_has_no_llm_transport_errors(e2e_answers):
+    """Keep endpoint failures visible even when an affected case is marked xfail."""
+    errors = _llm_errors(e2e_answers["answers"])
+    assert not errors, f"LLM answer generation errors: {errors}"
+
+
 def test_beam_e2e_storage(e2e_answers):
     """
     Storage test (not parametrized): verify facts and version chains.
@@ -317,3 +387,34 @@ def test_beam_e2e_storage(e2e_answers):
     versioned_facts = cursor.fetchone()[0]
 
     print(f"\n[E2E Storage] Total facts: {total_facts}, Versioned (with previous_value): {versioned_facts}")
+
+
+def test_beam_e2e_metric_version_chain_forms(e2e_answers):
+    """
+    Verify that LLM-assisted metric consolidation forms version chains.
+
+    Query the shared beam's memoria_facts for metric facts with version history
+    (previous_value IS NOT NULL). Assert at least one metric version chain exists,
+    proving that identical metrics phrased differently collapsed to a single key.
+    """
+    beam = e2e_answers["beam"]
+    cursor = beam.conn.cursor()
+
+    # Query metric facts that have a version chain
+    cursor.execute(
+        "SELECT key, value, previous_value, version_id FROM memoria_facts "
+        "WHERE fact_type = 'metric' AND previous_value IS NOT NULL "
+        "ORDER BY key, version_id DESC"
+    )
+    metric_chains = cursor.fetchall()
+
+    # Assert at least one metric version chain
+    assert len(metric_chains) >= 1, (
+        f"Expected at least 1 metric version chain (consolidation result), "
+        f"but got {len(metric_chains)}"
+    )
+
+    # Print for visibility
+    print("\n[E2E Metric Consolidation] Version chains detected:")
+    for key, value, prev_value, version_id in metric_chains:
+        print(_format_metric_chain(key, prev_value, value, version_id))

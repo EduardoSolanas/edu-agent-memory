@@ -57,7 +57,34 @@ import urllib.error
 import numpy as np
 
 from edumem.core.beam import BeamMemory, init_beam, _embeddings, _vec_available, _vec_insert, _fts_search_working, _generate_id, parse_relative_date
-from edumem.core.query_mode import build_system_prompt, is_temporal_query, needs_second_pass, is_ordering_query, is_duration_query, is_aggregation_query, is_date_interval_query, is_stated_duration_query, is_summarization_query
+from edumem.core.query_mode import (
+    build_system_prompt, is_temporal_query, needs_second_pass, is_ordering_query, is_duration_query,
+    is_aggregation_query, is_date_interval_query, is_stated_duration_query, is_summarization_query,
+    is_contradiction_query, is_knowledge_update_query
+)
+
+
+def _intent_from_question(question: str) -> str:
+    """Map a question to a generic recall intent from its TEXT only (no dataset label).
+
+    Returns one of: 'ordered', 'timeline', 'change', or 'current'.
+
+    'current' is the default on purpose: real BEAM questions rarely use KU
+    keywords (they ask "what is the X"), and current-rendering is harmless when a
+    fact has no version history (it falls back to flat). First-person history
+    checks ("have I...", "did I/we...") map to 'change' — the contradiction-
+    resolution pattern where we want both sides of a value change surfaced. We use
+    a narrow anchored match here, NOT is_yesno_check_query, because that helper's
+    " is the " token also fires on declarative "what is the X" value questions.
+    """
+    import re
+    if is_ordering_query(question):
+        return "ordered"
+    if is_duration_query(question):
+        return "timeline"
+    if is_contradiction_query(question) or re.match(r"^\s*(?:have|did)\s+(?:i|we)\b", (question or "").lower()):
+        return "change"
+    return "current"
 
 
 def _is_calculator_question(question: str) -> bool:
@@ -85,10 +112,14 @@ def _wants_broad_aggregation_retrieval(question: str) -> bool:
 
 def _wants_negation_retrieval(question: str) -> bool:
     """Return True only when the question is actually asking about negation."""
-    q = (question or "").lower()
+    import re
+
+    q = (question or "").strip().lower()
     if is_duration_query(question) or is_stated_duration_query(question):
         return False
-    return any(w in q for w in ["have i", "did i", "do i", "am i", "has"]) or "contradict" in q or "conflict" in q
+    if "contradict" in q or "conflict" in q:
+        return True
+    return re.match(r"^(?:(?:have|did|do|am)\s+i\b|has\b)", q) is not None
 
 
 def _tr_python_answer_is_trustworthy(py_answer: str, timeline_size: int,
@@ -2815,11 +2846,13 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
     # and memoria_kg tables. These provide exact values that FTS5/vector search
     # may miss (dates, metrics, versions, negations, sequences, entity mappings).
     # Injected as synthetic high-score entries so they surface ahead of fuzzy matches.
+    # In pure-recall (label-free) mode, derive intent from question text to activate routing.
     try:
-        _memoria_result = beam.memoria_retrieve(question, ability=routing_ability, top_k=top_k)
+        _recall_intent = _intent_from_question(question)
+        _memoria_result = beam.memoria_retrieve(question, ability=routing_ability, top_k=top_k, intent=_recall_intent)
         if _memoria_result and _memoria_result.get("source") != "fallback" and _memoria_result.get("context"):
             _memoria_facts = _memoria_result.get("facts", [])
-            print(f"    [MEMORIA] {_memoria_result['source']} hit for ability={routing_ability}: {len(_memoria_facts)} facts", flush=True)
+            print(f"    [MEMORIA] {_memoria_result['source']} hit for intent={_recall_intent}, ability={routing_ability}: {len(_memoria_facts)} facts", flush=True)
             memories.insert(0, {
                 "content": f"[MEMORIA {_memoria_result['source']}]\n{_memoria_result['context']}",
                 "score": 0.95,
