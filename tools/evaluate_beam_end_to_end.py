@@ -69,22 +69,45 @@ def _intent_from_question(question: str) -> str:
 
     Returns one of: 'ordered', 'timeline', 'change', or 'current'.
 
-    'current' is the default on purpose: real BEAM questions rarely use KU
-    keywords (they ask "what is the X"), and current-rendering is harmless when a
-    fact has no version history (it falls back to flat). First-person history
-    checks ("have I...", "did I/we...") map to 'change' — the contradiction-
-    resolution pattern where we want both sides of a value change surfaced. We use
-    a narrow anchored match here, NOT is_yesno_check_query, because that helper's
-    " is the " token also fires on declarative "what is the X" value questions.
+    Uses the OpenVINO reranker to perform Zero-Shot Classification of intent,
+    falling back to robust local regex if the reranker is unavailable.
     """
     import re
-    if is_ordering_query(question):
-        return "ordered"
-    if is_duration_query(question):
-        return "timeline"
-    if is_contradiction_query(question) or re.match(r"^\s*(?:have|did)\s+(?:i|we)\b", (question or "").lower()):
-        return "change"
-    return "current"
+    import os
+    import requests
+
+    def _fallback_intent(q_text: str) -> str:
+        if is_ordering_query(q_text):
+            return "ordered"
+        if is_duration_query(q_text):
+            return "timeline"
+        if is_contradiction_query(q_text) or re.match(r"^\s*(?:have|did)\s+(?:i|we)\b", (q_text or "").lower()):
+            return "change"
+        return "current"
+
+    # Reuse our local OpenVINO reranker for fast dynamic intent classification (Zero-Shot classification pattern)
+    _reranker_url = os.environ.get("EDUMEM_RERANKER_URL", "http://localhost:3002/rerank")
+    try:
+        # Hypotheses mapped to index 0: ordered, 1: timeline, 2: change, 3: current
+        hypotheses = [
+            "This query asks about the chronological order, sequence, or ordering of events.",
+            "This query asks about dates, deadlines, duration, intervals, or timeline of events.",
+            "This query asks about a change of state, switched preference, contradictions, or previous versus current values.",
+            "This query asks for general factual details, current versions, or standard information of an entity.",
+        ]
+        resp = requests.post(_reranker_url, json={"query": question, "texts": hypotheses}, timeout=1.0)
+        if resp.status_code == 200:
+            scores = resp.json()
+            if isinstance(scores, list) and len(scores) == len(hypotheses):
+                # Format: [{"index": idx, "score": score}, ...]
+                sorted_scores = sorted(scores, key=lambda x: x.get("score", 0.0), reverse=True)
+                best_idx = sorted_scores[0]["index"]
+                intents = ["ordered", "timeline", "change", "current"]
+                return intents[best_idx]
+    except Exception:
+        pass
+
+    return _fallback_intent(question)
 
 
 def _is_calculator_question(question: str) -> bool:
