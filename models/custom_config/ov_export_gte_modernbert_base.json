@@ -1,0 +1,18 @@
+{
+  "name": "gte-modernbert-base-openvino-export",
+  "source": {
+    "huggingface_repo": "Alibaba-NLP/gte-modernbert-base",
+    "onnx_file": "onnx/model_fp16.onnx",
+    "onnx_resolved_url": "https://huggingface.co/Alibaba-NLP/gte-modernbert-base/resolve/main/onnx/model_fp16.onnx",
+    "onnx_sha256": "505e85e8cdf09e53f1eda0c22e023ccbbf5682846b0ce91e5ae21992d6290992"
+  },
+  "export": {
+    "method": "openvino-ovc",
+    "command": "ovc /root/gte_modernbert_fp16.onnx --output_model ov_gte_modernbert --compress_to_fp16=False --verbose",
+    "ov_xml": "ov_gte_modernbert.xml",
+    "ov_bin": "ov_gte_modernbert.bin",
+    "ov_xml_sha256": "512be273b57b1fb7054496dc0b56fbbc0cf5e79f205ee7173ca3622723caa540",
+    "notes": "Conversion performed from HF ONNX FP16 artifact using OpenVINO ovc tool. This model is ModernBERT-based; Optimum export may require a custom_export_configs.json for direct optimum-cli export of 'modernbert' architecture."
+  },
+  "timestamp_utc": "2026-06-21T23:18:00Z"
+}
