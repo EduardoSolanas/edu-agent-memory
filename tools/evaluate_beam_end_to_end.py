@@ -1256,6 +1256,22 @@ def ingest_conversation(beam: BeamMemory, messages: list[dict], diag: dict | Non
     for batch_start in range(0, len(messages), BATCH_SIZE):
         batch_msgs = messages[batch_start:batch_start + BATCH_SIZE]
 
+        # Pre-classify user messages in parallel to cut down latency (Hindsight concurrent optimization pattern)
+        classifications = {}
+        if llm is not None:
+            user_jobs = []
+            for idx, msg in enumerate(batch_msgs):
+                if msg.get("role", "").lower() == "user":
+                    user_jobs.append((idx, msg.get("content", "")))
+            if user_jobs:
+                from concurrent.futures import ThreadPoolExecutor
+                def _classify_worker(job):
+                    idx, content = job
+                    return idx, _classify_message_llm(llm, content)
+                with ThreadPoolExecutor(max_workers=4) as executor:
+                    results = list(executor.map(_classify_worker, user_jobs))
+                classifications = {idx: tags for idx, tags in results}
+
         batch_items = []
         for i, msg in enumerate(batch_msgs):
             raw_content = msg.get("content", "")
@@ -1295,7 +1311,7 @@ def ingest_conversation(beam: BeamMemory, messages: list[dict], diag: dict | Non
 
             # Detect and tag instructions and preferences for IF/PF abilities
             if msg.get("role", "").lower() == "user" and llm is not None:
-                tags = _classify_message_llm(llm, raw_content)
+                tags = classifications.get(i, [])
                 if "INSTRUCTION" in tags:
                     content = f"{content} [INSTRUCTION]"
                 if "PREFERENCE" in tags:
@@ -3441,6 +3457,43 @@ def _load_official_compute_metrics() -> tuple[object | None, str | None]:
 
         import importlib
         compute_metrics = importlib.import_module("src.evaluation.compute_metrics")
+        
+        # Monkeypatch the event ordering bug in official BEAM to avoid overwriting system_list
+        def patched_evaluate_event_ordering(rubric: list, llm_response: str, probing_question: str, model):
+            import json
+            extract_facts_fn = getattr(compute_metrics, "extract_facts")
+            event_ordering_score_fn = getattr(compute_metrics, "event_ordering_score")
+            unified_llm_judge_base_prompt_val = getattr(compute_metrics, "unified_llm_judge_base_prompt")
+            parse_json_response_fn = getattr(compute_metrics, "parse_json_response")
+            repair_json_fn = getattr(compute_metrics, "repair_json", None)
+            
+            system_list = extract_facts_fn(paragraph=llm_response, question=probing_question, model=model)
+            # The official BEAM benchmark bug overrode system_list with llm_response.split("\n"),
+            # discarding the results of extract_facts entirely. We skip that overwrite line here!
+            
+            score = event_ordering_score_fn(reference_list=rubric, system_list=system_list, align_type="llm", llm=model)
+            
+            llm_judge_responses = []
+            llm_judge_score = 0
+            for item in rubric:
+                prompt = unified_llm_judge_base_prompt_val.replace("<rubric_item>", item).replace("<llm_response>", llm_response)
+                response = model.invoke(prompt).content.strip()
+                try:
+                    response = parse_json_response_fn(response=response)
+                except Exception:
+                    if repair_json_fn:
+                        response = json.loads(repair_json_fn(response))
+                    else:
+                        response = json.loads(response)
+                llm_judge_score += float(response['score'])
+                llm_judge_responses.append(response)
+                
+            llm_judge_score = llm_judge_score / len(rubric)
+            score["llm_judge_score"] = llm_judge_score
+            score["llm_judge_responses"] = llm_judge_responses
+            return score
+            
+        compute_metrics.evaluate_event_ordering = patched_evaluate_event_ordering
         _OFFICIAL_GRADER_IMPORT_CACHE = (compute_metrics, None)
     except Exception as exc:
         _OFFICIAL_GRADER_IMPORT_CACHE = (None, str(exc))
@@ -3691,114 +3744,142 @@ def evaluate_conversation(
 
     print(f"  Conversation {conv_id}: {len(questions)} questions")
 
-    for i, q in enumerate(questions):
-        qid = f"{conv_id}:q{i}"
+    # Thread worker for thread-safe parallel evaluation (Hindsight concurrent optimization pattern)
+    def _evaluate_question_worker(item):
+        idx, q = item
+        qid = f"{conv_id}:q{idx}"
         if resume_ids and qid in resume_ids:
-            continue
+            return None
 
         policy = _question_row_policy(q)
         question = policy["question"]
         ideal = policy["ideal_answer"]
         rubric = policy["rubric"]
-        ability = q.get("ability", "unknown")
-        # Map dataset ability names to BEAM abbreviations
-        ability = ABILITY_MAP.get(ability, ability)
+        ability_raw = q.get("ability", "unknown")
+        ability = str(ABILITY_MAP.get(ability_type := q.get("ability", "unknown"), ability_type))
 
         if not policy["should_evaluate"]:
-            results.append(_build_skipped_question_result(
-                qid=qid,
-                ability=ability,
-                question=question,
-                ideal_answer=ideal,
-                rubric=rubric,
-                skip_reason=policy["skip_reason"],
-            ))
-            skipped_count += 1
-            print(f"    [SKIP] [{ability}] {qid} reason={policy['skip_reason']}")
-            continue
+            return {
+                "is_skipped": True,
+                "result": _build_skipped_question_result(
+                    qid=qid,
+                    ability=ability,
+                    question=question,
+                    ideal_answer=ideal,
+                    rubric=rubric,
+                    skip_reason=policy["skip_reason"],
+                ),
+                "skip_reason": policy["skip_reason"],
+                "ability": ability,
+                "qid": qid,
+            }
 
-        # Step 1: LLM answers using edumem memories + conversation context.
-        # `return_memories=True` gives us the per-question retrieved memory
-        # list so we can summarize voice-attribution provenance below.
-        q_diag = {}
-        t0 = time.perf_counter()
-        ai_answer, recall_memories = answer_with_memory(
-            llm, beam, question,
-            conversation_messages=conversation.get("messages", []),
-            ability=ability, diag=q_diag, return_memories=True,
-        )
-        answer_time = time.perf_counter() - t0
+        # Sub-threads must instantiate their own BeamMemory instance for SQLite thread safety
+        from edumem.core.beam import BeamMemory
+        thread_beam = BeamMemory(session_id=beam.session_id, db_path=beam.db_path)
+        try:
+            q_diag = {}
+            t0 = time.perf_counter()
+            ret_ans = answer_with_memory(
+                llm, thread_beam, question,
+                conversation_messages=conversation.get("messages", []),
+                ability=ability, diag=q_diag, return_memories=True,
+            )
+            assert isinstance(ret_ans, tuple)
+            ai_answer, recall_memories = ret_ans
+            answer_time = time.perf_counter() - t0
 
-        # Handle None answer (LLM timeout/error)
-        if ai_answer is None:
-            ai_answer = "[LLM_ERROR: No response from answering model]"
+            if ai_answer is None:
+                ai_answer = "[LLM_ERROR: No response from answering model]"
 
-        answer_diag = _llm_client_snapshot(llm)
-        q_diag["answer_api"] = answer_diag
+            answer_diag = _llm_client_snapshot(llm)
+            q_diag["answer_api"] = answer_diag
 
-        # Step 2: LLM-as-judge scores the answer (after normalizing EO/KU JSON output)
-        t0 = time.perf_counter()
-        normalized_answer = normalize_for_judge(ai_answer, ability)
-        judgment = judge_with_rubrics(judge_llm, question, rubric, normalized_answer, ability=ability)
-        judge_time = time.perf_counter() - t0
+            t0 = time.perf_counter()
+            normalized_answer = normalize_for_judge(ai_answer, ability)
+            judgment = judge_with_rubrics(judge_llm, question, rubric, normalized_answer, ability=ability)
+            judge_time = time.perf_counter() - t0
 
-        judged = _summarize_judge_result(judgment)
-        score = judged.get("official_score", 0.0)
+            judged = _summarize_judge_result(judgment)
+            score = judged.get("official_score", 0.0)
+            recall_provenance = _summarize_recall_memories(recall_memories or [])
 
-        # Compact recall-provenance summary so per-voice attribution
-        # analysis (docs/benchmark-results-analysis.md Recipe E) works
-        # from the result file directly -- no DB re-query needed. Full
-        # memory dicts would be ~10× larger; this summary captures
-        # what an analyst actually needs.
-        recall_provenance = _summarize_recall_memories(recall_memories)
+            result = {
+                "qid": qid,
+                "ability": ability,
+                "question": question[:200],
+                "question_full": question,
+                "ideal_answer": ideal[:200],
+                "ideal_answer_full": ideal,
+                "rubric": rubric,
+                "ai_answer": ai_answer,
+                "ai_answer_full": ai_answer,
+                "ai_answer_excerpt": ai_answer[:500],
+                "recall_provenance": recall_provenance,
+                "score": score,
+                "official_score": judged.get("official_score", score),
+                "partial_credit_score": judged.get("partial_credit_score", score),
+                "scoring_mode": judged.get("scoring_mode", "unknown"),
+                "parse_status": judged.get("parse_status", "unknown"),
+                "judge_status": judged.get("judge_status", "unknown"),
+                "judge_failure_class": judged.get("judge_failure_class"),
+                "judge_failure_message": judged.get("judge_failure_message", ""),
+                "judge_raw_response": judged.get("raw_response", ""),
+                "judge_raw_result": judged.get("raw_result"),
+                "judge_raw_payload": judged.get("raw_result", judged.get("raw_response", "")),
+                "judge_finish_reason": judged.get("finish_reason"),
+                "judge_response_had_content": judged.get("response_had_content"),
+                "judge_retry_count": judged.get("retry_count", 0),
+                "nuggets": judged.get("nuggets", []),
+                "assessment": judged.get("brief_assessment", judged.get("assessment", "")),
+                "judge_assessment": judged.get("assessment", ""),
+                "answer_model": llm.model,
+                "judge_model": judge_llm.model,
+                "answer_time_ms": answer_time * 1000,
+                "judge_time_ms": judge_time * 1000,
+                "retrieval_diagnostics": q_diag,
+                "answer_api_diagnostics": answer_diag,
+            }
+            return {
+                "is_skipped": False,
+                "result": result,
+                "ability": ability,
+                "score": score,
+                "answer_time_ms": answer_time * 1000,
+                "judge_time_ms": judge_time * 1000,
+                "question_full": question,
+                "qid": qid,
+            }
+        finally:
+            thread_beam.conn.close()
 
-        result = {
-            "qid": qid,
-            "ability": ability,
-            "question": question[:200],
-            "question_full": question,
-            "ideal_answer": ideal[:200],
-            "ideal_answer_full": ideal,
-            "rubric": rubric,
-            "ai_answer": ai_answer,
-            "ai_answer_full": ai_answer,
-            "ai_answer_excerpt": ai_answer[:500],
-            "recall_provenance": recall_provenance,
-            "score": score,
-            "official_score": judged.get("official_score", score),
-            "partial_credit_score": judged.get("partial_credit_score", score),
-            "scoring_mode": judged.get("scoring_mode", "unknown"),
-            "parse_status": judged.get("parse_status", "unknown"),
-            "judge_status": judged.get("judge_status", "unknown"),
-            "judge_failure_class": judged.get("judge_failure_class"),
-            "judge_failure_message": judged.get("judge_failure_message", ""),
-            "judge_raw_response": judged.get("raw_response", ""),
-            "judge_raw_result": judged.get("raw_result"),
-            "judge_raw_payload": judged.get("raw_result", judged.get("raw_response", "")),
-            "judge_finish_reason": judged.get("finish_reason"),
-            "judge_response_had_content": judged.get("response_had_content"),
-            "judge_retry_count": judged.get("retry_count", 0),
-            "nuggets": judged.get("nuggets", []),
-            "assessment": judged.get("brief_assessment", judged.get("assessment", "")),
-            "judge_assessment": judged.get("assessment", ""),
-            "answer_model": llm.model,
-            "judge_model": judge_llm.model,
-            "answer_time_ms": answer_time * 1000,
-            "judge_time_ms": judge_time * 1000,
-            "retrieval_diagnostics": q_diag,
-            "answer_api_diagnostics": answer_diag,
-        }
-        results.append(result)
-        evaluated_count += 1
+    jobs = [(idx, q) for idx, q in enumerate(questions)]
+    from concurrent.futures import ThreadPoolExecutor, as_completed
 
-        print(f"    [{ability}] score={score:.2f} ans={answer_time*1000:.0f}ms judge={judge_time*1000:.0f}ms "
-              f"Q: {question[:60]}...")
-        
-        # Rate-limit avoidance: pause between questions. Default 20s for burst-limited
-        # providers; set BEAM_QUESTION_DELAY=2 (or 0) for higher-tier APIs like gpt-4o.
-        _q_delay = float(os.environ.get("BEAM_QUESTION_DELAY", "20"))
-        if _q_delay > 0:
-            time.sleep(_q_delay)
+    # Use a ThreadPoolExecutor with max_workers=4 to respect proxy rate limit (concurrency of 4)
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = {executor.submit(_evaluate_question_worker, job): job for job in jobs}
+        for future in as_completed(futures):
+            res = future.result()
+            if res is None:
+                continue
+            if res["is_skipped"]:
+                results.append(res["result"])
+                skipped_count += 1
+                print(f"    [SKIP] [{res['ability']}] {res['qid']} reason={res['skip_reason']}")
+            else:
+                results.append(res["result"])
+                evaluated_count += 1
+                print(f"    [{res['ability']}] score={res['score']:.2f} ans={res['answer_time_ms']:.0f}ms judge={res['judge_time_ms']:.0f}ms "
+                      f"Q: {res['question_full'][:60]}...")
+
+                # Pause optionally if required (usually BEAM_QUESTION_DELAY is 2 or 0)
+                _q_delay = float(os.environ.get("BEAM_QUESTION_DELAY", "2"))
+                if _q_delay > 0:
+                    time.sleep(_q_delay)
+
+    # Sort results back to original question index order for deterministic file diffs
+    results.sort(key=lambda r: int(r["qid"].split(":q")[1]))
 
     return {
         "conversation_id": conv_id,
