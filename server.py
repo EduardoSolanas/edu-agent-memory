@@ -243,19 +243,19 @@ def rerank_in_length_buckets(query: str, texts: List[str]):
 def sanitize_text(text: str) -> str:
     if not text:
         return "empty"
-    # Collapse multiple whitespaces/newlines to single space and truncate long words to 30 chars
+    # Collapse multiple whitespaces/newlines to single space, limit to 60 words, and truncate long words to 25 chars
     words = text.split()
     cleaned_words = []
-    for w in words:
-        if len(w) > 30:
-            w = w[:30]
+    for w in words[:60]:
+        if len(w) > 25:
+            w = w[:25]
         cleaned_words.append(w)
     text = " ".join(cleaned_words)
     if not text:
         return "empty"
-    # Collapse consecutive identical characters of length > 3 (e.g. === -> ==)
+    # Collapse consecutive identical characters of length > 2 (e.g. === -> ==)
     import re
-    text = re.sub(r'(.)\1{3,}', r'\1\1\1', text)
+    text = re.sub(r'(.)\1{2,}', r'\1\1', text)
     return text
 
 
