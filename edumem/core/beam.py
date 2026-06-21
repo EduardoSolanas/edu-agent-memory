@@ -4051,7 +4051,7 @@ class BeamMemory:
                 r'(?:(?<=^)|(?<=\n)|(?<=\-\s)|(?<=—\s))(?:Prefers|Likes|Loves|Hates|Dislikes|Wants|Needs|Tends to|Enjoys|Uses)'
                 r')'
                 r'\s+([^.,;!?\n]{10,200})',
-            'event_keywords': ['meeting', 'call', 'scheduled', 'happened', 'occurred', 'plan to', 'will be on', 'due on', 'release', 'deadline', 'launched', 'deployed', 'released', 'published', 'posted', 'started', 'began', 'finished', 'completed', 'ended', 'event', 'conference', 'workshop', 'appointment'],
+            'event_keywords': ['meeting', 'call', 'scheduled', 'happened', 'occurred', 'plan to', 'will be on', 'due on', 'release', 'deadline', 'deployment', 'launched', 'deployed', 'released', 'published', 'posted', 'started', 'began', 'finished', 'completed', 'ended', 'event', 'conference', 'workshop', 'appointment'],
             'named_months': r'((?:January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2}(?:st|nd|rd|th)?,?\s*(?:\d{4})?)',
         },
         'de': {
@@ -4288,9 +4288,12 @@ class BeamMemory:
         # Named dates (e.g. March 29, 2024 — language-aware)
         for m in _re.finditer(pat['named_months'], content, _re.IGNORECASE):
             dt = m.group(1).strip()
-            ctx = self._context_snippet(content, m.start())
+            ctx = self._context_snippet(content, m.start(), width=120)
             if self._insert_fact(session, message_idx, 'date', 'named_date', dt, ctx, 0.7, source_memory_id=source_memory_id):
                 counts["date"] += 1
+            if any(kw in content.lower() for kw in _EVENT_KEYWORDS):
+                if self._insert_timeline(session, dt, message_idx, ctx, 'named_date', source_memory_id=source_memory_id):
+                    counts["timeline"] += 1
 
         # Version strings — two patterns:
         # Pattern A: "PostgreSQL v14.2", "Docker 27.1.1" (name directly before version)
@@ -5402,16 +5405,42 @@ Now respond with ONLY the JSON array, no explanation."""
                 (f'{month}%', self.session_id, top_k)
             ).fetchall()
         else:
-            # Recent timeline events
+            # Prefer the schedule/message that covers the query's event terms.
+            # This keeps interval endpoints together when later plans contain
+            # unrelated deadlines.
             rows = cursor.execute(
                 "SELECT date, description, message_idx FROM memoria_timelines "
-                "WHERE session_id = ? ORDER BY date DESC LIMIT ?",
-                (self.session_id, top_k)
+                "WHERE session_id = ?",
+                (self.session_id,)
             ).fetchall()
+            stop = {'how', 'many', 'weeks', 'days', 'between', 'from', 'when',
+                    'what', 'were', 'was', 'the', 'and', 'have', 'does', 'did',
+                    'date'}
+            query_terms = {
+                word for word in _re.findall(r'[a-z0-9]+', query.lower())
+                if len(word) > 2 and word not in stop
+            }
+            group_terms = {}
+            for row in rows:
+                group_terms.setdefault(row[2], set()).update(
+                    _re.findall(r'[a-z0-9]+', row[1].lower())
+                )
+            group_scores = {
+                idx: len(query_terms & terms) for idx, terms in group_terms.items()
+            }
+            rows = sorted(
+                rows,
+                key=lambda row: (
+                    -group_scores.get(row[2], 0),
+                    -len(query_terms & set(_re.findall(r'[a-z0-9]+', row[1].lower()))),
+                    row[2],
+                    row[0],
+                ),
+            )[:top_k]
 
         if rows:
             facts = [dict(zip(['date', 'description', 'msg_idx'], r)) for r in rows]
-            ctx_lines = [f"[{r[0]}] {r[1][:120]}" for r in rows]
+            ctx_lines = [f"[{r[0]}] {r[1][:200]}" for r in rows]
             return {"context": "\n".join(ctx_lines), "facts": facts, "source": "memoria_timelines"}
         return {"context": "", "facts": [], "source": "fallback"}
 

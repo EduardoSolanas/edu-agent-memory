@@ -181,6 +181,63 @@ def test_time_anchor_normalizes_relative_weekday_during_real_ingestion(
         beam.conn.close()
 
 
+def test_tr_timeline_anchors_dates_to_the_queried_schedule_events(
+    tmp_path,
+    monkeypatch,
+):
+    """Regression for BEAM 100K conversation 1, q18."""
+    monkeypatch.setenv("EDUMEM_NO_EMBEDDINGS", "1")
+    beam = _make_beam(tmp_path)
+    try:
+        ingest_conversation(
+            beam,
+            [
+                {
+                    "role": "user",
+                    "time_anchor": "March-15-2024",
+                    "content": (
+                        "November 1 - November 15, 2023: set up the Flask project "
+                        "and initial database schema. November 16 - December 15, "
+                        "2023: implement user authentication. December 16, 2023 - "
+                        "January 15, 2024: develop transaction management features. "
+                        "January 16 - February 15, 2024: integrate basic analytics. "
+                        "February 16 - March 15, 2024: final adjustments, testing, "
+                        "and deployment."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        "A separate revised MVP plan has a final deployment "
+                        "deadline of April 15, 2024."
+                    ),
+                },
+            ],
+        )
+
+        result = beam.memoria_retrieve(
+            "How many weeks are between finishing transaction management "
+            "and the final deployment deadline?",
+            intent="timeline",
+            top_k=10,
+        )
+
+        context = result["context"].lower()
+        assert "january 15, 2024" in context
+        assert "march 15, 2024" in context
+        january_line = next(
+            line for line in context.splitlines() if "january 15, 2024" in line
+        )
+        march_line = next(
+            line for line in context.splitlines() if "march 15, 2024" in line
+        )
+        assert "transaction management" in january_line
+        assert "deployment" in march_line
+        assert "april 15, 2024" not in context
+    finally:
+        beam.conn.close()
+
+
 @pytest.mark.parametrize(
     "question, expected_mr",
     [
