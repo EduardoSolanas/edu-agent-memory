@@ -96,7 +96,7 @@ def install_optimum():
     # Fallback to assuming we can run 'optimum-cli' from PATH or venv
     return venv_optimum_cli
 
-def _build_export_command(optimum_cli, model_name, task, out_dir):
+def _build_export_command(optimum_cli, model_name, task, out_dir, custom_export_configs=None):
     cmd = [
         optimum_cli,
         "export", "openvino",
@@ -104,10 +104,14 @@ def _build_export_command(optimum_cli, model_name, task, out_dir):
         "--task", task,
         "--weight-format", "fp16",
     ]
+    # If a custom export config is provided and exists, pass it through to optimum-cli
+    if custom_export_configs:
+        # Support comma-separated list of config paths
+        cmd.extend(["--custom-export-configs", custom_export_configs])
     cmd.append(out_dir)
     return cmd
 
-def run_export(optimum_cli, model_name, task, out_dir, hf_token):
+def run_export(optimum_cli, model_name, task, out_dir, hf_token, custom_export_configs=None):
     print(f"Exporting model {model_name} (Task: {task}) to {out_dir}...")
     
     # Create output directory's parent if it doesn't exist
@@ -120,7 +124,7 @@ def run_export(optimum_cli, model_name, task, out_dir, hf_token):
         # Also set HUGGING_FACE_HUB_TOKEN just in case
         env["HUGGING_FACE_HUB_TOKEN"] = hf_token
         
-    cmd = _build_export_command(optimum_cli, model_name, task, out_dir)
+    cmd = _build_export_command(optimum_cli, model_name, task, out_dir, custom_export_configs)
     
     print(f"Executing: {' '.join(cmd)}")
     try:
@@ -183,7 +187,17 @@ def main():
         if os.path.exists(ETTIN_DIR):
             print(f"Removing existing directory: {ETTIN_DIR}")
             shutil.rmtree(ETTIN_DIR, ignore_errors=True)
-        run_export(optimum_cli, ETTIN_MODEL, "text-classification", ETTIN_DIR, hf_token)
+        # Decide export task for the ettin model. Default to feature-extraction for encoder-style models.
+        ettin_task = os.environ.get("ETTIN_TASK")
+        if not ettin_task:
+            if "encoder" in ETTIN_MODEL or "embed" in ETTIN_MODEL or "encoder" in ETTIN_MODEL.lower():
+                ettin_task = "feature-extraction"
+            else:
+                ettin_task = "text-classification"
+        print(f"Ettin export task chosen: {ettin_task}")
+        # Allow passing custom export configs via env var (path or comma-separated list)
+        custom_cfg = os.environ.get("CUSTOM_EXPORT_CONFIGS")
+        run_export(optimum_cli, ETTIN_MODEL, ettin_task, ETTIN_DIR, hf_token, custom_cfg)
     else:
         print(f"Skipping Ettin Reranker export (already exists at {ETTIN_DIR})")
         
