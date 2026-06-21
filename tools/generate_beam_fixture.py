@@ -36,6 +36,55 @@ Q7_ATOMIC_NUGGETS = [
     "integrate frontend",
 ]
 
+STATIC_CASE_CHECKS = {
+    "1:q8": {"check": "tagged_code_fence"},
+    "1:q9": {"check": "versioned_dependencies", "min_versioned_dependencies": 2},
+    "1:q14": {
+        "check": "contains_groups",
+        "groups": [
+            ["flask-login", "session management"],
+            ["flask-sqlalchemy", "sqlite", "sqlalchemy"],
+            ["chart.js", "analytics", "data visualization"],
+        ],
+    },
+    "1:q15": {
+        "check": "contains_groups",
+        "groups": [
+            ["password hashing", "argon2", "bcrypt"],
+            ["csrf", "input validation", "rate limiting"],
+            ["incremental", "in phases", "start with", "then add", "prioritize"],
+        ],
+    },
+    "1:q16": {
+        "check": "contains_groups",
+        "groups": [
+            ["registration", "user authentication"],
+            ["expense", "transaction management"],
+            ["visualization", "analytics"],
+            ["april 15, 2024", "april 15 2024"],
+            ["authentication", "login"],
+            ["deployment"],
+            ["password hashing", "stronger password"],
+            ["token-based", "token authentication"],
+            ["role-based access", "rbac"],
+            ["input validation"],
+            ["confluence"],
+            ["api endpoint", "architecture decision"],
+            ["table", "diagram"],
+        ],
+    },
+    "1:q17": {
+        "check": "contains_groups",
+        "groups": [
+            ["werkzeug", "pbkdf2:sha256"],
+            ["uuid", "unique constraint"],
+            ["operationalerror", "operational error"],
+            ["csrf", "csrf token"],
+            ["redis", "account lockout", "login lockout"],
+        ],
+    },
+}
+
 def _atomize(nugget: str) -> list:
     """
     Decompose a nugget string into atomic facts.
@@ -226,6 +275,13 @@ for i, q in enumerate(conv['questions']):
         'nuggets': nuggets,
     }
 
+    if qid in STATIC_CASE_CHECKS:
+        case.update(STATIC_CASE_CHECKS[qid])
+
+    # q15 passed an older run but failed the latest persisted live baseline.
+    if qid == "1:q15":
+        case["expectation"] = "xfail"
+
     # Add comment for q18 special case
     if qid == "1:q18":
         case['_note'] = "q18 (TR): dropped '8 weeks' nugget (contradicts ideal_answer '4 weeks' — known BEAM dataset bug); kept date-range nugget"
@@ -233,7 +289,7 @@ for i, q in enumerate(conv['questions']):
     cases.append(case)
 
 OUTPUT.parent.mkdir(parents=True, exist_ok=True)
-OUTPUT.write_text(json.dumps(cases, indent=2), encoding='utf-8')
+OUTPUT.write_text(json.dumps(cases, indent=2) + "\n", encoding='utf-8')
 
 # Print per-question summary
 print('\n' + '='*100)

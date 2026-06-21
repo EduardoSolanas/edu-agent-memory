@@ -119,7 +119,7 @@
     "question": "Could you show me how to implement a login feature?",
     "baseline_score": 1.0,
     "expectation": "hard",
-    "check": "skip",
+    "check": "tagged_code_fence",
     "nuggets": []
   },
   {
@@ -128,8 +128,9 @@
     "question": "Which libraries are used in this project?",
     "baseline_score": 1.0,
     "expectation": "hard",
-    "check": "skip",
-    "nuggets": []
+    "check": "versioned_dependencies",
+    "nuggets": [],
+    "min_versioned_dependencies": 2
   },
   {
     "qid": "1:q10",
@@ -188,17 +189,52 @@
     "question": "I'm planning to add user login, income and expense tracking, and some basic analytics to my Flask app. What libraries or tools would you suggest I use to implement these features?",
     "baseline_score": 1.0,
     "expectation": "hard",
-    "check": "skip",
-    "nuggets": []
+    "check": "contains_groups",
+    "nuggets": [],
+    "groups": [
+      [
+        "flask-login",
+        "session management"
+      ],
+      [
+        "flask-sqlalchemy",
+        "sqlite",
+        "sqlalchemy"
+      ],
+      [
+        "chart.js",
+        "analytics",
+        "data visualization"
+      ]
+    ]
   },
   {
     "qid": "1:q15",
     "ability": "PF",
     "question": "I'm looking to improve the security features of my app. What steps would you suggest I take?",
     "baseline_score": 1.0,
-    "expectation": "hard",
-    "check": "skip",
-    "nuggets": []
+    "expectation": "xfail",
+    "check": "contains_groups",
+    "nuggets": [],
+    "groups": [
+      [
+        "password hashing",
+        "argon2",
+        "bcrypt"
+      ],
+      [
+        "csrf",
+        "input validation",
+        "rate limiting"
+      ],
+      [
+        "incremental",
+        "in phases",
+        "start with",
+        "then add",
+        "prioritize"
+      ]
+    ]
   },
   {
     "qid": "1:q16",
@@ -206,8 +242,59 @@
     "question": "Can you provide a comprehensive summary of how my budget tracker project has progressed, including the key features implemented, the development timeline, security enhancements, and documentation efforts?",
     "baseline_score": 0.8,
     "expectation": "hard",
-    "check": "skip",
-    "nuggets": []
+    "check": "contains_groups",
+    "nuggets": [],
+    "groups": [
+      [
+        "registration",
+        "user authentication"
+      ],
+      [
+        "expense",
+        "transaction management"
+      ],
+      [
+        "visualization",
+        "analytics"
+      ],
+      [
+        "april 15, 2024",
+        "april 15 2024"
+      ],
+      [
+        "authentication",
+        "login"
+      ],
+      [
+        "deployment"
+      ],
+      [
+        "password hashing",
+        "stronger password"
+      ],
+      [
+        "token-based",
+        "token authentication"
+      ],
+      [
+        "role-based access",
+        "rbac"
+      ],
+      [
+        "input validation"
+      ],
+      [
+        "confluence"
+      ],
+      [
+        "api endpoint",
+        "architecture decision"
+      ],
+      [
+        "table",
+        "diagram"
+      ]
+    ]
   },
   {
     "qid": "1:q17",
@@ -215,8 +302,31 @@
     "question": "Can you give me a comprehensive summary of how I handled the security and database challenges in my budget tracker app across our discussions?",
     "baseline_score": 0.0,
     "expectation": "xfail",
-    "check": "skip",
-    "nuggets": []
+    "check": "contains_groups",
+    "nuggets": [],
+    "groups": [
+      [
+        "werkzeug",
+        "pbkdf2:sha256"
+      ],
+      [
+        "uuid",
+        "unique constraint"
+      ],
+      [
+        "operationalerror",
+        "operational error"
+      ],
+      [
+        "csrf",
+        "csrf token"
+      ],
+      [
+        "redis",
+        "account lockout",
+        "login lockout"
+      ]
+    ]
   },
   {
     "qid": "1:q18",

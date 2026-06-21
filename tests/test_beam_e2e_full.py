@@ -76,6 +76,46 @@ def _contains_all(answer: str, nuggets: list[str]) -> tuple[bool, list[str]]:
     return len(missing) == 0, missing
 
 
+def _contains_groups(answer: str, groups: list[list[str]]) -> tuple[bool, list[list[str]]]:
+    """Require at least one short evidence atom from every semantic group."""
+    ans_norm, ans_stripped = _norm(answer)
+    missing = []
+    for group in groups:
+        matched = False
+        for atom in group:
+            atom_norm, atom_stripped = _norm(atom)
+            if atom_norm in ans_norm or atom_stripped in ans_stripped:
+                matched = True
+                break
+        if not matched:
+            missing.append(group)
+    return not missing, missing
+
+
+def _has_tagged_code_fence(answer: str) -> bool:
+    """Recognize a fenced code block with a Markdown language tag."""
+    return re.search(r"```[a-z][a-z0-9_+.-]*\s*\n[\s\S]+?```", answer or "", re.IGNORECASE) is not None
+
+
+def _versioned_dependency_stats(answer: str) -> tuple[int, list[str]]:
+    """Count versioned packages and find dependency bullets lacking a version."""
+    plain = re.sub(r"[*_`]", "", answer or "")
+    matches = re.findall(
+        r"\b([a-z][a-z0-9_.-]*)\s*(?::|==|~=|>=|<=|=)?\s*v?(\d+(?:\.\d+){1,3})\b",
+        plain,
+        re.IGNORECASE,
+    )
+    count = len({name.lower() for name, _version in matches})
+    unversioned_bullets = []
+    for line in (answer or "").splitlines():
+        stripped = line.replace("**", "").replace("__", "").replace("`", "").strip()
+        if not re.match(r"^[-+*]\s+[a-z][a-z0-9_.-]*(?:\s|:|$)", stripped, re.IGNORECASE):
+            continue
+        if not re.search(r"\b\d+(?:\.\d+){1,3}\b", stripped):
+            unversioned_bullets.append(stripped)
+    return count, unversioned_bullets
+
+
 def _absence(answer: str) -> bool:
     """
     Check if answer indicates absence of information.
@@ -169,6 +209,21 @@ def _case_outcome(case: dict, answer: str) -> dict:
     if check == "contains_all":
         ok, missing = _contains_all(answer, case.get("nuggets", []))
         return {"outcome": "passed" if ok else "failed", "missing": missing}
+    if check == "contains_groups":
+        ok, missing = _contains_groups(answer, case.get("groups", []))
+        return {"outcome": "passed" if ok else "failed", "missing_groups": missing}
+    if check == "tagged_code_fence":
+        ok = _has_tagged_code_fence(answer)
+        return {"outcome": "passed" if ok else "failed"}
+    if check == "versioned_dependencies":
+        count, unversioned = _versioned_dependency_stats(answer)
+        required = int(case.get("min_versioned_dependencies", 1))
+        return {
+            "outcome": "passed" if count >= required and not unversioned else "failed",
+            "versioned_dependencies": count,
+            "required": required,
+            "unversioned_dependency_bullets": unversioned,
+        }
     if check == "absence":
         ok = _absence(answer)
         return {"outcome": "passed" if ok else "failed"}
@@ -336,9 +391,18 @@ def test_beam_e2e_answer_meets_static_expectation(case, e2e_answers):
     answer = e2e_answers["answers"].get(qid)
     assert answer is not None, f"{qid}: no answer generated"
 
+    outcome = _case_outcome(case, answer)
+
     # Skip checks that are not statically gradable
-    if check == "skip":
+    if outcome["outcome"] == "ungraded":
         pytest.skip(f"{ability} not statically gradable")
+
+    if check in {"contains_groups", "tagged_code_fence", "versioned_dependencies"}:
+        assert outcome["outcome"] == "passed", (
+            f"{qid} [{ability}] {check} failed: {outcome}\n"
+            f"Answer (first 200 chars): {answer[:200]}"
+        )
+        return
 
     # Dispatch on check type
     if check == "contains_all":
