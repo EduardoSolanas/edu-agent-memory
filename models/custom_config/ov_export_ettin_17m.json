@@ -1,0 +1,18 @@
+{
+  "name": "ettin-encoder-17m-openvino-export",
+  "source": {
+    "huggingface_repo": "jhu-clsp/ettin-encoder-17m",
+    "onnx_file": "onnx/model_fp16.onnx",
+    "onnx_resolved_url": "https://huggingface.co/jhu-clsp/ettin-encoder-17m/resolve/main/onnx/model_fp16.onnx",
+    "onnx_sha256": "760f1758d9fa49a5855d80d00ac474de9158c338877055fbe45c4e5d2d2b26bb"
+  },
+  "export": {
+    "method": "openvino-ovc",
+    "command": "ovc /root/ettin_model_fp16.onnx --output_model ov_ettin_17m --compress_to_fp16=False --verbose",
+    "ov_xml": "ov_ettin_17m.xml",
+    "ov_bin": "ov_ettin_17m.bin",
+    "ov_xml_sha256": "27fd6a89aa7de3269cb8e5afb08c2d9be95266855af0614c193b08e894564017",
+    "notes": "Conversion performed from HF ONNX FP16 artifact using OpenVINO ovc tool. No custom Optimum export config was required for this Ettin model. If you need an Optimum `custom_export_configs` JSON for other tooling, create it under models/custom_config/optimum_export_configs.json"
+  },
+  "timestamp_utc": "2026-06-21T22:45:00Z"
+}
