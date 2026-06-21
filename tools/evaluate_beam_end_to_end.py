@@ -39,6 +39,7 @@ import sys
 import tempfile
 import time
 import subprocess
+import threading
 from copy import deepcopy
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
@@ -64,6 +65,51 @@ from edumem.core.query_mode import (
 )
 
 
+def _deterministic_intent(question: str) -> str | None:
+    """Return intent only when the question contains an explicit signal."""
+    import re
+
+    q = (question or "").lower()
+    if is_ordering_query(question):
+        return "ordered"
+    if (
+        is_duration_query(question)
+        or is_date_interval_query(question)
+        or re.search(r"\b(?:date|deadline|when|timeline)\b", q)
+    ):
+        return "timeline"
+    if (
+        is_contradiction_query(question)
+        or re.match(r"^\s*have\s+(?:i|we)\b", q)
+        or re.search(r"\b(?:changed?|switched?|contradict(?:ion|ory)?|conflicting|from\s+.+\s+to)\b", q)
+        or re.search(r"\bprevious(?:ly)?\s+(?:versus|vs\.?|compared\s+to|and)\s+(?:current|new|now)\b", q)
+        or re.search(r"\b(?:current|new|now)\s+(?:versus|vs\.?|compared\s+to|and)\s+previous(?:ly)?\b", q)
+    ):
+        return "change"
+    return None
+
+
+def _intent_from_reranker_scores(scores: object) -> str | None:
+    """Accept a reranker decision only when both confidence and margin are useful."""
+    if not isinstance(scores, list) or len(scores) != 4:
+        return None
+    try:
+        ranked = sorted(
+            ((int(item["index"]), float(item["score"])) for item in scores),
+            key=lambda item: item[1],
+            reverse=True,
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+    if {index for index, _ in ranked} != {0, 1, 2, 3}:
+        return None
+    minimum = float(os.environ.get("BEAM_INTENT_MIN_CONFIDENCE", "0.55"))
+    margin = float(os.environ.get("BEAM_INTENT_MIN_MARGIN", "0.15"))
+    if ranked[0][1] < minimum or ranked[0][1] - ranked[1][1] < margin:
+        return None
+    return ["ordered", "timeline", "change", "current"][ranked[0][0]]
+
+
 def _intent_from_question(question: str) -> str:
     """Map a question to a generic recall intent from its TEXT only (no dataset label).
 
@@ -72,23 +118,18 @@ def _intent_from_question(question: str) -> str:
     Uses the OpenVINO reranker to perform Zero-Shot Classification of intent,
     falling back to robust local regex if the reranker is unavailable.
     """
-    import re
-    import os
     import requests
 
     def _fallback_intent(q_text: str) -> str:
-        if is_ordering_query(q_text):
-            return "ordered"
-        if is_duration_query(q_text):
-            return "timeline"
-        if is_contradiction_query(q_text) or re.match(r"^\s*(?:have|did)\s+(?:i|we)\b", (q_text or "").lower()):
-            return "change"
-        return "current"
+        return _deterministic_intent(q_text) or "current"
+
+    deterministic = _deterministic_intent(question)
+    if deterministic is not None:
+        return deterministic
 
     # Reuse our local OpenVINO reranker for fast dynamic intent classification (Zero-Shot classification pattern)
     _reranker_url = os.environ.get("EDUMEM_RERANKER_URL", "http://localhost:3002/rerank")
     try:
-        from edumem.core.embeddings import _EMBED_API_LOCK as _CLIENT_API_LOCK
         # Hypotheses mapped to index 0: ordered, 1: timeline, 2: change, 3: current
         hypotheses = [
             "This query asks about the chronological order, sequence, or ordering of events.",
@@ -96,16 +137,11 @@ def _intent_from_question(question: str) -> str:
             "This query asks about a change of state, switched preference, contradictions, or previous versus current values.",
             "This query asks for general factual details, current versions, or standard information of an entity.",
         ]
-        with _CLIENT_API_LOCK:
-            resp = requests.post(_reranker_url, json={"query": question, "texts": hypotheses}, timeout=1.0)
+        resp = requests.post(_reranker_url, json={"query": question, "texts": hypotheses}, timeout=1.0)
         if resp.status_code == 200:
-            scores = resp.json()
-            if isinstance(scores, list) and len(scores) == len(hypotheses):
-                # Format: [{"index": idx, "score": score}, ...]
-                sorted_scores = sorted(scores, key=lambda x: x.get("score", 0.0), reverse=True)
-                best_idx = sorted_scores[0]["index"]
-                intents = ["ordered", "timeline", "change", "current"]
-                return intents[best_idx]
+            reranked = _intent_from_reranker_scores(resp.json())
+            if reranked is not None:
+                return reranked
     except Exception:
         pass
 
@@ -908,6 +944,32 @@ class LLMClient:
 
     def close(self):
         pass
+
+
+def _new_worker_clients(llm: LLMClient, judge_llm: LLMClient) -> tuple[LLMClient, LLMClient]:
+    """Create request-local clients so mutable diagnostics never cross threads."""
+    answer = LLMClient(model=llm.model, api_key=llm.api_key, base_url=llm.base_url)
+    judge = LLMClient(model=judge_llm.model, api_key=judge_llm.api_key, base_url=judge_llm.base_url)
+    answer.fallback_models = list(llm.fallback_models)
+    judge.fallback_models = list(judge_llm.fallback_models)
+    return answer, judge
+
+
+class _StartRateLimiter:
+    """Thread-safe minimum spacing between question request starts."""
+
+    def __init__(self, delay_seconds: float):
+        self.delay_seconds = max(0.0, delay_seconds)
+        self._next_start = 0.0
+        self._lock = threading.Lock()
+
+    def wait(self) -> None:
+        with self._lock:
+            now = time.monotonic()
+            delay = max(0.0, self._next_start - now)
+            if delay:
+                time.sleep(delay)
+            self._next_start = time.monotonic() + self.delay_seconds
 
 
 # ============================================================
@@ -2709,11 +2771,9 @@ def _rerank(question: str, memories: list, top_n: int = 30, diag: dict | None = 
     else:
         rerank_diag = None
     try:
-        from edumem.core.embeddings import _EMBED_API_LOCK as _CLIENT_API_LOCK
-        with _CLIENT_API_LOCK:
-            resp = _rr.post(_reranker_url, json={"query": question, "texts": texts}, timeout=5)
-            resp.raise_for_status()
-            scores = resp.json()
+        resp = _rr.post(_reranker_url, json={"query": question, "texts": texts}, timeout=5)
+        resp.raise_for_status()
+        scores = resp.json()
         memories = _apply_rerank_scores(memories, scores, top_n)
         if rerank_diag is not None:
             rerank_diag["successes"] += 1
@@ -3651,10 +3711,17 @@ def judge_with_rubrics(llm: LLMClient, question: str, rubric: list, ai_answer: s
         }
 
     except Exception as exc:
-        import traceback
-        print(f"      [Grader-Error] official grader failed with {type(exc).__name__}: {exc}", flush=True)
-        traceback.print_exc()
+        _log_grader_error(exc)
         return _legacy_judge_with_rubrics(llm, question, rubric, ai_answer)
+
+
+def _log_grader_error(exc: Exception) -> None:
+    """Keep routine fallback logs bounded; make tracebacks explicitly opt-in."""
+    message = str(exc).splitlines()[0][:240]
+    print(f"      [Grader-Error] official grader failed with {type(exc).__name__}: {message}", flush=True)
+    if os.environ.get("BEAM_DEBUG_GRADER_ERRORS", "").strip().lower() in {"1", "true", "yes", "on"}:
+        import traceback
+        traceback.print_exc()
 
 
 def _legacy_judge_with_rubrics(llm: LLMClient, question: str, rubric: list, ai_answer: str) -> dict:
@@ -3771,6 +3838,8 @@ def evaluate_conversation(
     results = []
     evaluated_count = 0
     skipped_count = 0
+    question_delay = float(os.environ.get("BEAM_QUESTION_DELAY", "2"))
+    start_limiter = _StartRateLimiter(question_delay)
 
     print(f"  Conversation {conv_id}: {len(questions)} questions")
 
@@ -3804,14 +3873,16 @@ def evaluate_conversation(
                 "qid": qid,
             }
 
-        # Sub-threads must instantiate their own BeamMemory instance for SQLite thread safety
+        # Sub-threads need request-local clients and SQLite connections.
         from edumem.core.beam import BeamMemory
+        worker_llm, worker_judge_llm = _new_worker_clients(llm, judge_llm)
         thread_beam = BeamMemory(session_id=beam.session_id, db_path=beam.db_path)
         try:
             q_diag = {}
+            start_limiter.wait()
             t0 = time.perf_counter()
             ret_ans = answer_with_memory(
-                llm, thread_beam, question,
+                worker_llm, thread_beam, question,
                 conversation_messages=conversation.get("messages", []),
                 ability=ability, diag=q_diag, return_memories=True,
             )
@@ -3822,12 +3893,12 @@ def evaluate_conversation(
             if ai_answer is None:
                 ai_answer = "[LLM_ERROR: No response from answering model]"
 
-            answer_diag = _llm_client_snapshot(llm)
+            answer_diag = _llm_client_snapshot(worker_llm)
             q_diag["answer_api"] = answer_diag
 
             t0 = time.perf_counter()
             normalized_answer = normalize_for_judge(ai_answer, ability)
-            judgment = judge_with_rubrics(judge_llm, question, rubric, normalized_answer, ability=ability)
+            judgment = judge_with_rubrics(worker_judge_llm, question, rubric, normalized_answer, ability=ability)
             judge_time = time.perf_counter() - t0
 
             judged = _summarize_judge_result(judgment)
@@ -3863,8 +3934,8 @@ def evaluate_conversation(
                 "nuggets": judged.get("nuggets", []),
                 "assessment": judged.get("brief_assessment", judged.get("assessment", "")),
                 "judge_assessment": judged.get("assessment", ""),
-                "answer_model": llm.model,
-                "judge_model": judge_llm.model,
+                "answer_model": worker_llm.model,
+                "judge_model": worker_judge_llm.model,
                 "answer_time_ms": answer_time * 1000,
                 "judge_time_ms": judge_time * 1000,
                 "retrieval_diagnostics": q_diag,
@@ -3882,12 +3953,14 @@ def evaluate_conversation(
             }
         finally:
             thread_beam.conn.close()
+            worker_llm.close()
+            worker_judge_llm.close()
 
     jobs = [(idx, q) for idx, q in enumerate(questions)]
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    # Use a ThreadPoolExecutor with max_workers=4 to respect proxy rate limit (concurrency of 4)
-    with ThreadPoolExecutor(max_workers=4) as executor:
+    max_workers = max(1, int(os.environ.get("BEAM_QUESTION_WORKERS", "4")))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(_evaluate_question_worker, job): job for job in jobs}
         for future in as_completed(futures):
             res = future.result()
@@ -3903,10 +3976,6 @@ def evaluate_conversation(
                 print(f"    [{res['ability']}] score={res['score']:.2f} ans={res['answer_time_ms']:.0f}ms judge={res['judge_time_ms']:.0f}ms "
                       f"Q: {res['question_full'][:60]}...")
 
-                # Pause optionally if required (usually BEAM_QUESTION_DELAY is 2 or 0)
-                _q_delay = float(os.environ.get("BEAM_QUESTION_DELAY", "2"))
-                if _q_delay > 0:
-                    time.sleep(_q_delay)
 
     # Sort results back to original question index order for deterministic file diffs
     results.sort(key=lambda r: int(r["qid"].split(":q")[1]))

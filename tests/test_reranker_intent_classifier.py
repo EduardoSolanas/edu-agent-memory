@@ -1,11 +1,25 @@
 import os
 import pytest
+import requests
 from tools.evaluate_beam_end_to_end import _intent_from_question
 
+pytestmark = pytest.mark.skipif(
+    os.environ.get("BEAM_LIVE_RERANKER_TEST") != "1",
+    reason="set BEAM_LIVE_RERANKER_TEST=1 to run the live reranker integration",
+)
+
 def test_reranker_intent_classification_integration():
-    # Set the environment variable for the reranker URL
-    os.environ["EDUMEM_RERANKER_URL"] = "http://localhost:3002/rerank"
-    
+    reranker_url = os.environ.get("EDUMEM_RERANKER_URL", "http://localhost:3002/rerank")
+    try:
+        response = requests.post(
+            reranker_url,
+            json={"query": "health check", "texts": ["health check"]},
+            timeout=2,
+        )
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        pytest.skip(f"live reranker unavailable: {type(exc).__name__}")
+
     # Test cases representing different BEAM query intents
     test_cases = [
         # Event Ordering / Sequence -> 'ordered'
