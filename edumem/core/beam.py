@@ -5476,12 +5476,7 @@ Now respond with ONLY the JSON array, no explanation."""
         return {"context": "", "facts": [], "source": "fallback"}
 
     def _memoria_chrono_retrieve(self, query: str, top_k: int = 10) -> dict:
-        """Return broad conversation evidence in message order.
-
-        Explicit sequence facts are useful, but ordinary topic introductions do
-        not contain words such as "first" or "then". Include chronological user
-        memories as well so ordered queries can see those introductions.
-        """
+        """Query memoria_facts for sequence markers, ordered by message_idx."""
         cursor = self.conn
         rows = cursor.execute(
             "SELECT value, message_idx FROM memoria_facts "
@@ -5489,73 +5484,10 @@ Now respond with ONLY the JSON array, no explanation."""
             "ORDER BY message_idx ASC LIMIT ?",
             (self.session_id, top_k)
         ).fetchall()
-        entries = [
-            (r[1], f"[MSGIDX:{r[1]}] {r[0]}",
-             dict(zip(['sequence', 'msg_idx'], r)), None)
-            for r in rows
-        ]
-
-        # Ordered questions need coverage across the conversation before they
-        # can select and sort topics. Four times the requested answer depth is
-        # enough breadth for normal queries while keeping the context bounded.
-        memory_limit = min(max(top_k * 4, top_k), 120)
-        memory_rows = cursor.execute(
-            "SELECT id, content, message_index FROM working_memory "
-            "WHERE session_id = ? AND superseded_by IS NULL "
-            "AND (source = 'conversation' OR source = 'user' OR source LIKE '%user%') "
-            "ORDER BY message_index ASC LIMIT ?",
-            (self.session_id, memory_limit),
-        ).fetchall()
-
-        import re as _re
-        ordering_words = {
-            'about', 'aspects', 'brought', 'conversations', 'different',
-            'order', 'ordered', 'project', 'throughout', 'which',
-        }
-        query_terms = {
-            word for word in _re.findall(r'[a-zA-Z]{4,}', query.lower())
-            if word not in ordering_words
-        }
-
-        for memory_id, content, message_index in memory_rows:
-            if message_index is None:
-                continue
-            clean_content = _re.sub(r'^\[MSGIDX:\d+\]\s*', '', content).strip()
-            content_terms = set(_re.findall(r'[a-zA-Z]{4,}', clean_content.lower()))
-            if len(query_terms & content_terms) >= 2:
-                snippet = clean_content[:300]
-            elif len(clean_content) <= 105:
-                snippet = clean_content
-            else:
-                # Preserve both the subject and the first detail clause. Long
-                # code-heavy turns otherwise consume the entire ordering budget.
-                snippet = f"{clean_content[:50]} ... {clean_content[125:175]}"
-            line = f"[MSGIDX:{message_index}] {snippet}"
-            fact = {"content": snippet, "msg_idx": message_index}
-            entries.append((message_index, line, fact, memory_id))
-
-        if entries:
-            entries.sort(key=lambda entry: entry[0])
-            context_budget = 15_500
-            ctx_lines = []
-            facts = []
-            source_ids = []
-            used_chars = 0
-            for _, line, fact, source_id in entries:
-                added_chars = len(line) + (1 if ctx_lines else 0)
-                if used_chars + added_chars > context_budget:
-                    continue
-                ctx_lines.append(line)
-                facts.append(fact)
-                used_chars += added_chars
-                if source_id:
-                    source_ids.append(source_id)
-            return {
-                "context": "\n".join(ctx_lines),
-                "facts": facts,
-                "source": "memoria_sequences",
-                "source_memory_ids": source_ids,
-            }
+        if rows:
+            facts = [dict(zip(['sequence', 'msg_idx'], r)) for r in rows]
+            ctx_lines = [f"[{i+1}] {r[0]}" for i, r in enumerate(rows)]
+            return {"context": "\n".join(ctx_lines), "facts": facts, "source": "memoria_sequences"}
         return {"context": "", "facts": [], "source": "fallback"}
 
     def _memoria_instruction_retrieve(self, query: str, top_k: int = 10) -> dict:
