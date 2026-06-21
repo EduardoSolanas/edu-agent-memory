@@ -245,7 +245,13 @@ async def rerank(request: RerankRequest):
     try:
         start = time.time()
 
-        cache_key = (request.query, tuple(request.texts))
+        # Sanitize query and texts to prevent OpenVINO Tokenizer crash on empty/whitespace inputs
+        query = request.query.strip() if request.query else "empty"
+        if not query:
+            query = "empty"
+        texts = [t.strip() if (t and t.strip()) else "empty" for t in request.texts]
+
+        cache_key = (query, tuple(texts))
         with rerank_cache_lock:
             cached = rerank_cache.get(cache_key)
             if cached is not None:
@@ -253,7 +259,7 @@ async def rerank(request: RerankRequest):
 
         if cached is None:
             with rerank_lock:
-                raw_results = rerank_in_length_buckets(request.query, request.texts)
+                raw_results = rerank_in_length_buckets(query, texts)
             if RERANK_CACHE_SIZE > 0:
                 with rerank_cache_lock:
                     rerank_cache[cache_key] = raw_results
