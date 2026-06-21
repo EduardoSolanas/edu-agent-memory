@@ -4476,14 +4476,15 @@ class BeamMemory:
         """Build a prompt for LLM-assisted metric key canonicalization.
 
         Args:
-            existing: list of (key, value) tuples (current session metric facts)
+            existing: list of (key, value, context) rows (current session metrics)
             candidates: list of {"context": str, "value": str, "raw_key": str}
 
         Returns:
             A prompt string requesting canonical keys in JSON array format.
         """
         existing_block = "\n".join(
-            f"- {key}: {value}" for key, value in existing
+            f'- {row[0]}: {row[1]} (context: "{row[2] if len(row) > 2 else ""}")'
+            for row in existing
         ) if existing else "(no existing facts)"
 
         observations_block = "\n".join(
@@ -4500,9 +4501,12 @@ New observations (context snippet, then observed value):
 {observations_block}
 
 Rules:
-1. If an observation describes the SAME real-world metric as an existing key (even if phrased differently), assign that existing key.
-2. If it is a different metric, create a new canonical key in snake_case ending with the unit.
-3. Return ONLY a JSON array with one element per observation:
+1. Reuse a key only for the SAME subject/component, operation, and metric.
+2. Different subjects or operations are different metrics even when their units and values match.
+3. Targets, goals, SLAs, and thresholds are separate from observed measurements; target keys must include "target".
+4. If wording differs but subject, operation, and metric are the same, reuse the existing key.
+5. If it is a different metric, create a new canonical key in snake_case ending with the unit.
+6. Return ONLY a JSON array with one element per observation:
 [{{"index": N, "canonical_key": "key_name", "is_update": bool}}, ...]
 
 Example:
@@ -4511,6 +4515,67 @@ If observation 0 is "response time is 250ms" and you have existing key "response
 
 Now respond with ONLY the JSON array, no explanation."""
         return prompt
+
+    @staticmethod
+    def _metric_is_target(context: str) -> bool:
+        import re as _re
+        return _re.search(
+            r"\b(?:target|goal|objective|sla|threshold|budget|aim(?:ing|ed)?|"
+            r"should|must|need(?:s|ed)?\s+to)\b",
+            context or "",
+            _re.IGNORECASE,
+        ) is not None
+
+    @staticmethod
+    def _metric_identity_tokens(context: str) -> set:
+        """Return explicit subject/operation words, excluding metric wording."""
+        import re as _re
+        ignored = {
+            "a", "after", "an", "and", "api", "are", "around", "at", "before",
+            "below", "by", "current", "currently", "down", "for", "from", "goal",
+            "has", "have", "in", "improved", "is", "it", "latency", "less", "load",
+            "loads", "maximum", "milliseconds", "ms", "now", "objective", "of", "our",
+            "performance", "response", "sla", "speed", "target", "than", "the", "time",
+            "to", "took", "under", "up", "was", "were", "with",
+        }
+        return {
+            token for token in _re.findall(r"[a-z][a-z0-9]+", (context or "").lower())
+            if token not in ignored and not token.isdigit()
+        }
+
+    @staticmethod
+    def _target_metric_key(key: str) -> str:
+        parts = [
+            part for part in (key or "metric").split("_")
+            if part not in {"under", "below", "maximum", "max", "threshold"}
+        ]
+        if "target" in parts:
+            return "_".join(parts)
+        unit_suffixes = {"ms", "s", "pct", "percent", "seconds", "minutes", "hours"}
+        insert_at = len(parts) - 1 if parts and parts[-1] in unit_suffixes else len(parts)
+        parts.insert(insert_at, "target")
+        return "_".join(parts)
+
+    def _validated_canonical_metric_key(self, candidate, canonical_key,
+                                        existing_contexts) -> str:
+        """Reject LLM merges that cross metric subjects or target state."""
+        raw_key = candidate["raw_key"]
+        candidate_context = candidate.get("context", "")
+        candidate_is_target = self._metric_is_target(candidate_context)
+        existing_context = existing_contexts.get(canonical_key)
+
+        if existing_context is not None:
+            if candidate_is_target != self._metric_is_target(existing_context):
+                return self._target_metric_key(raw_key) if candidate_is_target else raw_key
+            candidate_identity = self._metric_identity_tokens(candidate_context)
+            existing_identity = self._metric_identity_tokens(existing_context)
+            if (candidate_identity and existing_identity
+                    and candidate_identity.isdisjoint(existing_identity)):
+                return self._target_metric_key(raw_key) if candidate_is_target else raw_key
+
+        if candidate_is_target:
+            return self._target_metric_key(canonical_key)
+        return canonical_key
 
     def _parse_canonicalize_response(self, raw: str, n: int) -> list:
         """Parse LLM response into a list of canonical keys.
@@ -4567,7 +4632,7 @@ Now respond with ONLY the JSON array, no explanation."""
         try:
             # Load existing metric facts for this session
             existing = self.conn.execute(
-                "SELECT key, value FROM memoria_facts "
+                "SELECT key, value, context_snippet FROM memoria_facts "
                 "WHERE session_id = ? AND fact_type = 'metric' "
                 "GROUP BY key ORDER BY key",
                 (session,)
@@ -4588,12 +4653,15 @@ Now respond with ONLY the JSON array, no explanation."""
 
             # Parse response
             canonical_keys = self._parse_canonicalize_response(response, len(candidates))
+            existing_contexts = {row[0]: row[2] for row in existing}
 
             # Use canonical key if present, else fallback to raw_key
             result = []
             for i, cand in enumerate(candidates):
                 key = canonical_keys[i] if canonical_keys[i] is not None else cand["raw_key"]
-                result.append(key)
+                result.append(self._validated_canonical_metric_key(
+                    cand, key, existing_contexts
+                ))
             return result
         except Exception:
             # Any error → fallback to raw keys
