@@ -88,6 +88,7 @@ def _intent_from_question(question: str) -> str:
     # Reuse our local OpenVINO reranker for fast dynamic intent classification (Zero-Shot classification pattern)
     _reranker_url = os.environ.get("EDUMEM_RERANKER_URL", "http://localhost:3002/rerank")
     try:
+        from edumem.core.embeddings import _EMBED_API_LOCK as _CLIENT_API_LOCK
         # Hypotheses mapped to index 0: ordered, 1: timeline, 2: change, 3: current
         hypotheses = [
             "This query asks about the chronological order, sequence, or ordering of events.",
@@ -95,7 +96,8 @@ def _intent_from_question(question: str) -> str:
             "This query asks about a change of state, switched preference, contradictions, or previous versus current values.",
             "This query asks for general factual details, current versions, or standard information of an entity.",
         ]
-        resp = requests.post(_reranker_url, json={"query": question, "texts": hypotheses}, timeout=1.0)
+        with _CLIENT_API_LOCK:
+            resp = requests.post(_reranker_url, json={"query": question, "texts": hypotheses}, timeout=1.0)
         if resp.status_code == 200:
             scores = resp.json()
             if isinstance(scores, list) and len(scores) == len(hypotheses):
@@ -2707,9 +2709,11 @@ def _rerank(question: str, memories: list, top_n: int = 30, diag: dict | None = 
     else:
         rerank_diag = None
     try:
-        resp = _rr.post(_reranker_url, json={"query": question, "texts": texts}, timeout=5)
-        resp.raise_for_status()
-        scores = resp.json()
+        from edumem.core.embeddings import _EMBED_API_LOCK as _CLIENT_API_LOCK
+        with _CLIENT_API_LOCK:
+            resp = _rr.post(_reranker_url, json={"query": question, "texts": texts}, timeout=5)
+            resp.raise_for_status()
+            scores = resp.json()
         memories = _apply_rerank_scores(memories, scores, top_n)
         if rerank_diag is not None:
             rerank_diag["successes"] += 1
@@ -3646,7 +3650,10 @@ def judge_with_rubrics(llm: LLMClient, question: str, rubric: list, ai_answer: s
             "raw_result": eval_result,
         }
 
-    except Exception:
+    except Exception as exc:
+        import traceback
+        print(f"      [Grader-Error] official grader failed with {type(exc).__name__}: {exc}", flush=True)
+        traceback.print_exc()
         return _legacy_judge_with_rubrics(llm, question, rubric, ai_answer)
 
 

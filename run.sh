@@ -30,10 +30,10 @@ if [ -z "$CONTAINER_ENGINE" ]; then
     fi
 fi
 
-if [ -z "$HF_TOKEN" ] && [ -f ".env" ]; then
+if [ -z "$HF_TOKEN" ] && [ -f ".env" ] && grep -q '^HF_TOKEN=' .env; then
     HF_TOKEN="$(grep -m1 '^HF_TOKEN=' .env | sed 's/^HF_TOKEN=//' | tr -d '\r' | sed 's/^["'\'']\(.*\)["'\'']$/\1/')"
 fi
-if [ -z "$HUGGING_FACE_HUB_TOKEN" ] && [ -f ".env" ]; then
+if [ -z "$HUGGING_FACE_HUB_TOKEN" ] && [ -f ".env" ] && grep -q '^HUGGING_FACE_HUB_TOKEN=' .env; then
     HUGGING_FACE_HUB_TOKEN="$(grep -m1 '^HUGGING_FACE_HUB_TOKEN=' .env | sed 's/^HUGGING_FACE_HUB_TOKEN=//' | tr -d '\r' | sed 's/^["'\'']\(.*\)["'\'']$/\1/')"
 fi
 if [ -z "$HF_TOKEN" ] && [ -n "$HUGGING_FACE_HUB_TOKEN" ]; then

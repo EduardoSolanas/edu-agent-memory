@@ -9,6 +9,7 @@ import json
 import os
 import ssl
 import urllib.request
+import threading
 from typing import List, Optional
 from functools import lru_cache
 
@@ -138,6 +139,9 @@ def _get_model():
     return _embedding_model
 
 
+_EMBED_API_LOCK = threading.Lock()
+
+
 def _embed_api(texts: List[str]) -> Optional[np.ndarray]:
     """Embed texts via OpenAI-compatible API (OpenRouter or custom endpoint)."""
     global _API_CALL_COUNT
@@ -164,26 +168,27 @@ def _embed_api(texts: List[str]) -> Optional[np.ndarray]:
     if _OPENAI_API_KEY:
         headers["Authorization"] = f"Bearer {_OPENAI_API_KEY}"
 
-    for attempt in range(3):
-        try:
-            req = urllib.request.Request(url, data=payload, headers=headers)
-            ctx = ssl.create_default_context()
-            # Support custom CA bundles (NixOS, enterprise proxies, etc.)
-            # SSL_CERT_FILE takes priority, then REQUESTS_CA_BUNDLE.
-            cert_file = os.environ.get("SSL_CERT_FILE") or os.environ.get("REQUESTS_CA_BUNDLE")
-            if cert_file:
-                ctx.load_verify_locations(cert_file)
-            with urllib.request.urlopen(req, timeout=30, context=ctx) as resp:
-                data = json.loads(resp.read())
-            embeddings = [item["embedding"] for item in data["data"]]
-            _API_CALL_COUNT += 1
-            return np.array(embeddings, dtype=np.float32)
-        except Exception as e:
-            if "429" in str(e) or "rate" in str(e).lower():
-                import time
-                time.sleep(2 ** attempt)
-                continue
-            return None
+    with _EMBED_API_LOCK:
+        for attempt in range(3):
+            try:
+                req = urllib.request.Request(url, data=payload, headers=headers)
+                ctx = ssl.create_default_context()
+                # Support custom CA bundles (NixOS, enterprise proxies, etc.)
+                # SSL_CERT_FILE takes priority, then REQUESTS_CA_BUNDLE.
+                cert_file = os.environ.get("SSL_CERT_FILE") or os.environ.get("REQUESTS_CA_BUNDLE")
+                if cert_file:
+                    ctx.load_verify_locations(cert_file)
+                with urllib.request.urlopen(req, timeout=30, context=ctx) as resp:
+                    data = json.loads(resp.read())
+                embeddings = [item["embedding"] for item in data["data"]]
+                _API_CALL_COUNT += 1
+                return np.array(embeddings, dtype=np.float32)
+            except Exception as e:
+                if "429" in str(e) or "rate" in str(e).lower():
+                    import time
+                    time.sleep(2 ** attempt)
+                    continue
+                return None
 
     return None
 

@@ -50,7 +50,7 @@ def test_runner_helpers_build_expected_env_and_command():
         start_index=4,
         case_index=7,
     )
-    assert command[0].endswith("python.exe") or command[0].endswith("python")
+    assert command[0].endswith("python.exe") or command[0].endswith("python") or command[0].endswith("python3")
     assert command[1] == "-u"
     assert command[2].endswith("evaluate_beam_end_to_end.py")
     assert command[command.index("--model") + 1] == "deepseek-v4-flash"

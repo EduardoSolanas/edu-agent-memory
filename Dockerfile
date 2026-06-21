@@ -48,12 +48,12 @@ RUN set -eux; \
             intel-opencl-icd \
             clinfo; \
         rm -rf /var/lib/apt/lists/*; \
+        pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu torch; \
         pip install --no-cache-dir \
             openvino==2026.2.0 \
             openvino-genai==2026.2.0 \
             openvino-tokenizers==2026.2.0.0 \
             optimum-intel[openvino]; \
-        pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu torch; \
     else \
         apt-get update; \
         apt-get install -y --no-install-recommends libgomp1; \
