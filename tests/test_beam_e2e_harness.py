@@ -4,7 +4,9 @@ import json
 import pytest
 
 from tests.test_beam_e2e_full import (
+    FIXTURE_PATH,
     _build_e2e_artifact,
+    _contains_all,
     _format_metric_chain,
     _llm_errors,
     _write_e2e_artifact,
@@ -72,3 +74,40 @@ def test_llm_errors_are_detected_independently_of_case_xfail_marks():
     errors = _llm_errors({"1:q0": "ok", "1:q7": "[LLM_ERROR: timeout]"})
 
     assert errors == {"1:q7": "[LLM_ERROR: timeout]"}
+
+
+def test_q7_fixture_accepts_complete_backend_and_frontend_sprint_answer():
+    cases = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
+    case = next(case for case in cases if case["qid"] == "1:q7")
+    answer = """The tasks were organized into a two-week sprint (March 15 - March 29).
+Week 1 (March 15 - March 22): Backend Foundation. Define the database schema
+for users and implement user registration.
+Week 2 (March 23 - March 29): Frontend and Integration. Add frontend forms and
+integrate frontend forms with the backend."""
+
+    assert case["expectation"] == "hard"
+    assert _contains_all(answer, case["nuggets"]) == (True, [])
+
+
+@pytest.mark.parametrize(
+    "incomplete_answer",
+    [
+        (
+            "Week 1, March 15 - March 22: define the database schema and "
+            "implement user registration."
+        ),
+        (
+            "Week 2, March 23 - March 29: add frontend forms and integrate "
+            "frontend forms with the backend."
+        ),
+    ],
+    ids=["missing_frontend_phase", "missing_backend_phase"],
+)
+def test_q7_fixture_rejects_answer_missing_a_sprint_phase(incomplete_answer):
+    cases = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
+    case = next(case for case in cases if case["qid"] == "1:q7")
+
+    ok, missing = _contains_all(incomplete_answer, case["nuggets"])
+
+    assert not ok
+    assert missing

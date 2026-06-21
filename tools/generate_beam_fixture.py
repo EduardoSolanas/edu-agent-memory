@@ -25,6 +25,17 @@ STOPWORDS = {
     'about', 'during', 'across', 'through'
 }
 
+Q7_ATOMIC_NUGGETS = [
+    "march 15",
+    "march 22",
+    "march 23",
+    "march 29",
+    "database schema",
+    "user registration",
+    "frontend forms",
+    "integrate frontend",
+]
+
 def _atomize(nugget: str) -> list:
     """
     Decompose a nugget string into atomic facts.
@@ -130,6 +141,9 @@ def derive_check(ability: str) -> str:
 
 def extract_nuggets(ability: str, rubric: list, qid: str = None) -> list:
     """Extract nuggets from rubric based on ability type."""
+    if qid == "1:q7":
+        return Q7_ATOMIC_NUGGETS.copy()
+
     check = derive_check(ability)
 
     if check == "skip" or check == "absence":
@@ -193,10 +207,9 @@ for i, q in enumerate(conv['questions']):
     # Determine expectation
     expectation = "hard" if baseline_score >= 0.75 else "xfail"
 
-    # SPECIAL CASE: demote q1 (ABS) and q7 (IE) to xfail
+    # SPECIAL CASE: demote q1 (ABS) to xfail
     # q1 ABS: abstention is single-sample model-variant; demoted to xfail
-    # q7 IE: model abstains due to perceived contradictions instead of providing task details; demoted to xfail
-    if qid in ("1:q1", "1:q7"):
+    if qid == "1:q1":
         expectation = "xfail"
 
     # Derive check and nuggets
