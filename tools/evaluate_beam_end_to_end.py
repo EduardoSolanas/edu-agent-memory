@@ -4745,8 +4745,13 @@ def main():
         print(f"\n  --- Scale: {scale} ({len(conversations)} conversations) ---")
 
         for conv in conversations:
-            # Create fresh edumem DB for each conversation
-            with tempfile.TemporaryDirectory() as tmpdir:
+            # Create fresh edumem DB for each conversation.
+            # ignore_cleanup_errors: on Windows the temp SQLite DB (plus its
+            # WAL -shm/-wal sidecars) may still have open handles when the
+            # TemporaryDirectory tries to unlink them. Windows cannot unlink an
+            # open file, so cleanup would raise PermissionError [WinError 32]
+            # and crash the run. Treat cleanup failures as a non-fatal warning.
+            with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
                 db_path = Path(tmpdir) / f"beam_{scale}_{conv['id']}.db"
                 init_beam(db_path)
                 beam = BeamMemory(session_id=f"beam_{scale}_{conv['id']}",
@@ -4815,7 +4820,20 @@ def main():
                     if api_calls_after is not None:
                         embedding_diag["api_calls"] = api_calls_after - api_calls_before
                 all_results.append(conv_result)
-                beam.conn.close()
+
+                # Explicitly release the SQLite file handle so the temp dir can
+                # be unlinked (critical on Windows, harmless on Linux). Checkpoint
+                # + truncate folds the WAL/-shm sidecars back into the main DB so
+                # they can be removed too. Best-effort: never let cleanup hygiene
+                # raise and abort the conversation loop.
+                try:
+                    beam.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                except Exception:
+                    pass
+                try:
+                    beam.conn.close()
+                except Exception:
+                    pass
 
                 # Print Conversation Summary to Console/Log
                 try:
