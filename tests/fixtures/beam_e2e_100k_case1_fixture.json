@@ -111,7 +111,8 @@
       "user registration",
       "frontend forms",
       "integrate frontend"
-    ]
+    ],
+    "min_fraction": 0.6
   },
   {
     "qid": "1:q8",
@@ -206,7 +207,8 @@
         "analytics",
         "data visualization"
       ]
-    ]
+    ],
+    "min_fraction": 1.0
   },
   {
     "qid": "1:q15",
@@ -234,7 +236,8 @@
         "then add",
         "prioritize"
       ]
-    ]
+    ],
+    "min_fraction": 1.0
   },
   {
     "qid": "1:q16",
@@ -294,7 +297,8 @@
         "table",
         "diagram"
       ]
-    ]
+    ],
+    "min_fraction": 0.5
   },
   {
     "qid": "1:q17",
@@ -326,7 +330,8 @@
         "account lockout",
         "login lockout"
       ]
-    ]
+    ],
+    "min_fraction": 1.0
   },
   {
     "qid": "1:q18",

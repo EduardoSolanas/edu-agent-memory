@@ -115,14 +115,22 @@ def _intent_from_question(question: str) -> str:
 
     Returns one of: 'ordered', 'timeline', 'change', or 'current'.
 
-    Uses the OpenVINO reranker to perform Zero-Shot Classification of intent,
-    falling back to robust local regex if the reranker is unavailable.
+    Mode (via EDUMEM_INTENT_MODE env var):
+      - "deterministic" (explicit opt-in): use only regex signals, no reranker
+      - "reranker" (default): use regex signals first, then reranker for ambiguous cases
     """
     import requests
 
     def _fallback_intent(q_text: str) -> str:
         return _deterministic_intent(q_text) or "current"
 
+    mode = os.environ.get("EDUMEM_INTENT_MODE", "reranker")
+
+    # Deterministic-only mode: no reranker, ever
+    if mode == "deterministic":
+        return _fallback_intent(question)
+
+    # Reranker mode (default): deterministic signals first, then reranker
     deterministic = _deterministic_intent(question)
     if deterministic is not None:
         return deterministic

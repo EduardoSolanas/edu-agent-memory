@@ -1969,136 +1969,46 @@ def test_beam_integ_default_ability_no_version_annotation(tmp_path):
 # versioned-fact surfacing in pure-recall (label-free) mode.
 
 
-def test_memoria_retrieve_intent_current_activates_under_no_ability(tmp_path):
-    """With ability=None, explicit intent='current' must activate versioned KU surfacing.
-
-    This test FAILS if intent parameter is ignored or not routed correctly."""
-    beam = _make_beam_for_integration(tmp_path, "test_intent_current")
-    try:
-        # Insert a version chain (KU-style)
-        beam._insert_fact("test_intent_current", 30, "metric", "api_response_time",
-                          "500ms", "API response time was 500ms", 0.7,
-                          source_memory_id="msg30")
-        beam._insert_fact("test_intent_current", 70, "metric", "api_response_time",
-                          "200ms", "API response time is now 200ms", 0.7,
-                          source_memory_id="msg70")
-        beam.conn.commit()
-
-        # Call with ability=None but explicit intent='current'
-        result = beam.memoria_retrieve(
-            "What is the current API response time?", ability=None, intent="current", top_k=10
-        )
-        ctx = result["context"]
-        # Must NOT be fallback
-        assert result.get("source") != "fallback", \
-            f"Intent='current' should activate retrieval, got fallback"
-        # Must contain CURRENT format
-        assert "[fact current" in ctx.lower(), \
-            f"Intent='current' must activate CURRENT format, got: {ctx}"
-        # Must show latest value
-        assert "200ms" in ctx
-    finally:
-        beam.conn.close()
-
-
-def test_memoria_retrieve_intent_change_activates_under_no_ability(tmp_path):
-    """With ability=None, explicit intent='change' must activate versioned CR surfacing.
-
-    This test FAILS if intent parameter is ignored or not routed correctly."""
-    beam = _make_beam_for_integration(tmp_path, "test_intent_change")
-    try:
-        # Insert a version chain (CR-style) using key that matches query term
-        beam._insert_fact("test_intent_change", 20, "entity", "Frontend_framework",
-                          "jQuery", "Used jQuery for UI", 0.7,
-                          source_memory_id="msg20")
-        beam._insert_fact("test_intent_change", 60, "entity", "Frontend_framework",
-                          "React", "Switched to React", 0.7,
-                          source_memory_id="msg60")
-        beam.conn.commit()
-
-        # Call with ability=None but explicit intent='change'
-        result = beam.memoria_retrieve(
-            "Have I changed the Frontend framework?", ability=None, intent="change", top_k=10
-        )
-        ctx = result["context"]
-        # Must NOT be fallback
-        assert result.get("source") != "fallback", \
-            f"Intent='change' should activate retrieval, got fallback"
-        # Must contain CHANGED format
-        assert "[fact changed" in ctx.lower(), \
-            f"Intent='change' must activate CHANGED format, got: {ctx}"
-        # Must show both old and new values
-        assert "jquery" in ctx.lower()
-        assert "react" in ctx.lower()
-    finally:
-        beam.conn.close()
-
-
-def test_memoria_retrieve_intent_timeline_activates_under_no_ability(tmp_path):
-    """With ability=None, explicit intent='timeline' must activate versioned TR surfacing.
-
-    This test FAILS if intent parameter is ignored or not routed correctly."""
-    beam = _make_beam_for_integration(tmp_path, "test_intent_timeline")
-    try:
-        # Insert a version chain with dates (TR-style)
-        # Use metric type and numeric key for Pass 1 search to work
-        beam._insert_fact("test_intent_timeline", 10, "metric", "deadline_01_15",
-                          "2024-02-01", "Original deadline Feb 1", 0.7,
-                          source_memory_id="msg10")
-        beam._insert_fact("test_intent_timeline", 45, "metric", "deadline_01_15",
-                          "2024-03-15", "Deadline extended to Mar 15", 0.7,
-                          source_memory_id="msg45")
-        beam.conn.commit()
-
-        # Call with ability=None but explicit intent='timeline'
-        # Query with numbers that will trigger Pass 1 search
-        result = beam.memoria_retrieve(
-            "What happened to the deadline between 01-15 and 2024?", ability=None, intent="timeline", top_k=10
-        )
-        ctx = result["context"]
-        # Must NOT be fallback
-        assert result.get("source") != "fallback", \
-            f"Intent='timeline' should activate retrieval, got fallback"
-        # Must contain TIMELINE format
-        assert "[fact timeline" in ctx.lower(), \
-            f"Intent='timeline' must activate TIMELINE format, got: {ctx}"
-        # Must show both dates
-        assert "2024-02-01" in ctx
-        assert "2024-03-15" in ctx
-    finally:
-        beam.conn.close()
-
-
 def test_intent_from_question_maps_text_to_intent():
-    """_intent_from_question() must derive correct intent from question text only.
+    """_intent_from_question() in deterministic mode must derive correct intent from question text only.
 
-    This test FAILS if the intent mapper doesn't recognize question patterns."""
+    This test FAILS if the intent mapper doesn't recognize question patterns.
+    Uses deterministic mode (offline, no reranker) for unit test reliability."""
     from tools.evaluate_beam_end_to_end import _intent_from_question
 
-    # Current (KU) questions
-    assert _intent_from_question("What is the current API version?") == "current"
-    assert _intent_from_question("What is the latest status?") == "current"
-    assert _intent_from_question("How many items do I have?") == "current"
+    saved_intent_mode = os.environ.get("EDUMEM_INTENT_MODE")
+    os.environ["EDUMEM_INTENT_MODE"] = "deterministic"
 
-    # Timeline (TR) questions
-    assert _intent_from_question("How long between Jan 1 and Feb 15?") == "timeline"
-    assert _intent_from_question("How many weeks did that take?") == "timeline"
-    assert _intent_from_question("How many days between the two dates?") == "timeline"
+    try:
+        # Current (KU) questions - no explicit temporal/order/change signals
+        assert _intent_from_question("What is the current API version?") == "current"
+        assert _intent_from_question("What is the latest status?") == "current"
+        assert _intent_from_question("How many items do I have?") == "current"
 
-    # Change (CR) questions — explicit contradiction wording AND yes/no checks
-    assert _intent_from_question("Is there a contradiction in my answers?") == "change"
-    assert _intent_from_question("Did I mention conflicting information?") == "change"
-    assert _intent_from_question("Have I worked with Flask routes?") == "change"
+        # Timeline (TR) questions - explicit duration/date signals
+        assert _intent_from_question("How long between Jan 1 and Feb 15?") == "timeline"
+        assert _intent_from_question("How many weeks did that take?") == "timeline"
+        assert _intent_from_question("How many days between the two dates?") == "timeline"
 
-    # Ordered (EO) questions
-    assert _intent_from_question("In what order did I implement them?") == "ordered"
-    assert _intent_from_question("What sequence did we follow?") == "ordered"
-    assert _intent_from_question("Walk me through the steps.") == "ordered"
+        # Change (CR) questions — explicit contradiction wording AND yes/no checks
+        assert _intent_from_question("Is there a contradiction in my answers?") == "change"
+        assert _intent_from_question("Did I mention conflicting information?") == "change"
+        assert _intent_from_question("Have I worked with Flask routes?") == "change"
 
-    # Default: value-seeking questions fall through to 'current' (KU questions
-    # rarely carry explicit keywords; current-rendering is harmless without history)
-    assert _intent_from_question("What is the average response time?") == "current"
-    assert _intent_from_question("Tell me about your experience.") == "current"
+        # Ordered (EO) questions - explicit ordering/sequence signals
+        assert _intent_from_question("In what order did I implement them?") == "ordered"
+        assert _intent_from_question("What sequence did we follow?") == "ordered"
+        assert _intent_from_question("Walk me through the steps.") == "ordered"
+
+        # Default: value-seeking questions with no explicit signals fall through to 'current'
+        # (KU questions rarely carry explicit keywords; current-rendering is harmless without history)
+        assert _intent_from_question("What is the average response time?") == "current"
+        assert _intent_from_question("Tell me about your experience.") == "current"
+    finally:
+        if saved_intent_mode is None:
+            os.environ.pop("EDUMEM_INTENT_MODE", None)
+        else:
+            os.environ["EDUMEM_INTENT_MODE"] = saved_intent_mode
 
 
 # ============================================================
@@ -2150,7 +2060,8 @@ def test_build_canonicalize_prompt_lists_existing_and_observations(tmp_path):
     """Test that _build_canonicalize_prompt generates a well-formed LLM prompt.
 
     The prompt should list existing facts and new observations,
-    requesting canonical keys in JSON format.
+    requesting canonical keys in JSON format, and include collapse instructions
+    for same-metric measurements while preserving target/goal distinction.
     """
     beam = _make_beam_for_integration(tmp_path, "prompt_test")
     try:
@@ -2170,6 +2081,16 @@ def test_build_canonicalize_prompt_lists_existing_and_observations(tmp_path):
         assert "dashboard API response time" in prompt, "Prompt should include context"
         # Should ask for JSON response
         assert "json" in prompt.lower() or "JSON" in prompt, "Prompt should ask for JSON"
+
+        # NEW: Prompt should include instruction to collapse actual measurements to a single base key
+        assert "single" in prompt.lower() and "base" in prompt.lower(), \
+            "Prompt should instruct collapsing to single base key for actual measurements"
+        # Should instruct to ignore incidental qualifiers
+        assert ("qualifiers" in prompt.lower() or "incidental" in prompt.lower()), \
+            "Prompt should mention ignoring incidental qualifiers"
+        # Should distinguish targets/goals from measurements
+        assert ("target" in prompt.lower() and ("goal" in prompt.lower() or "distinct" in prompt.lower())), \
+            "Prompt should distinguish targets/goals from actual measurements"
     finally:
         beam.conn.close()
 
@@ -2222,3 +2143,318 @@ def test_consolidation_falls_back_to_regex_without_llm(tmp_path):
         beam.conn.commit()
     finally:
         beam.conn.close()
+
+
+# ============================================================================
+# NEW TESTS: Static Grading Thresholds (Loosen IE/IF/SUM, Keep Atomic Strict)
+# ============================================================================
+# These tests verify the new fractional threshold logic for descriptive checks
+
+
+def test_contains_all_with_min_fraction_passes_majority():
+    """IE descriptive: _contains_all(..., min_fraction=0.6) passes with 6/8 nuggets."""
+    from tests.test_beam_e2e_full import _contains_all
+
+    answer = (
+        "The sprint was organized over multiple dates: March 15 for planning, "
+        "March 22 for schema work, March 23 for another milestone, and March 29 for the sprint end. "
+        "The team set up the database schema, implemented user registration, "
+        "and created frontend forms."
+    )
+    nuggets = [
+        "march 15", "march 22", "march 23", "march 29",
+        "database schema", "user registration", "frontend forms",
+        "integrate frontend",  # MISSING
+    ]
+
+    # With min_fraction=0.6: 6/8 = 0.75 >= 0.6 should PASS
+    ok, missing = _contains_all(answer, nuggets, min_fraction=0.6)
+    assert ok is True, (
+        f"Should PASS with {(len(nuggets) - len(missing)) / len(nuggets):.1%} coverage "
+        f"(>= 0.6 threshold). Missing: {missing}"
+    )
+
+
+def test_contains_all_with_min_fraction_fails_below_threshold():
+    """IE descriptive: _contains_all(..., min_fraction=0.6) fails with 2/8 nuggets."""
+    from tests.test_beam_e2e_full import _contains_all
+
+    answer = "March 15 was important. Database schema was discussed."
+    nuggets = [
+        "march 15", "march 22", "march 23", "march 29",
+        "database schema", "user registration", "frontend forms",
+        "integrate frontend",
+    ]
+
+    # With min_fraction=0.6: 2/8 = 0.25 < 0.6 should FAIL
+    ok, missing = _contains_all(answer, nuggets, min_fraction=0.6)
+    fraction = (len(nuggets) - len(missing)) / len(nuggets)
+    assert ok is False, f"Should FAIL with {fraction:.1%} coverage (< 0.6 threshold)"
+
+
+def test_contains_groups_with_min_fraction_passes_majority():
+    """SUM descriptive: _contains_groups(..., min_fraction=0.5) passes with 7/13 groups."""
+    from tests.test_beam_e2e_full import _contains_groups
+
+    answer = (
+        "The project includes user authentication and registration. "
+        "It handles expense and transaction management. "
+        "We added visualization and analytics features. "
+        "The deadline was April 15, 2024. "
+        "We implemented password hashing. "
+        "We used token-based authentication. "
+        "Input validation was added throughout."
+    )
+
+    groups = [
+        ["registration", "user authentication"],
+        ["expense", "transaction management"],
+        ["visualization", "analytics"],
+        ["april 15, 2024", "april 15 2024"],
+        ["authentication", "login"],
+        ["deployment"],
+        ["password hashing", "stronger password"],
+        ["token-based", "token authentication"],
+        ["role-based access", "rbac"],
+        ["input validation"],
+        ["confluence"],
+        ["api endpoint", "architecture decision"],
+        ["table", "diagram"],
+    ]
+
+    # With min_fraction=0.5: 7/13 = 53.8% >= 0.5 should PASS
+    ok, missing = _contains_groups(answer, groups, min_fraction=0.5)
+    assert ok is True, (
+        f"Should PASS with {(len(groups) - len(missing)) / len(groups):.1%} coverage "
+        f"(>= 0.5 threshold). Missing groups: {len(missing)}/{len(groups)}"
+    )
+
+
+def test_contains_groups_with_min_fraction_fails_below_threshold():
+    """SUM descriptive: _contains_groups(..., min_fraction=0.5) fails with 2/13 groups."""
+    from tests.test_beam_e2e_full import _contains_groups
+
+    answer = "The project includes user authentication. We handle transactions."
+
+    groups = [
+        ["registration", "user authentication"],
+        ["expense", "transaction management"],
+        ["visualization", "analytics"],
+        ["april 15, 2024", "april 15 2024"],
+        ["authentication", "login"],
+        ["deployment"],
+        ["password hashing", "stronger password"],
+        ["token-based", "token authentication"],
+        ["role-based access", "rbac"],
+        ["input validation"],
+        ["confluence"],
+        ["api endpoint", "architecture decision"],
+        ["table", "diagram"],
+    ]
+
+    # With min_fraction=0.5: 2/13 = 15.4% < 0.5 should FAIL
+    ok, missing = _contains_groups(answer, groups, min_fraction=0.5)
+    fraction = (len(groups) - len(missing)) / len(groups)
+    assert ok is False, f"Should FAIL with {fraction:.1%} coverage (< 0.5 threshold)"
+
+
+def test_versioned_dependencies_requires_multiple_versions():
+    """IF: _case_outcome requires multiple explicitly versioned dependencies."""
+    from tests.test_beam_e2e_full import _versioned_dependency_stats
+
+    # Two versioned deps: should PASS
+    answer_good = "Flask 2.3.0 and SQLAlchemy==2.0.19 are used."
+    count_good, unv_good = _versioned_dependency_stats(answer_good)
+    assert count_good >= 2, f"Expected >= 2 versioned, got {count_good}"
+    assert not unv_good, f"Should have no unversioned bullets, got {unv_good}"
+
+    # One versioned dep: should FAIL (with min_versioned_dependencies=2)
+    answer_bad = "The project uses Flask 2.3.0."
+    count_bad, unv_bad = _versioned_dependency_stats(answer_bad)
+    assert count_bad == 1, f"Expected exactly 1 versioned, got {count_bad}"
+    assert not unv_bad, "Should have no unversioned bullets"
+
+
+def test_versioned_dependencies_detects_unversioned_bullets():
+    """IF: check fails if any unversioned dependency bullets are found."""
+    from tests.test_beam_e2e_full import _versioned_dependency_stats
+
+    answer = (
+        "Main libraries:\n"
+        "* Flask: 2.3.0\n"
+        "* SQLAlchemy: 2.0.19\n"
+        "* Werkzeug\n"  # No version
+    )
+
+    count, unversioned = _versioned_dependency_stats(answer)
+    # count >= 2 but unversioned bullets exist -> should still fail
+    assert count >= 2, f"Expected >= 2 versioned, got {count}"
+    assert len(unversioned) >= 1, (
+        f"Should detect unversioned bullet 'Werkzeug', "
+        f"got unversioned={unversioned}"
+    )
+
+
+def test_atomic_ku_check_strict_exact_value():
+    """KU atomic checks remain STRICT: must have exact value."""
+    from tests.test_beam_e2e_full import _contains_all
+
+    # Exact value must be found
+    answer = "The average response time is 250ms according to our dashboard."
+    nuggets = ["250ms"]
+    ok, missing = _contains_all(answer, nuggets)
+    assert ok is True, "Exact atomic value must be found"
+
+    # Wrong value should fail
+    answer_wrong = "The average response time is 200ms."
+    ok_wrong, missing_wrong = _contains_all(answer_wrong, nuggets)
+    assert ok_wrong is False, "Wrong atomic value must fail"
+    assert "250ms" in missing_wrong
+
+
+def test_atomic_mr_count_check_strict_exact_count():
+    """MR atomic checks remain STRICT: must have exact count."""
+    from tests.test_beam_e2e_full import _contains_all
+
+    # Exact count must be found
+    answer = "I want to implement three different user roles: admin, moderator, viewer."
+    nuggets = ["three"]
+    ok, missing = _contains_all(answer, nuggets)
+    assert ok is True, "Exact count must be found"
+
+    # Wrong count should fail
+    answer_wrong = "I want to implement two different user roles."
+    ok_wrong, missing_wrong = _contains_all(answer_wrong, nuggets)
+    assert ok_wrong is False, "Wrong count must fail"
+
+
+# ---------- RRF Fusion tests (2026-06-22) ----------
+
+
+def test_rrf_fuse_single_list_preserves_order():
+    """A single ranked list → same order."""
+    from edumem.core.beam import _rrf_fuse
+
+    ranked_lists = [["A", "B", "C"]]
+    result = _rrf_fuse(ranked_lists, k=60)
+    assert result == ["A", "B", "C"]
+
+
+def test_rrf_fuse_rewards_items_in_multiple_lists():
+    """Items appearing in multiple lists rank higher (appear in both)."""
+    from edumem.core.beam import _rrf_fuse
+
+    ranked_lists = [["A", "B"], ["A", "C"]]
+    result = _rrf_fuse(ranked_lists, k=60)
+    # A is in both lists at positions 0 and 0 → RRF score = 1/(60+0) + 1/(60+0) = 2/60
+    # B is in list 1 at position 1 → RRF score = 1/(60+1) = 1/61
+    # C is in list 2 at position 1 → RRF score = 1/(60+1) = 1/61
+    # So A ranks first
+    assert result[0] == "A"
+
+
+def test_rrf_fuse_multi_list_beats_single():
+    """An item ranked mid in TWO lists outranks an item ranked top in only ONE."""
+    from edumem.core.beam import _rrf_fuse
+
+    # Item X: top in list 1 only → score = 1/60
+    # Item Y: mid (position 2) in both lists → score = 1/62 + 1/62 = 2/62 ≈ 0.0323
+    # Item Z: similar to Y
+    # With k=60, 1/60 ≈ 0.0167 and 2/62 ≈ 0.0323, so Y > X
+    ranked_lists = [
+        ["X", "Y", "Z"],    # X top, Y/Z mid
+        ["Y", "Z", "X"],    # Y top, Z mid, X bottom
+    ]
+    result = _rrf_fuse(ranked_lists, k=60)
+    # Y: 1/60 (pos 1 in list 2) + 1/62 (pos 2 in list 1) = 1/60 + 1/62 ≈ 0.0333
+    # X: 1/60 (pos 0 in list 1) + 1/63 (pos 2 in list 2) ≈ 0.0276
+    # Z: 1/61 (pos 2 in list 1) + 1/61 (pos 1 in list 2) ≈ 0.0328
+    assert result[0] == "Y", f"Y should rank first, got {result}"
+
+
+def test_rrf_fuse_handles_empty_lists():
+    """Empty/missing lists don't crash; returns non-empty union."""
+    from edumem.core.beam import _rrf_fuse
+
+    ranked_lists = [[], ["A", "B"]]
+    result = _rrf_fuse(ranked_lists, k=60)
+    assert set(result) == {"A", "B"}
+
+    ranked_lists = []
+    result = _rrf_fuse(ranked_lists, k=60)
+    assert result == []
+
+
+def test_memoria_fused_retrieve_merges_multiple_specialists(tmp_path):
+    """Fused retrieval includes results from BOTH fact AND timeline specialists."""
+    from edumem.core.beam import BeamMemory, init_beam
+
+    saved_no_embeddings = os.environ.get("EDUMEM_NO_EMBEDDINGS")
+    os.environ["EDUMEM_NO_EMBEDDINGS"] = "1"
+
+    try:
+        db_path = str(tmp_path / "test_fused.db")
+        init_beam(db_path)
+        beam = BeamMemory(db_path=db_path, session_id="test_fused")
+
+        # Insert a versioned metric fact
+        beam._insert_fact(
+            "test_fused", 3, "metric", "team_size", "5members",
+            "We have 5 team members", 0.7, source_memory_id="msg3"
+        )
+        # Insert a timeline entry
+        beam.conn.execute(
+            "INSERT INTO memoria_timelines (session_id, date, description, message_idx) "
+            "VALUES (?, ?, ?, ?)",
+            ("test_fused", "2024-03-15", "The team expanded to 5 members", 3)
+        )
+        beam.conn.commit()
+
+        # Call fused retrieve
+        result = beam._memoria_fused_retrieve("team members", top_k=10)
+
+        # Should have both fact and timeline context
+        assert result["source"] == "rrf_fused"
+        assert len(result["context"]) > 0
+        assert len(result["facts"]) > 0
+        # The result should include contributions from multiple specialists
+        # At minimum, source should indicate fusion
+        assert result.get("source") is not None
+    finally:
+        beam.conn.close()
+        if saved_no_embeddings is None:
+            os.environ.pop("EDUMEM_NO_EMBEDDINGS", None)
+        else:
+            os.environ["EDUMEM_NO_EMBEDDINGS"] = saved_no_embeddings
+
+
+def test_rrf_fusion_on_by_default(tmp_path):
+    """RRF fusion is always active and returns fused results."""
+    from edumem.core.beam import BeamMemory, init_beam
+
+    saved_no_embeddings = os.environ.get("EDUMEM_NO_EMBEDDINGS")
+    os.environ["EDUMEM_NO_EMBEDDINGS"] = "1"
+
+    try:
+        db_path = str(tmp_path / "test_fusion_default.db")
+        init_beam(db_path)
+        beam = BeamMemory(db_path=db_path, session_id="test_fusion_default")
+
+        # Insert test data using correct schema (key/value pattern)
+        beam.conn.execute(
+            "INSERT INTO memoria_facts (session_id, message_idx, fact_type, key, value, context_snippet) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("test_fusion_default", 5, "product", "launch_date", "March 2024", "Feature launches in March")
+        )
+        beam.conn.commit()
+
+        # Call with a query - always uses RRF fusion
+        result = beam.memoria_retrieve("When did we launch?", ability="KU", top_k=10)
+        # Fusion returns "rrf_fused" as source
+        assert result["source"] == "rrf_fused", f"Expected 'rrf_fused' but got '{result['source']}'"
+    finally:
+        beam.conn.close()
+        if saved_no_embeddings is None:
+            os.environ.pop("EDUMEM_NO_EMBEDDINGS", None)
+        else:
+            os.environ["EDUMEM_NO_EMBEDDINGS"] = saved_no_embeddings

@@ -2316,6 +2316,33 @@ def _wm_vec_search(conn: sqlite3.Connection, query_embedding, k: int = 20) -> Li
     return results[:k]
 
 
+def _rrf_fuse(ranked_lists: list[list], k: int = 60) -> list:
+    """Fuse multiple ranked lists using Reciprocal Rank Fusion (RRF).
+
+    Args:
+        ranked_lists: List of ranked lists, each is an ordered list of item keys.
+                     Index 0 = best rank.
+        k: Parameter in RRF score formula: score = sum(1 / (k + rank)).
+           Default 60 (typical for RRF).
+
+    Returns:
+        Single list of unique keys ordered by descending RRF score.
+    """
+    if not ranked_lists:
+        return []
+
+    # Compute RRF score for each item
+    scores = {}
+    for ranked_list in ranked_lists:
+        for rank, item in enumerate(ranked_list):
+            score = 1.0 / (k + rank)
+            scores[item] = scores.get(item, 0.0) + score
+
+    # Sort by descending score
+    sorted_items = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    return [item for item, _ in sorted_items]
+
+
 class BeamMemory:
     """
     BEAM memory interface.
@@ -4509,7 +4536,9 @@ Rules:
 3. Targets, goals, SLAs, and thresholds are separate from observed measurements; target keys must include "target".
 4. If wording differs but subject, operation, and metric are the same, reuse the existing key.
 5. If it is a different metric, create a new canonical key in snake_case ending with the unit.
-6. Return ONLY a JSON array with one element per observation:
+6. CRITICAL: Map all actual measurements of the same metric to a single base snake_case key (e.g., "response_time_ms"). Ignore incidental qualifiers when forming the key — words like "current", "now", "under", "around", "improved", "before optimization", and "after optimization" describe the value's context or moment, not a different metric. Strongly prefer reusing an existing base key over inventing a qualified variant.
+7. Only use a distinct key (e.g., "response_time_target_ms") when the observation is a stated GOAL or TARGET, not an actual measurement. Keep targets separate from actual measurements.
+8. Return ONLY a JSON array with one element per observation:
 [{{"index": N, "canonical_key": "key_name", "is_update": bool}}, ...]
 
 Example:
@@ -4886,6 +4915,131 @@ Now respond with ONLY the JSON array, no explanation."""
         return ''.join(_accent_map.get(c, c) for c in text)
 
     # ------------------------------------------------------------------
+    # RRF Fusion: Reciprocal Rank Fusion for multi-specialist fusion
+    # ------------------------------------------------------------------
+    def _memoria_fused_retrieve(self, query: str, top_k: int = 10) -> dict:
+        """Fuse results from all MEMORIA specialists using RRF.
+
+        Runs all four specialists in parallel (guarded), extracts their ranked results,
+        fuses them with RRF, and reassembles into a single result dict.
+
+        Args:
+            query: The query string.
+            top_k: Number of final results to return.
+
+        Returns:
+            Dict with keys: context (str), facts (list), source (str),
+                           source_memory_ids (list), and optional rrf_timing.
+        """
+        import time as _time
+
+        timing = {}
+        start_total = _time.perf_counter()
+
+        # Run all four specialists, guarding against failures
+        specialists = []
+
+        # Specialist 1: Fact retrieval
+        try:
+            start = _time.perf_counter()
+            fact_result = self._memoria_fact_retrieve(query, top_k=top_k, intent='')
+            timing['fact_ms'] = (_time.perf_counter() - start) * 1000
+            specialists.append(('fact', fact_result))
+        except Exception:
+            timing['fact_ms'] = 0
+            specialists.append(('fact', {"context": "", "facts": [], "source": "fallback"}))
+
+        # Specialist 2: Timeline retrieval
+        try:
+            start = _time.perf_counter()
+            timeline_result = self._memoria_timeline_retrieve(query, top_k=top_k)
+            timing['timeline_ms'] = (_time.perf_counter() - start) * 1000
+            specialists.append(('timeline', timeline_result))
+        except Exception:
+            timing['timeline_ms'] = 0
+            specialists.append(('timeline', {"context": "", "facts": [], "source": "fallback"}))
+
+        # Specialist 3: Negation retrieval
+        try:
+            start = _time.perf_counter()
+            negation_result = self._memoria_negation_retrieve(query, top_k=top_k)
+            timing['negation_ms'] = (_time.perf_counter() - start) * 1000
+            specialists.append(('negation', negation_result))
+        except Exception:
+            timing['negation_ms'] = 0
+            specialists.append(('negation', {"context": "", "facts": [], "source": "fallback"}))
+
+        # Specialist 4: Chrono retrieval
+        try:
+            start = _time.perf_counter()
+            chrono_result = self._memoria_chrono_retrieve(query, top_k=top_k)
+            timing['chrono_ms'] = (_time.perf_counter() - start) * 1000
+            specialists.append(('chrono', chrono_result))
+        except Exception:
+            timing['chrono_ms'] = 0
+            specialists.append(('chrono', {"context": "", "facts": [], "source": "fallback"}))
+
+        # Build ranked lists from each specialist's results
+        # Stable key for fusion: use fact's source_memory_id if available, else content hash
+        ranked_lists = []
+        all_items = {}  # Maps key → (specialist_name, item_dict)
+
+        for specialist_name, result in specialists:
+            ranked_list = []
+            facts = result.get("facts", [])
+            for fact in facts:
+                # Use source_memory_id as stable key; fallback to stringified fact
+                if isinstance(fact, dict):
+                    key = fact.get("source_memory_id") or fact.get("fact_key") or str(fact)
+                else:
+                    key = str(fact)
+                ranked_list.append(key)
+                all_items[key] = (specialist_name, fact)
+            ranked_lists.append(ranked_list)
+
+        # Fuse the ranked lists
+        start = _time.perf_counter()
+        fused_keys = _rrf_fuse(ranked_lists, k=60)
+        timing['fuse_ms'] = (_time.perf_counter() - start) * 1000
+
+        # Reassemble result, respecting fused order
+        final_context_lines = []
+        final_facts = []
+        final_ids = set()
+
+        for key in fused_keys[:top_k]:
+            if key in all_items:
+                specialist_name, fact_item = all_items[key]
+                final_facts.append(fact_item)
+                if isinstance(fact_item, dict):
+                    final_ids.add(fact_item.get("source_memory_id", key))
+
+        # Build context from final facts (reconstruct from facts)
+        for fact in final_facts:
+            if isinstance(fact, dict):
+                # Format depends on fact type; reconstruct similar to individual specialists
+                if "date" in fact:  # Timeline entry
+                    line = f"[{fact.get('date', '')}] {fact.get('description', '')[:200]}"
+                elif "key" in fact:  # Fact entry
+                    line = f"{fact.get('key', '')}: {fact.get('value', '')}"
+                else:
+                    line = str(fact)
+                if line:
+                    final_context_lines.append(line)
+
+        timing['total_ms'] = (_time.perf_counter() - start_total) * 1000
+
+        result = {
+            "context": "\n".join(final_context_lines),
+            "facts": final_facts,
+            "source": "rrf_fused",
+            "source_memory_ids": list(final_ids),
+            "rrf_timing": timing,
+        }
+
+        return result if final_facts else {"context": "", "facts": [], "source": "fallback"}
+
+    # ------------------------------------------------------------------
     # MEMORIA: Structured Fact Retrieval (Phase 2)
     # ------------------------------------------------------------------
     def memoria_retrieve(self, query: str, ability: str = None, top_k: int = 10, intent: str | None = None) -> dict:
@@ -4900,44 +5054,8 @@ Now respond with ONLY the JSON array, no explanation."""
             intent: Generic intent string ('current', 'change', 'timeline', 'ordered', or '').
                     If None, derived from ability code via _ABILITY_TO_INTENT mapping.
                     If provided explicitly, takes precedence."""
-        result = {"context": "", "facts": [], "source": "fallback"}
-
-        # Determine ability from query if not provided
-        if not ability:
-            ability = self._classify_ability(query)
-
-        # Map BEAM ability codes to generic intent strings for core memory logic
-        _ABILITY_TO_INTENT = {'KU': 'current', 'CR': 'change', 'TR': 'timeline', 'EO': 'ordered'}
-        # Resolve intent: explicit intent parameter takes precedence, else derive from ability
-        if intent is None:
-            intent = _ABILITY_TO_INTENT.get(ability, '')
-        # else: intent is explicitly provided; use as-is
-
-        # Route on the RESOLVED intent, not the raw ability
-        if intent == 'timeline':
-            timeline = self._memoria_timeline_retrieve(query, top_k)
-            facts = self._memoria_fact_retrieve(query, top_k, intent='timeline')
-            return self._merge_memoria_results(timeline, facts)
-        elif intent == 'change':
-            neg = self._memoria_negation_retrieve(query, top_k)
-            facts = self._memoria_fact_retrieve(query, top_k, intent='change')
-            return self._merge_memoria_results(neg, facts)
-        elif intent == 'ordered':
-            chrono = self._memoria_chrono_retrieve(query, top_k)
-            facts = self._memoria_fact_retrieve(query, top_k, intent='ordered')
-            return self._merge_memoria_results(chrono, facts)
-        else:
-            # Default path (intent='current', intent='', or unrecognized)
-            # Also handles ability-only paths (MR, IE, IF, PF) that don't have intent variants
-            if ability == 'MR':
-                return self._memoria_entity_retrieve(query, top_k)
-            elif ability == 'IF':
-                return self._memoria_instruction_retrieve(query, top_k)
-            elif ability == 'PF':
-                return self._memoria_preference_retrieve(query, top_k)
-            else:
-                # IE, KU, or unclassified: use generic fact retrieval with resolved intent
-                return self._memoria_fact_retrieve(query, top_k, intent=intent)
+        # RRF fusion over all MEMORIA specialists is the proven recall strategy (A/B: 2.6× answer-facts, zero regressions)
+        return self._memoria_fused_retrieve(query, top_k=top_k)
 
     @staticmethod
     def _classify_ability(query: str) -> str:

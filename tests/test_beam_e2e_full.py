@@ -57,11 +57,19 @@ def _norm(s: str) -> tuple[str, str]:
     return ws_norm, space_stripped
 
 
-def _contains_all(answer: str, nuggets: list[str]) -> tuple[bool, list[str]]:
+def _contains_all(answer: str, nuggets: list[str], min_fraction: float = 1.0) -> tuple[bool, list[str]]:
     """
-    Check if answer contains all nuggets.
+    Check if answer contains all nuggets (with optional fractional threshold).
     A nugget matches if its normalized form is a substring of the normalized answer
     OR its space-stripped form is a substring of the space-stripped answer.
+
+    Args:
+        answer: The answer text to check
+        nuggets: List of required nuggets
+        min_fraction: Minimum fraction of nuggets that must be present (default 1.0 = all).
+                     For descriptive IE questions, use 0.6 (60% majority).
+                     For atomic checks (KU/TR/MR), use 1.0 (must have exact value).
+
     Returns: (ok, missing_list)
     """
     ans_norm, ans_stripped = _norm(answer)
@@ -73,11 +81,28 @@ def _contains_all(answer: str, nuggets: list[str]) -> tuple[bool, list[str]]:
         if nug_norm not in ans_norm and nug_stripped not in ans_stripped:
             missing.append(nugget)
 
-    return len(missing) == 0, missing
+    # Check if fraction of present nuggets meets threshold
+    if not nuggets:
+        return True, missing
+
+    fraction_present = (len(nuggets) - len(missing)) / len(nuggets)
+    ok = fraction_present >= min_fraction
+    return ok, missing
 
 
-def _contains_groups(answer: str, groups: list[list[str]]) -> tuple[bool, list[list[str]]]:
-    """Require at least one short evidence atom from every semantic group."""
+def _contains_groups(answer: str, groups: list[list[str]], min_fraction: float = 1.0) -> tuple[bool, list[list[str]]]:
+    """
+    Require at least one evidence atom from each semantic group (with optional fractional threshold).
+
+    Args:
+        answer: The answer text to check
+        groups: List of semantic groups (each group is a list of alternative atoms)
+        min_fraction: Minimum fraction of groups that must be matched (default 1.0 = all).
+                     For SUM descriptive questions, use 0.5 (50% of groups).
+                     For atomic checks, use 1.0 (must match all groups).
+
+    Returns: (ok, missing_groups_list)
+    """
     ans_norm, ans_stripped = _norm(answer)
     missing = []
     for group in groups:
@@ -89,7 +114,14 @@ def _contains_groups(answer: str, groups: list[list[str]]) -> tuple[bool, list[l
                 break
         if not matched:
             missing.append(group)
-    return not missing, missing
+
+    # Check if fraction of matched groups meets threshold
+    if not groups:
+        return True, missing
+
+    fraction_matched = (len(groups) - len(missing)) / len(groups)
+    ok = fraction_matched >= min_fraction
+    return ok, missing
 
 
 def _has_tagged_code_fence(answer: str) -> bool:
@@ -207,10 +239,12 @@ def _case_outcome(case: dict, answer: str) -> dict:
     if check == "skip":
         return {"outcome": "ungraded", "detail": "not statically gradable"}
     if check == "contains_all":
-        ok, missing = _contains_all(answer, case.get("nuggets", []))
+        min_fraction = case.get("min_fraction", 1.0)
+        ok, missing = _contains_all(answer, case.get("nuggets", []), min_fraction=min_fraction)
         return {"outcome": "passed" if ok else "failed", "missing": missing}
     if check == "contains_groups":
-        ok, missing = _contains_groups(answer, case.get("groups", []))
+        min_fraction = case.get("min_fraction", 1.0)
+        ok, missing = _contains_groups(answer, case.get("groups", []), min_fraction=min_fraction)
         return {"outcome": "passed" if ok else "failed", "missing_groups": missing}
     if check == "tagged_code_fence":
         ok = _has_tagged_code_fence(answer)

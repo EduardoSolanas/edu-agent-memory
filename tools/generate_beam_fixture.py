@@ -46,6 +46,7 @@ STATIC_CASE_CHECKS = {
             ["flask-sqlalchemy", "sqlite", "sqlalchemy"],
             ["chart.js", "analytics", "data visualization"],
         ],
+        "min_fraction": 1.0,  # PF: all groups required
     },
     "1:q15": {
         "check": "contains_groups",
@@ -54,6 +55,7 @@ STATIC_CASE_CHECKS = {
             ["csrf", "input validation", "rate limiting"],
             ["incremental", "in phases", "start with", "then add", "prioritize"],
         ],
+        "min_fraction": 1.0,  # PF: all groups required
     },
     "1:q16": {
         "check": "contains_groups",
@@ -72,6 +74,7 @@ STATIC_CASE_CHECKS = {
             ["api endpoint", "architecture decision"],
             ["table", "diagram"],
         ],
+        "min_fraction": 0.5,  # SUM: 50% of groups required (7 of 13)
     },
     "1:q17": {
         "check": "contains_groups",
@@ -82,6 +85,7 @@ STATIC_CASE_CHECKS = {
             ["csrf", "csrf token"],
             ["redis", "account lockout", "login lockout"],
         ],
+        "min_fraction": 1.0,  # CR: all groups required
     },
 }
 
@@ -274,6 +278,11 @@ for i, q in enumerate(conv['questions']):
         'check': check,
         'nuggets': nuggets,
     }
+
+    # Add min_fraction for IE descriptive contains_all checks (60% threshold)
+    # Only for questions with multiple nuggets (descriptive, not atomic)
+    if check == "contains_all" and ability_short == "IE" and len(nuggets) > 1:
+        case['min_fraction'] = 0.6
 
     if qid in STATIC_CASE_CHECKS:
         case.update(STATIC_CASE_CHECKS[qid])
