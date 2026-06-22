@@ -2639,3 +2639,164 @@ def test_fused_recall_non_ordering_query_unaffected(tmp_path):
             os.environ.pop("EDUMEM_NO_EMBEDDINGS", None)
         else:
             os.environ["EDUMEM_NO_EMBEDDINGS"] = saved
+
+
+# ---------------------------------------------------------------------------
+# LLM-based write-time fact extraction (flag-gated: EDUMEM_LLM_EXTRACTION)
+# ---------------------------------------------------------------------------
+
+class _RecordingLLMClient:
+    """Real (non-mock) test double: records chat calls, returns canned text."""
+
+    def __init__(self, response: str = ""):
+        self.response = response
+        self.chat_calls = []
+
+    def chat(self, messages, temperature=0.0, max_tokens=1024):
+        self.chat_calls.append({"messages": messages, "temperature": temperature})
+        return self.response
+
+
+def _make_beam_with_llm(tmp_path, response=""):
+    beam_mod = pytest.importorskip("edumem.core.beam")
+    client = _RecordingLLMClient(response)
+    beam = beam_mod.BeamMemory(
+        db_path=tmp_path / "beam.db", session_id="llm-extract", llm_client=client
+    )
+    return beam, client
+
+
+def test_build_llm_extraction_prompt_asks_for_typed_json(tmp_path):
+    saved = os.environ.get("EDUMEM_NO_EMBEDDINGS")
+    os.environ["EDUMEM_NO_EMBEDDINGS"] = "1"
+    try:
+        beam, _ = _make_beam_with_llm(tmp_path)
+        content = "The dashboard API response time is 250ms."
+        prompt = beam._build_llm_extraction_prompt(content)
+        assert content in prompt
+        # asks for typed JSON with the three categories
+        for token in ("facts", "dates", "triples", "JSON"):
+            assert token in prompt
+        # asks for canonical snake_case keys
+        low = prompt.lower()
+        assert "canonical" in low and "snake_case" in low
+    finally:
+        beam.conn.close()
+        if saved is None:
+            os.environ.pop("EDUMEM_NO_EMBEDDINGS", None)
+        else:
+            os.environ["EDUMEM_NO_EMBEDDINGS"] = saved
+
+
+def test_parse_llm_extraction_handles_fences_and_garbage(tmp_path):
+    saved = os.environ.get("EDUMEM_NO_EMBEDDINGS")
+    os.environ["EDUMEM_NO_EMBEDDINGS"] = "1"
+    try:
+        beam, _ = _make_beam_with_llm(tmp_path)
+        fenced = (
+            "Here is the extraction:\n"
+            "```json\n"
+            '{"facts":[{"key":"response_time_ms","value":"250ms","type":"metric"}],'
+            '"dates":[{"key":"deploy","date":"2024-03-15","context":"deadline"}],'
+            '"triples":[{"subject":"user","predicate":"never_used","object":"flask"}]}\n'
+            "```\nThanks!"
+        )
+        parsed = beam._parse_llm_extraction(fenced)
+        assert parsed["facts"][0]["key"] == "response_time_ms"
+        assert parsed["dates"][0]["date"] == "2024-03-15"
+        assert parsed["triples"][0]["predicate"] == "never_used"
+
+        garbage = beam._parse_llm_extraction("totally not json at all")
+        assert garbage == {"facts": [], "dates": [], "triples": []}
+    finally:
+        beam.conn.close()
+        if saved is None:
+            os.environ.pop("EDUMEM_NO_EMBEDDINGS", None)
+        else:
+            os.environ["EDUMEM_NO_EMBEDDINGS"] = saved
+
+
+def test_store_llm_extraction_inserts_and_chains(tmp_path):
+    saved = os.environ.get("EDUMEM_NO_EMBEDDINGS")
+    os.environ["EDUMEM_NO_EMBEDDINGS"] = "1"
+    try:
+        beam, _ = _make_beam_with_llm(tmp_path)
+        session = beam.session_id
+
+        # Two facts sharing one canonical key, different values, different msg_idx
+        parsed_v1 = {
+            "facts": [{"key": "response_time_ms", "value": "250ms", "type": "metric"}],
+            "dates": [{"key": "deploy_deadline", "date": "2024-03-15",
+                       "context": "deployment deadline"}],
+            "triples": [{"subject": "user", "predicate": "never_used",
+                         "object": "flask routes"}],
+        }
+        c1 = beam._store_llm_extraction(session, 0, parsed_v1, "ctx-1")
+        assert c1["facts"] == 1 and c1["dates"] == 1 and c1["triples"] == 1
+
+        parsed_v2 = {
+            "facts": [{"key": "response_time_ms", "value": "180ms", "type": "metric"}],
+            "dates": [], "triples": [],
+        }
+        beam._store_llm_extraction(session, 5, parsed_v2, "ctx-2")
+        beam.conn.commit()
+
+        # One canonical key, version chain with previous_value set
+        rows = beam.conn.execute(
+            "SELECT value, previous_value FROM memoria_facts "
+            "WHERE session_id=? AND key='response_time_ms' AND fact_type='metric' "
+            "ORDER BY version_id",
+            (session,),
+        ).fetchall()
+        values = {r[0] for r in rows}
+        assert values == {"250ms", "180ms"}
+        assert any(r[1] == "250ms" for r in rows)  # chained previous_value
+
+        # Date landed in memoria_timelines
+        tl = beam.conn.execute(
+            "SELECT date FROM memoria_timelines WHERE session_id=? AND date='2024-03-15'",
+            (session,),
+        ).fetchone()
+        assert tl is not None
+
+        # Negation triple retrievable via _memoria_negation_retrieve
+        res = beam._memoria_negation_retrieve("Did the user use flask routes?")
+        assert res["source"] == "memoria_kg_negation"
+        assert any("flask" in f["object"] for f in res["facts"])
+    finally:
+        beam.conn.close()
+        if saved is None:
+            os.environ.pop("EDUMEM_NO_EMBEDDINGS", None)
+        else:
+            os.environ["EDUMEM_NO_EMBEDDINGS"] = saved
+
+
+def test_llm_extraction_off_by_default_uses_regex(tmp_path):
+    saved = os.environ.get("EDUMEM_NO_EMBEDDINGS")
+    saved_flag = os.environ.get("EDUMEM_LLM_EXTRACTION")
+    saved_consol = os.environ.get("EDUMEM_LLM_FACT_CONSOLIDATION")
+    os.environ["EDUMEM_NO_EMBEDDINGS"] = "1"
+    os.environ.pop("EDUMEM_LLM_EXTRACTION", None)
+    # Isolate the extraction flag: disable the (separate) metric-key
+    # consolidation LLM path so any chat call must come from extraction.
+    os.environ["EDUMEM_LLM_FACT_CONSOLIDATION"] = "0"
+    try:
+        beam, client = _make_beam_with_llm(tmp_path, response='{"facts":[]}')
+        counts = beam.extract_and_store_facts(
+            "The API response time was 250ms.", message_idx=0
+        )
+        # LLM was NOT called (flag off) and regex path produced a metric
+        assert client.chat_calls == []
+        assert counts.get("metric", 0) >= 1
+    finally:
+        beam.conn.close()
+        if saved is None:
+            os.environ.pop("EDUMEM_NO_EMBEDDINGS", None)
+        else:
+            os.environ["EDUMEM_NO_EMBEDDINGS"] = saved
+        if saved_flag is not None:
+            os.environ["EDUMEM_LLM_EXTRACTION"] = saved_flag
+        if saved_consol is None:
+            os.environ.pop("EDUMEM_LLM_FACT_CONSOLIDATION", None)
+        else:
+            os.environ["EDUMEM_LLM_FACT_CONSOLIDATION"] = saved_consol

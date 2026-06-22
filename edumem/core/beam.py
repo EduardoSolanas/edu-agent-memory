@@ -4199,6 +4199,30 @@ class BeamMemory:
         content = _strip_synthetic_structured_metadata(content)
         if source_memory_id is None and message_idx is not None:
             source_memory_id = f"msgidx:{message_idx}"
+
+        # Flag-gated LLM extraction path (A/B against regex). Default OFF.
+        # On any failure or empty parse, fall through to the regex path below
+        # so extraction is never lost.
+        if (self._llm_client is not None
+                and os.environ.get("EDUMEM_LLM_EXTRACTION", "0") == "1"):
+            try:
+                prompt = self._build_llm_extraction_prompt(content)
+                raw = self._llm_client.chat(
+                    [{"role": "user", "content": prompt}], temperature=0.0)
+                parsed = self._parse_llm_extraction(raw)
+                if parsed.get("facts") or parsed.get("dates") or parsed.get("triples"):
+                    ctx = self._context_snippet(content, 0)
+                    stored = self._store_llm_extraction(
+                        self.session_id, message_idx, parsed, ctx,
+                        source_memory_id=source_memory_id)
+                    return {
+                        "metric": stored["facts"], "date": stored["dates"],
+                        "version": 0, "entity": 0, "sequence": 0,
+                        "timeline": stored["dates"], "negation": stored["triples"],
+                        "decision": 0,
+                    }
+            except Exception:
+                pass  # fall through to regex path
         """Extract structured facts from a message and store in facts/timelines/kg tables.
         Uses regex patterns matching the BEAM benchmark oracles.
         Language-aware: detects language and uses language-specific patterns.
@@ -4698,6 +4722,135 @@ Now respond with ONLY the JSON array, no explanation."""
         except Exception:
             # Any error → fallback to raw keys
             return [c["raw_key"] for c in candidates]
+
+    # ------------------------------------------------------------------
+    # LLM-based write-time fact extraction (flag-gated, Mem0/Hindsight-style)
+    # ------------------------------------------------------------------
+    def _build_llm_extraction_prompt(self, content: str) -> str:
+        """Build a deterministic prompt instructing the LLM to return ONLY a
+        JSON object of typed facts with canonical snake_case keys.
+
+        The schema mirrors the regex extractor's targets so the two paths can
+        be A/B'd: persistent facts, dated events, and subject/predicate/object
+        triples (including negations).
+        """
+        return (
+            "You extract persistent, reusable memory from a single message.\n"
+            "Return ONLY a JSON object (no prose, no code fences) with exactly "
+            "these keys: \"facts\", \"dates\", \"triples\".\n\n"
+            "Schema:\n"
+            '{"facts":[{"key":"response_time_ms","value":"250ms","type":"metric"}],'
+            '"dates":[{"key":"deployment_deadline","date":"2024-03-15","context":"..."}],'
+            '"triples":[{"subject":"user","predicate":"never_used","object":"flask routes"}]}\n\n'
+            "Rules:\n"
+            "- Extract ONLY persistent facts worth remembering later; skip "
+            "transient chatter (weather, greetings, ephemeral status).\n"
+            "- Use canonical snake_case keys so the SAME concept mentioned in "
+            "different messages always maps to the SAME key.\n"
+            "- Keep an ACTUAL measured value distinct from a STATED target/goal "
+            "(use different keys, e.g. response_time_ms vs response_time_target_ms).\n"
+            "- Be language-agnostic: derive keys from meaning, do NOT rely on "
+            "English keywords; keys are always snake_case ASCII.\n"
+            "- \"type\" is a short category such as metric, version, entity, "
+            "decision, preference, or fact.\n"
+            "- dates: ISO YYYY-MM-DD when an event is tied to a date.\n"
+            "- triples: capture relations; for negations (the user never did / "
+            "does not / refuses something) set predicate to \"never_used\".\n"
+            "- If a category has nothing, return an empty list for it.\n\n"
+            "Message:\n"
+            f"{content}\n"
+        )
+
+    def _parse_llm_extraction(self, raw) -> dict:
+        """Parse the LLM extraction output into
+        {"facts":[...],"dates":[...],"triples":[...]}.
+
+        Tolerates ```json fences and trailing prose. On ANY failure returns the
+        empty structure so the caller can fall through to the regex path.
+        """
+        empty = {"facts": [], "dates": [], "triples": []}
+        if not raw or not isinstance(raw, str):
+            return empty
+        import re as _re
+        text = raw.strip()
+        # Strip code fences if present.
+        fence = _re.search(r"```(?:json)?\s*(.*?)```", text, _re.DOTALL | _re.IGNORECASE)
+        if fence:
+            text = fence.group(1).strip()
+        # Isolate the outermost JSON object if surrounded by prose.
+        if not text.startswith("{"):
+            start = text.find("{")
+            end = text.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                text = text[start:end + 1]
+        try:
+            data = json.loads(text)
+        except Exception:
+            return empty
+        if not isinstance(data, dict):
+            return empty
+        result = dict(empty)
+        for cat in ("facts", "dates", "triples"):
+            val = data.get(cat)
+            if isinstance(val, list):
+                result[cat] = [item for item in val if isinstance(item, dict)]
+        return result
+
+    def _store_llm_extraction(self, session: str, msg_idx: int, parsed: dict,
+                              ctx: str,
+                              source_memory_id: Optional[str] = None) -> dict:
+        """Persist a parsed extraction dict into the MEMORIA tables.
+
+        Pure given ``parsed`` (performs no LLM call). Facts go through
+        ``_insert_fact`` (version-chaining on repeated canonical key); dates go
+        to ``memoria_timelines``; triples go to ``memoria_kg`` with negations
+        mapped to the ``negation`` predicate read by ``_memoria_negation_retrieve``.
+
+        Returns per-category insert counts.
+        """
+        counts = {"facts": 0, "dates": 0, "triples": 0}
+        parsed = parsed or {}
+
+        for fact in parsed.get("facts", []):
+            key = fact.get("key")
+            value = fact.get("value")
+            if not key or value is None:
+                continue
+            ftype = fact.get("type") or "fact"
+            if self._insert_fact(session, msg_idx, str(ftype), str(key),
+                                 str(value), ctx, 0.65,
+                                 source_memory_id=source_memory_id):
+                counts["facts"] += 1
+
+        for d in parsed.get("dates", []):
+            date = d.get("date")
+            if not date:
+                continue
+            desc = (d.get("context") or d.get("key") or "")[:120]
+            if self._insert_timeline(session, str(date), msg_idx, desc,
+                                     'llm_extraction',
+                                     source_memory_id=source_memory_id):
+                counts["dates"] += 1
+
+        # Predicates that express negation map to the canonical 'negation'
+        # predicate that the negation specialist (_memoria_negation_retrieve)
+        # reads. Language-agnostic: callers/LLM are told to use never_used.
+        _NEGATION_PREDICATES = {"never_used", "never", "not", "did_not",
+                                "does_not", "no", "negation", "refused"}
+        for t in parsed.get("triples", []):
+            subj = t.get("subject")
+            obj = t.get("object")
+            pred = t.get("predicate")
+            if not subj or not obj or not pred:
+                continue
+            pred_norm = str(pred).strip().lower()
+            mapped = 'negation' if pred_norm in _NEGATION_PREDICATES else pred_norm
+            if self._insert_kg(session, str(subj), mapped, str(obj), msg_idx,
+                               confidence=0.7,
+                               source_memory_id=source_memory_id):
+                counts["triples"] += 1
+
+        return counts
 
     def _insert_fact(self, session: str, msg_idx: int, ftype: str,
                      key: str, value: str, ctx: str, importance: float,
