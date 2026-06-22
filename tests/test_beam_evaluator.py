@@ -40,6 +40,21 @@ from tools.evaluate_beam_end_to_end import (
 )
 
 
+def test_write_json_sanitized_handles_emoji_payload(tmp_path):
+    """Issue 1 regression: a result payload containing an emoji must serialize
+    without raising (e.g. UnicodeEncodeError) so a completed run's results are
+    never lost to a charmap-encode crash."""
+    payload = {
+        "metadata": {"note": "CONVERSATION COMPLETE 🎉"},
+        "results": [{"qid": "q1", "assessment": "great answer 🎉", "score": 1.0}],
+    }
+    out_path = tmp_path / "beam_e2e_results.json"
+    with open(out_path, "w", encoding="utf-8") as f:
+        _write_json_sanitized(payload, f, indent=2)
+    reloaded = json.loads(out_path.read_text(encoding="utf-8"))
+    assert reloaded["results"][0]["assessment"] == "great answer 🎉"
+
+
 @pytest.mark.parametrize(
     "question",
     [
@@ -2458,3 +2473,128 @@ def test_rrf_fusion_on_by_default(tmp_path):
             os.environ.pop("EDUMEM_NO_EMBEDDINGS", None)
         else:
             os.environ["EDUMEM_NO_EMBEDDINGS"] = saved_no_embeddings
+
+
+def _make_eo_beam(tmp_path, session_id):
+    from edumem.core.beam import BeamMemory
+
+    return BeamMemory(db_path=tmp_path / "beam.db", session_id=session_id)
+
+
+def test_fused_recall_emits_msgidx_anchors(tmp_path):
+    saved = os.environ.get("EDUMEM_NO_EMBEDDINGS")
+    os.environ["EDUMEM_NO_EMBEDDINGS"] = "1"
+    beam = _make_eo_beam(tmp_path, "eo_anchors")
+    try:
+        beam.conn.execute(
+            "INSERT INTO memoria_facts (session_id, message_idx, fact_type, key, value, context_snippet) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("eo_anchors", 3, "product", "login_flow", "implemented login flow", "I built the login flow"),
+        )
+        beam.conn.execute(
+            "INSERT INTO memoria_facts (session_id, message_idx, fact_type, key, value, context_snippet) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("eo_anchors", 7, "sequence", "step", "set up the database schema", "Then database schema"),
+        )
+        beam.conn.commit()
+
+        result = beam.memoria_retrieve(
+            "In what order did I work on these things?", ability="EO", top_k=10
+        )
+        ctx = result["context"]
+        assert "MSGIDX:3" in ctx, ctx
+        assert "MSGIDX:7" in ctx, ctx
+    finally:
+        beam.conn.close()
+        if saved is None:
+            os.environ.pop("EDUMEM_NO_EMBEDDINGS", None)
+        else:
+            os.environ["EDUMEM_NO_EMBEDDINGS"] = saved
+
+
+def test_fused_recall_orders_by_msgidx_for_ordering_queries(tmp_path):
+    saved = os.environ.get("EDUMEM_NO_EMBEDDINGS")
+    os.environ["EDUMEM_NO_EMBEDDINGS"] = "1"
+    beam = _make_eo_beam(tmp_path, "eo_order")
+    try:
+        for idx, val in (
+            (30, "deployed the service"),
+            (5, "designed the api"),
+            (18, "wrote the tests"),
+        ):
+            beam.conn.execute(
+                "INSERT INTO memoria_facts (session_id, message_idx, fact_type, key, value, context_snippet) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                ("eo_order", idx, "sequence", "step", val, val),
+            )
+        beam.conn.commit()
+
+        result = beam.memoria_retrieve(
+            "In what order did I work on these steps?", ability="EO", top_k=10
+        )
+        ctx = result["context"]
+        import re
+
+        idxs = [int(m) for m in re.findall(r"MSGIDX:(\d+)", ctx)]
+        assert idxs == sorted(idxs), idxs
+        assert {5, 18, 30}.issubset(set(idxs)), idxs
+    finally:
+        beam.conn.close()
+        if saved is None:
+            os.environ.pop("EDUMEM_NO_EMBEDDINGS", None)
+        else:
+            os.environ["EDUMEM_NO_EMBEDDINGS"] = saved
+
+
+def test_fused_recall_no_raw_dict_repr(tmp_path):
+    saved = os.environ.get("EDUMEM_NO_EMBEDDINGS")
+    os.environ["EDUMEM_NO_EMBEDDINGS"] = "1"
+    beam = _make_eo_beam(tmp_path, "eo_norepr")
+    try:
+        beam.conn.execute(
+            "INSERT INTO memoria_facts (session_id, message_idx, fact_type, key, value, context_snippet) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("eo_norepr", 2, "sequence", "step", "kicked off the project", "first I kicked off the project"),
+        )
+        beam.conn.execute(
+            "INSERT INTO memoria_facts (session_id, message_idx, fact_type, key, value, context_snippet) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("eo_norepr", 9, "sequence", "step", "shipped the project", "then I shipped the project"),
+        )
+        beam.conn.commit()
+
+        result = beam.memoria_retrieve(
+            "In what order did I work on the project?", ability="EO", top_k=10
+        )
+        ctx = result["context"]
+        assert "'msg_idx':" not in ctx, ctx
+        assert "{'sequence'" not in ctx, ctx
+    finally:
+        beam.conn.close()
+        if saved is None:
+            os.environ.pop("EDUMEM_NO_EMBEDDINGS", None)
+        else:
+            os.environ["EDUMEM_NO_EMBEDDINGS"] = saved
+
+
+def test_fused_recall_non_ordering_query_unaffected(tmp_path):
+    saved = os.environ.get("EDUMEM_NO_EMBEDDINGS")
+    os.environ["EDUMEM_NO_EMBEDDINGS"] = "1"
+    beam = _make_eo_beam(tmp_path, "eo_nonorder")
+    try:
+        beam.conn.execute(
+            "INSERT INTO memoria_facts (session_id, message_idx, fact_type, key, value, context_snippet) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("eo_nonorder", 4, "metric", "latency", "120 ms", "latency was 120 ms"),
+        )
+        beam.conn.commit()
+
+        result = beam.memoria_retrieve("What is the latency?", ability="IE", top_k=10)
+        assert result["source"] in ("rrf_fused", "fallback")
+        assert "'msg_idx':" not in result["context"]
+    finally:
+        beam.conn.close()
+        if saved is None:
+            os.environ.pop("EDUMEM_NO_EMBEDDINGS", None)
+        else:
+            os.environ["EDUMEM_NO_EMBEDDINGS"] = saved

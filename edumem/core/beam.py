@@ -5002,30 +5002,73 @@ Now respond with ONLY the JSON array, no explanation."""
         fused_keys = _rrf_fuse(ranked_lists, k=60)
         timing['fuse_ms'] = (_time.perf_counter() - start) * 1000
 
-        # Reassemble result, respecting fused order
-        final_context_lines = []
+        # Reassemble result, respecting fused order. Keep the source specialist
+        # alongside each fact so rendering can pick the right message-index field.
+        final_items = []  # list of (specialist_name, fact_item)
         final_facts = []
         final_ids = set()
 
         for key in fused_keys[:top_k]:
             if key in all_items:
                 specialist_name, fact_item = all_items[key]
+                final_items.append((specialist_name, fact_item))
                 final_facts.append(fact_item)
                 if isinstance(fact_item, dict):
                     final_ids.add(fact_item.get("source_memory_id", key))
 
-        # Build context from final facts (reconstruct from facts)
-        for fact in final_facts:
-            if isinstance(fact, dict):
-                # Format depends on fact type; reconstruct similar to individual specialists
-                if "date" in fact:  # Timeline entry
-                    line = f"[{fact.get('date', '')}] {fact.get('description', '')[:200]}"
-                elif "key" in fact:  # Fact entry
-                    line = f"{fact.get('key', '')}: {fact.get('value', '')}"
-                else:
-                    line = str(fact)
-                if line:
-                    final_context_lines.append(line)
+        # Message-index extraction is specialist-aware: facts expose `message_idx`
+        # (with updated/valid_from fallbacks); timelines/negations/sequences expose
+        # `msg_idx`. This is the ordering signal the answer prompt's ORDERING
+        # modifier relies on via [MSGIDX:N] anchors.
+        def _item_msg_idx(item):
+            if not isinstance(item, dict):
+                return None
+            idx = (
+                item.get("message_idx")
+                or item.get("msg_idx")
+                or item.get("updated_msg_idx")
+                or item.get("valid_from_msg_idx")
+            )
+            return idx
+
+        # Ordering queries ("in what order did I ...") need first-appearance order,
+        # not RRF rank. Sort by message index ASCENDING; non-ordering queries keep
+        # the RRF-fused order untouched.
+        from . import query_mode as _query_mode
+        if _query_mode.is_ordering_query(query):
+            final_items.sort(
+                key=lambda pair: (
+                    _item_msg_idx(pair[1]) if _item_msg_idx(pair[1]) is not None else 1 << 30
+                )
+            )
+            final_facts = [fact for _, fact in final_items]
+
+        # Render each item as readable text (never a raw dict repr), tagging it
+        # with its [MSGIDX:N] anchor when a message index is available.
+        final_context_lines = []
+        for specialist_name, fact in final_items:
+            if not isinstance(fact, dict):
+                final_context_lines.append(str(fact))
+                continue
+            idx = _item_msg_idx(fact)
+            tag = f"[MSGIDX:{idx}] " if idx is not None else ""
+            if "sequence" in fact:  # chrono / sequence specialist
+                body = f"{fact.get('sequence', '')}"
+            elif "date" in fact:  # timeline specialist
+                body = f"[{fact.get('date', '')}] {str(fact.get('description', ''))[:200]}"
+            elif "predicate" in fact:  # entity KG specialist
+                body = f"{fact.get('subject', '')} {fact.get('predicate', '')} {fact.get('object', '')}"
+            elif "object" in fact:  # negation specialist
+                body = f"user said never/not: {fact.get('object', '')}"
+            elif "key" in fact:  # fact specialist
+                body = f"{fact.get('key', '')}: {fact.get('value', '')}"
+            else:
+                body = ", ".join(
+                    f"{k}: {v}" for k, v in fact.items() if not k.startswith("_")
+                )
+            line = f"{tag}{body}".strip()
+            if line:
+                final_context_lines.append(line)
 
         timing['total_ms'] = (_time.perf_counter() - start_total) * 1000
 

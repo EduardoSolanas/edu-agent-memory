@@ -35,6 +35,7 @@ import json
 import logging
 import math
 import os
+import random
 import sys
 import tempfile
 import time
@@ -48,6 +49,14 @@ from pathlib import Path
 
 # Unbuffered output for real-time progress
 print = partial(print, flush=True)
+
+# Make console output UTF-8 safe so non-ASCII characters (e.g. emoji in summary
+# lines) never raise UnicodeEncodeError on a Windows cp1252 console and abort a run.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 
 # --- Setup ---
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -893,12 +902,49 @@ class LLMClient:
         self.last_response = ""
         self.last_retry_count = 0
 
+    MAX_RETRIES = 6  # Resilient to a shared/contended endpoint (429s, transient 5xx).
+
+    @staticmethod
+    def _is_retryable_error(error_text: str, status_code: int | None) -> bool:
+        """Retry on rate limits (429), server errors (5xx), and timeouts."""
+        if status_code is not None:
+            if status_code == 429 or 500 <= status_code <= 599:
+                return True
+        low = error_text.lower()
+        if "429" in error_text or "rate" in low:
+            return True
+        if "timeout" in low or "timed out" in low:
+            return True
+        if any(code in error_text for code in ("500", "502", "503", "504")):
+            return True
+        return False
+
+    @staticmethod
+    def _retry_after_seconds(response) -> float | None:
+        """Parse a Retry-After header (seconds form) from a response, capped."""
+        if response is None:
+            return None
+        try:
+            raw = response.headers.get("Retry-After")
+        except Exception:
+            return None
+        if not raw:
+            return None
+        try:
+            return min(float(raw), 60.0)
+        except (TypeError, ValueError):
+            return None
+
     def chat(self, messages: list, temperature: float = 0.1, max_tokens: int = 1024) -> str:
-        """Send chat completion request with retry. No fallback models to avoid rate limits."""
-        
+        """Send chat completion request with capped exponential backoff + jitter.
+
+        Retries 429 / 5xx / timeout up to MAX_RETRIES times, honoring a
+        Retry-After header when present. Returns the [LLM_ERROR...] fallback
+        only after the retry budget is exhausted."""
+
         last_error = None
         self.last_retry_count = 0
-        for attempt in range(3):
+        for attempt in range(self.MAX_RETRIES):
             try:
                 response = self._call_api(self.model, messages, temperature, max_tokens)
                 self.last_response = response
@@ -910,12 +956,22 @@ class LLMClient:
                 self.last_error_class = type(e).__name__
                 self.last_error_message = str(e)
                 self.last_retry_count = attempt + 1
-                if "429" in last_error or "rate" in last_error.lower():
-                    wait = 15 * (attempt + 1)  # 15s, 30s, 45s backoff
-                    time.sleep(wait)
-                    continue
-                else:
+
+                resp = getattr(e, "response", None)
+                status_code = getattr(resp, "status_code", None)
+                if not self._is_retryable_error(last_error, status_code):
                     break  # Non-retryable error
+                if attempt == self.MAX_RETRIES - 1:
+                    break  # Budget exhausted; fall through to fallback
+
+                retry_after = self._retry_after_seconds(resp)
+                if retry_after is not None:
+                    wait = retry_after
+                else:
+                    # Capped exponential backoff with jitter.
+                    wait = min(15 * (2 ** attempt), 60) + random.uniform(0, 5)
+                time.sleep(wait)
+                continue
 
         self.last_response = f"[LLM_ERROR: all models failed. Last: {last_error}]"
         self.last_response_had_content = False
@@ -4456,6 +4512,14 @@ def print_sota_report(ability_summary: dict, metadata: dict):
 
 def main():
     global RESULTS_FILE, PAIRED_OUTCOMES_FILE, QUESTION_VALIDATIONS_FILE
+    # Defensive: ensure console output is UTF-8 safe even if stdout/stderr were
+    # replaced after import. Prevents a UnicodeEncodeError in the summary print
+    # from aborting the run before results are persisted.
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
     parser = argparse.ArgumentParser(description="BEAM End-to-End Evaluation")
     parser.add_argument("--scales", default="100K,500K,1M,10M",
                         help="Scales to evaluate (comma-separated)")
