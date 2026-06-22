@@ -70,7 +70,7 @@ from edumem.core.beam import BeamMemory, init_beam, _embeddings, _vec_available,
 from edumem.core.query_mode import (
     build_system_prompt, is_temporal_query, needs_second_pass, is_ordering_query, is_duration_query,
     is_aggregation_query, is_date_interval_query, is_stated_duration_query, is_summarization_query,
-    is_contradiction_query, is_knowledge_update_query
+    is_contradiction_query
 )
 
 
@@ -117,52 +117,6 @@ def _intent_from_reranker_scores(scores: object) -> str | None:
     if ranked[0][1] < minimum or ranked[0][1] - ranked[1][1] < margin:
         return None
     return ["ordered", "timeline", "change", "current"][ranked[0][0]]
-
-
-def _intent_from_question(question: str) -> str:
-    """Map a question to a generic recall intent from its TEXT only (no dataset label).
-
-    Returns one of: 'ordered', 'timeline', 'change', or 'current'.
-
-    Mode (via EDUMEM_INTENT_MODE env var):
-      - "deterministic" (explicit opt-in): use only regex signals, no reranker
-      - "reranker" (default): use regex signals first, then reranker for ambiguous cases
-    """
-    import requests
-
-    def _fallback_intent(q_text: str) -> str:
-        return _deterministic_intent(q_text) or "current"
-
-    mode = os.environ.get("EDUMEM_INTENT_MODE", "reranker")
-
-    # Deterministic-only mode: no reranker, ever
-    if mode == "deterministic":
-        return _fallback_intent(question)
-
-    # Reranker mode (default): deterministic signals first, then reranker
-    deterministic = _deterministic_intent(question)
-    if deterministic is not None:
-        return deterministic
-
-    # Reuse our local OpenVINO reranker for fast dynamic intent classification (Zero-Shot classification pattern)
-    _reranker_url = os.environ.get("EDUMEM_RERANKER_URL", "http://localhost:3002/rerank")
-    try:
-        # Hypotheses mapped to index 0: ordered, 1: timeline, 2: change, 3: current
-        hypotheses = [
-            "This query asks about the chronological order, sequence, or ordering of events.",
-            "This query asks about dates, deadlines, duration, intervals, or timeline of events.",
-            "This query asks about a change of state, switched preference, contradictions, or previous versus current values.",
-            "This query asks for general factual details, current versions, or standard information of an entity.",
-        ]
-        resp = requests.post(_reranker_url, json={"query": question, "texts": hypotheses}, timeout=1.0)
-        if resp.status_code == 200:
-            reranked = _intent_from_reranker_scores(resp.json())
-            if reranked is not None:
-                return reranked
-    except Exception:
-        pass
-
-    return _fallback_intent(question)
 
 
 def _is_calculator_question(question: str) -> bool:
@@ -3013,13 +2967,12 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
     # and memoria_kg tables. These provide exact values that FTS5/vector search
     # may miss (dates, metrics, versions, negations, sequences, entity mappings).
     # Injected as synthetic high-score entries so they surface ahead of fuzzy matches.
-    # In pure-recall (label-free) mode, derive intent from question text to activate routing.
+    # Retrieval always runs RRF fusion over all specialists; no per-question routing.
     try:
-        _recall_intent = _intent_from_question(question)
-        _memoria_result = beam.memoria_retrieve(question, ability=routing_ability, top_k=top_k, intent=_recall_intent)
+        _memoria_result = beam.memoria_retrieve(question, ability=routing_ability, top_k=top_k)
         if _memoria_result and _memoria_result.get("source") != "fallback" and _memoria_result.get("context"):
             _memoria_facts = _memoria_result.get("facts", [])
-            print(f"    [MEMORIA] {_memoria_result['source']} hit for intent={_recall_intent}, ability={routing_ability}: {len(_memoria_facts)} facts", flush=True)
+            print(f"    [MEMORIA] {_memoria_result['source']} hit for ability={routing_ability}: {len(_memoria_facts)} facts", flush=True)
             memories.insert(0, {
                 "content": f"[MEMORIA {_memoria_result['source']}]\n{_memoria_result['context']}",
                 "score": 0.95,
