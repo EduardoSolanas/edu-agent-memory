@@ -229,7 +229,13 @@ METHOD:
 7. One clause per line, earliest first, no preamble.
 8. If the same feature appears multiple times at different stages (building it, then later optimizing, refactoring, or debugging it), keep only the FIRST occurrence where that feature was introduced. Later refinements of an already-listed feature are NOT new topics. Treat the entire lifecycle of a feature as one item in the order.
 
-If the context includes [Fact ... MSGIDX:N] entries, use their MSGIDX values as ordering anchors. These are pre-extracted fact appearances that supplement the MSGIDX tags on full memories."""
+If the context includes [Fact ... MSGIDX:N] entries, use their MSGIDX values as ordering anchors. These are pre-extracted fact appearances that supplement the MSGIDX tags on full memories.
+
+TIMELINE COVERAGE:
+- Spread your items across the ENTIRE conversation timeline — from the LOWEST MSGIDX to the HIGHEST MSGIDX present in the context. Do NOT cluster all items on the earliest setup/feature-building topics.
+- Each item should be a distinct PHASE or milestone, distributed from the start of the conversation to the end. Ensure later phases are represented when present — e.g., testing, deployment, optimization, security hardening, error handling, and final refinements — not only the initial setup.
+- Pick the right granularity: each item is one high-level phase/aspect (how someone would summarize a milestone), NOT several sub-steps of the same early phase. Merge fine-grained early sub-steps that belong to one phase into a single item.
+- When the question says "ONLY N" items, output EXACTLY N items — no more, no fewer — and make those N span the full range of MSGIDX values."""
 
 _DURATION_MODIFIER = """
 

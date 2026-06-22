@@ -30,6 +30,25 @@ def test_true_interval_questions_still_compute_from_dates():
     assert "Answer that stated duration directly" not in prompt
 
 
+def test_ordering_prompt_spreads_items_across_full_timeline():
+    question = (
+        "List the order in which I brought up different aspects of the project, "
+        "mentioning ONLY 3 items."
+    )
+
+    prompt = build_system_prompt(question)
+    assert "ORDERING" in prompt
+    # still keeps the existing MSGIDX-ordering guidance
+    assert "LOWEST MSGIDX" in prompt
+    # new guidance: spread across the entire timeline (lowest to highest MSGIDX)
+    assert "HIGHEST MSGIDX" in prompt and "LOWEST MSGIDX" in prompt
+    assert "Do NOT cluster" in prompt
+    # new guidance: ensure later phases are represented
+    assert "later phases" in prompt
+    # new guidance: exact-count instruction
+    assert "EXACTLY" in prompt
+
+
 def test_event_pair_interval_wording_counts_as_a_date_interval():
     question = "How many days passed between when I planned peer review and when I completed final review?"
 
