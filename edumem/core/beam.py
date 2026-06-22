@@ -5016,6 +5016,41 @@ Now respond with ONLY the JSON array, no explanation."""
                 if isinstance(fact_item, dict):
                     final_ids.add(fact_item.get("source_memory_id", key))
 
+        # CR / yes-no questions hinge on the negation specialist's facts (the
+        # "both sides" of a contradiction). RRF + top_k truncation can drop them,
+        # burying the contradiction. Guarantee they survive by prepending any
+        # negation results that the truncation excluded. Non-CR queries are
+        # untouched.
+        from . import query_mode as _query_mode
+        if _query_mode.is_contradiction_query(query) or _query_mode.is_yesno_check_query(query):
+            present_keys = {
+                f.get("source_memory_id") or f.get("fact_key") or str(f)
+                if isinstance(f, dict) else str(f)
+                for f in final_facts
+            }
+            negation_facts = next(
+                (r.get("facts", []) for name, r in specialists if name == "negation"), []
+            )
+            recovered = []
+            for fact in negation_facts:
+                key = (
+                    fact.get("source_memory_id") or fact.get("fact_key") or str(fact)
+                    if isinstance(fact, dict) else str(fact)
+                )
+                if key not in present_keys:
+                    present_keys.add(key)
+                    recovered.append(("negation", fact))
+            if recovered:
+                final_items = recovered + final_items
+                final_facts = [f for _, f in final_items]
+                for _, fact in recovered:
+                    if isinstance(fact, dict):
+                        final_ids.add(
+                            fact.get("source_memory_id")
+                            or fact.get("fact_key")
+                            or str(fact)
+                        )
+
         # Message-index extraction is specialist-aware: facts expose `message_idx`
         # (with updated/valid_from fallbacks); timelines/negations/sequences expose
         # `msg_idx`. This is the ordering signal the answer prompt's ORDERING
@@ -5034,7 +5069,6 @@ Now respond with ONLY the JSON array, no explanation."""
         # Ordering queries ("in what order did I ...") need first-appearance order,
         # not RRF rank. Sort by message index ASCENDING; non-ordering queries keep
         # the RRF-fused order untouched.
-        from . import query_mode as _query_mode
         if _query_mode.is_ordering_query(query):
             final_items.sort(
                 key=lambda pair: (

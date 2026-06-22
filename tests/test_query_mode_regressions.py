@@ -60,3 +60,14 @@ def test_stated_duration_wording_does_not_count_as_a_date_interval():
     question = "How long did I say the project is expected to take?"
 
     assert not is_date_interval_query(question)
+
+
+def test_absence_rule_rejects_tangential_facts():
+    # Fix A: tangential/related facts must NOT make an out-of-scope question
+    # answerable. The strengthened ABSENCE rule must say so explicitly.
+    prompt = build_system_prompt("How did user feedback influence the UI/UX?")
+    lowered = prompt.lower()
+    assert "tangential" in lowered or "related" in lowered
+    assert "directly" in lowered
+    # must not let the model synthesize from loosely-related facts
+    assert "do not synthesize" in lowered or "do not infer" in lowered

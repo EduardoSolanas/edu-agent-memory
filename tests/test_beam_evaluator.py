@@ -1947,6 +1947,47 @@ def test_beam_integ_tr_routing_merges_versioned_facts(tmp_path):
         beam.conn.close()
 
 
+def test_beam_integ_cr_fusion_preserves_negation_fact(tmp_path):
+    """Fix B: for contradiction / yes-no questions, the negation specialist's
+    fact must survive RRF fusion even when out-ranked by many unrelated facts.
+
+    Inserts one negation triple plus several unrelated facts so RRF would
+    normally truncate the negation away under top_k; asserts it is still
+    present in the returned context."""
+    beam = _make_beam_for_integration(tmp_path, "cr_negation")
+    try:
+        # Negation triple the specialist will return (memoria_kg, predicate='negation')
+        beam.conn.execute(
+            "INSERT INTO memoria_kg (session_id, subject, predicate, object, message_idx, confidence, source_memory_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("cr_negation", "Redis", "negation", "never used Redis for caching", 7, 0.7, "neg1"),
+        )
+        # Several other Redis facts the fact specialist DOES retrieve (they match
+        # the capitalized "Redis" term), so under RRF + top_k truncation they
+        # out-rank and would drop the lone negation triple.
+        for i in range(8):
+            beam._insert_fact(
+                "cr_negation", 10 + i, "metric", f"redis_metric_{i}",
+                f"Redis value {i}", f"Redis fact {i}", 0.7,
+                source_memory_id=f"msg{10 + i}",
+            )
+        beam.conn.commit()
+
+        # top_k=1 leaves a single slot: RRF tie-breaking gives it to the fact
+        # specialist, so the negation triple is truncated away without the fix.
+        result = beam.memoria_retrieve(
+            "Have I ever used Redis for caching?", ability="CR", top_k=1
+        )
+        ctx = result["context"].lower()
+        # "never" is contributed ONLY by the negation specialist's rendering
+        # ("user said never/not: ..."), so this fails if the negation triple
+        # was dropped by top_k truncation.
+        assert "never" in ctx, \
+            f"CR fusion must preserve negation fact, got: {result['context']}"
+    finally:
+        beam.conn.close()
+
+
 def test_beam_integ_default_ability_no_version_annotation(tmp_path):
     """For IE and unrecognized abilities, versioned facts should render as
     flat [Fact type] key: value (no CURRENT/CHANGED/TIMELINE annotations).
