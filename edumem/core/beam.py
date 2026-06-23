@@ -5209,18 +5209,17 @@ Now respond with ONLY the JSON array, no explanation."""
             timing['chrono_ms'] = 0
             specialists.append(('chrono', {"context": "", "facts": [], "source": "fallback"}))
 
-        # Specialist 5: Knowledge graph (entity/relation) retrieval.
-        # Flag-gated (default on) so graph-vs-no-graph can be A/B'd without
-        # changing storage: when off, the KG source simply does not fuse.
-        if os.environ.get("EDUMEM_KG_FUSION", "1") == "1":
-            try:
-                start = _time.perf_counter()
-                kg_result = self._memoria_kg_retrieve(query, top_k=top_k)
-                timing['kg_ms'] = (_time.perf_counter() - start) * 1000
-                specialists.append(('kg', kg_result))
-            except Exception:
-                timing['kg_ms'] = 0
-                specialists.append(('kg', {"context": "", "facts": [], "source": "fallback"}))
+        # Specialist 5: Knowledge graph (entity/relation) retrieval. Always on
+        # -- the KG source is a default part of fusion (empty when memoria_kg
+        # has no matching triples, so it is a no-op without graph data).
+        try:
+            start = _time.perf_counter()
+            kg_result = self._memoria_kg_retrieve(query, top_k=top_k)
+            timing['kg_ms'] = (_time.perf_counter() - start) * 1000
+            specialists.append(('kg', kg_result))
+        except Exception:
+            timing['kg_ms'] = 0
+            specialists.append(('kg', {"context": "", "facts": [], "source": "fallback"}))
 
         # Specialist 6: Summary retrieval (flag-gated; default OFF).
         if os.environ.get("EDUMEM_LLM_SUMMARY", "0") == "1":
