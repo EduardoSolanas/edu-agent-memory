@@ -4074,7 +4074,7 @@ class BeamMemory:
             'negation': r'(I(?: have|\'ve)?\s*(?:never|not)\s+[^.,;!?\n]{15,120})',
             'decision': r'(?:decided to|chose to|opted for|selected|picked|switching to)\s+([^.,;!?\n]{10,120})',
             'entity': r'(?:the|my|our|your)\s+([a-z_]+(?:\s+(?:table|model|schema|API|endpoint|function|module|route|handler|tool|plugin|script|config|setting|workflow|pipeline|process|system|server|client|service|database|query|file|repo|branch|PR|issue|task|job)))\s+(?:needs?|requires?|should|could|would|will|has|have|uses?|runs?|handles?|processes?|supports?)\s+([^.,;!?\n]{10,80})',
-            'sequence': r'((?:first|second|third|fourth|fifth|finally|next|then|after that)[^.,;!?\n]{15,120})',
+            'sequence': r'(\b(?:first|second|third|fourth|fifth|finally|next|then|after that)[^.,;!?\n]{15,120})',
             'instruction_false_positives': ['i think you should leave', 'should behave', 'their work style'],
             'instruction_imperative': 'always|never|remember|use|keep|avoid|ensure|check|verify|run|test|build|deploy|push|pull|merge|commit|close|open|update|install|configure|set|enable|disable|add|remove|create|delete|start|stop|restart|reload|reset|try|implement|write|read|switch|move|copy|rename|send|reply|respond',
             'instruction': r'(?:always|never|must|must not|should(?: not)?(?=\s+(?:you|we|i|one)\s+(?:IMPVERBS))|need(?:s)? to(?: not)?|required to|prefer(?: not)? to|want to(?: avoid| ensure| use| keep))\s+([^.,;!?\n]{10,200})',
@@ -5849,7 +5849,16 @@ Now respond with ONLY the JSON array, no explanation."""
         """Query memoria_kg rows matching query terms via simple SQL LIKE.
 
         Returns matching subject/predicate/object triples rendered as readable
-        text with [MSGIDX:N]. Fallback to most recent rows when no terms match.
+        text with [MSGIDX:N]. Returns empty when no query term matches a triple
+        -- the KG must only fuse when it is actually relevant. A previous
+        "most recent rows" fallback injected query-irrelevant triples that
+        displaced good content in RRF and regressed date/preference (TR/PF)
+        recall; relevant-only contribution keeps the KU/MR gains without that
+        noise.
+
+        After matching rows are found, perform one-hop neighbor expansion:
+        collect distinct subject/object entities from matched rows and find
+        additional triples where those neighbors appear, up to 2*top_k total.
         """
         import re as _re
         cursor = self.conn
@@ -5872,16 +5881,40 @@ Now respond with ONLY the JSON array, no explanation."""
                 if rows:
                     break
 
-        if not rows:
-            rows = cursor.execute(
-                "SELECT subject, predicate, object, message_idx FROM memoria_kg "
-                "WHERE session_id = ? ORDER BY message_idx LIMIT ?",
-                (self.session_id, top_k)
-            ).fetchall()
-
         if rows:
-            facts = [dict(zip(['subject', 'predicate', 'object', 'msg_idx'], r)) for r in rows]
-            ctx_lines = [f"[MSGIDX:{r[3]}] {r[0]} {r[1]} {r[2]}" for r in rows]
+            # Collect distinct neighbors (subject and object values) from matched rows.
+            neighbors = set()
+            for r in rows:
+                neighbors.add(r[0])  # subject
+                neighbors.add(r[2])  # object
+
+            # One-hop expansion: find triples where neighbor entities appear.
+            neighbor_rows = []
+            for neighbor in neighbors:
+                expanded = cursor.execute(
+                    "SELECT subject, predicate, object, message_idx FROM memoria_kg "
+                    "WHERE (subject = ? OR object = ?) "
+                    "AND session_id = ? ",
+                    (neighbor, neighbor, self.session_id)
+                ).fetchall()
+                neighbor_rows.extend(expanded)
+
+            # Deduplicate on (subject, predicate, object, message_idx) and remove rows already in rows.
+            existing_tuples = set(rows)
+            unique_neighbors = []
+            seen = set(existing_tuples)
+            for r in neighbor_rows:
+                if r not in seen:
+                    unique_neighbors.append(r)
+                    seen.add(r)
+
+            # Merge: keep original rows, add neighbors up to 2*top_k total.
+            all_rows = rows + unique_neighbors
+            if len(all_rows) > 2 * top_k:
+                all_rows = all_rows[:2 * top_k]
+
+            facts = [dict(zip(['subject', 'predicate', 'object', 'msg_idx'], r)) for r in all_rows]
+            ctx_lines = [f"[MSGIDX:{r[3]}] {r[0]} {r[1]} {r[2]}" for r in all_rows]
             return {"context": "\n".join(ctx_lines), "facts": facts, "source": "memoria_kg"}
         return {"context": "", "facts": [], "source": "fallback"}
 

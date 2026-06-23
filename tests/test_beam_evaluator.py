@@ -3000,3 +3000,61 @@ def test_llm_extraction_client_exception_falls_back_to_regex(tmp_path):
             os.environ.pop("EDUMEM_LLM_FACT_CONSOLIDATION", None)
         else:
             os.environ["EDUMEM_LLM_FACT_CONSOLIDATION"] = saved_consol
+
+
+def test_sequence_extraction_uses_word_boundaries_not_substrings(tmp_path):
+    """Sequence markers (first/then/next/...) must match as whole words, not
+    as substrings inside other words. 'then' lives inside 'au-THEN-tication',
+    so without \b the regex captured 'thentication ...' as a bogus sequence
+    fact, corrupting retrieved context across abilities."""
+    saved = os.environ.get("EDUMEM_NO_EMBEDDINGS")
+    os.environ["EDUMEM_NO_EMBEDDINGS"] = "1"
+    beam = _make_beam(tmp_path)
+    try:
+        beam.extract_and_store_facts(
+            "We implemented user authentication with registration and login.",
+            message_idx=0,
+        )
+        rows = beam.conn.execute(
+            "SELECT key, value FROM memoria_facts WHERE fact_type='sequence'"
+        ).fetchall()
+        joined = " ".join((k or "") + " " + (v or "") for k, v in rows)
+        assert "thentication" not in joined, f"mid-word 'then' captured: {rows}"
+
+        # Genuine sequence markers must still be extracted.
+        beam.extract_and_store_facts(
+            "First I designed the database schema, then I built the login endpoints.",
+            message_idx=1,
+        )
+        seq = beam.conn.execute(
+            "SELECT value FROM memoria_facts WHERE fact_type='sequence'"
+        ).fetchall()
+        assert any("login endpoints" in (v or "") for (v,) in seq), seq
+    finally:
+        beam.conn.close()
+        if saved is None:
+            os.environ.pop("EDUMEM_NO_EMBEDDINGS", None)
+        else:
+            os.environ["EDUMEM_NO_EMBEDDINGS"] = saved
+
+
+def test_memoria_kg_retrieve_one_hop_expansion(tmp_path):
+    """KG recall should exploit graph structure: when a query matches entity A
+    and A-(rel)->B exists, B's own triples should also surface even though the
+    query never named B. One hop only, no recursion."""
+    saved = os.environ.get("EDUMEM_NO_EMBEDDINGS")
+    os.environ["EDUMEM_NO_EMBEDDINGS"] = "1"
+    beam = _make_beam(tmp_path)
+    try:
+        beam._insert_kg("test-session", "Alice", "manages", "ProjectX", 0, confidence=0.7)
+        beam._insert_kg("test-session", "ProjectX", "uses", "Redis", 1, confidence=0.7)
+        res = beam._memoria_kg_retrieve("What does Alice work on?", top_k=10)
+        ctx = res.get("context", "")
+        assert "Alice manages ProjectX" in ctx, ctx
+        assert "ProjectX uses Redis" in ctx, f"1-hop neighbor missing: {ctx}"
+    finally:
+        beam.conn.close()
+        if saved is None:
+            os.environ.pop("EDUMEM_NO_EMBEDDINGS", None)
+        else:
+            os.environ["EDUMEM_NO_EMBEDDINGS"] = saved
