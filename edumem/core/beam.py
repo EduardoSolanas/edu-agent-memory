@@ -793,13 +793,24 @@ def init_beam(db_path: Path = None):
     # post-E3 sleep marks SLEEP_BATCH_SIZE rows per cycle and would
     # otherwise generate 2*N FTS round-trips per sleep with no content
     # delta. SQLite column-list triggers handle the perf concern.
-    cursor.execute("DROP TRIGGER IF EXISTS wm_au")
-    cursor.execute("""
-        CREATE TRIGGER IF NOT EXISTS wm_au AFTER UPDATE OF content ON working_memory BEGIN
-            DELETE FROM fts_working WHERE id = old.id;
-            INSERT INTO fts_working(id, content) VALUES (new.id, new.content);
-        END
-    """)
+    # Only rewrite wm_au when it is missing or still the pre-E3 (non
+    # column-list) form. Re-running init_beam on an already-migrated DB must
+    # NOT issue this DROP/CREATE: it is a write, and when another connection to
+    # the same file is open (e.g. a per-question eval worker constructing a
+    # BeamMemory while ingestion's connection is still alive), the unconditional
+    # DROP TRIGGER cannot get the write lock and fails with "database is
+    # locked". Guarding it makes steady-state re-init a pure read.
+    _wm_au = cursor.execute(
+        "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='wm_au'"
+    ).fetchone()
+    if _wm_au is None or "UPDATE OF content" not in (_wm_au[0] or ""):
+        cursor.execute("DROP TRIGGER IF EXISTS wm_au")
+        cursor.execute("""
+            CREATE TRIGGER IF NOT EXISTS wm_au AFTER UPDATE OF content ON working_memory BEGIN
+                DELETE FROM fts_working WHERE id = old.id;
+                INSERT INTO fts_working(id, content) VALUES (new.id, new.content);
+            END
+        """)
 
     # --- MEMORIA: Structured Fact Tables (Phase 1) ---
     cursor.execute("""
@@ -4206,19 +4217,36 @@ class BeamMemory:
         if (self._llm_client is not None
                 and os.environ.get("EDUMEM_LLM_EXTRACTION", "0") == "1"):
             try:
-                prompt = self._build_llm_extraction_prompt(content)
-                raw = self._llm_client.chat(
-                    [{"role": "user", "content": prompt}], temperature=0.0)
+                # Load existing canonical keys for the session to guide reuse
+                existing_keys = [
+                    r[0] for r in self.conn.execute(
+                        "SELECT DISTINCT key FROM memoria_facts "
+                        "WHERE session_id = ? AND fact_type != 'date'",
+                        (self.session_id,)
+                    ).fetchall()
+                ]
+                prompt = self._build_llm_extraction_prompt(
+                    content, existing_keys=existing_keys or None
+                )
+                from concurrent.futures import ThreadPoolExecutor, TimeoutError as _TimeoutError
+                timeout = int(os.environ.get("EDUMEM_EXTRACTION_TIMEOUT", "20"))
+                with ThreadPoolExecutor(max_workers=1) as _executor:
+                    _future = _executor.submit(
+                        self._llm_client.chat,
+                        [{"role": "user", "content": prompt}],
+                        temperature=0.0, max_tokens=512,
+                    )
+                    raw = _future.result(timeout=timeout)
                 parsed = self._parse_llm_extraction(raw)
-                if parsed.get("facts") or parsed.get("dates") or parsed.get("triples"):
+                if parsed.get("facts") or parsed.get("entities") or parsed.get("relations") or parsed.get("dates"):
                     ctx = self._context_snippet(content, 0)
                     stored = self._store_llm_extraction(
                         self.session_id, message_idx, parsed, ctx,
                         source_memory_id=source_memory_id)
                     return {
                         "metric": stored["facts"], "date": stored["dates"],
-                        "version": 0, "entity": 0, "sequence": 0,
-                        "timeline": stored["dates"], "negation": stored["triples"],
+                        "version": 0, "entity": stored["entities"], "sequence": 0,
+                        "timeline": stored["dates"], "negation": stored["relations"],
                         "decision": 0,
                     }
             except Exception:
@@ -4726,22 +4754,32 @@ Now respond with ONLY the JSON array, no explanation."""
     # ------------------------------------------------------------------
     # LLM-based write-time fact extraction (flag-gated, Mem0/Hindsight-style)
     # ------------------------------------------------------------------
-    def _build_llm_extraction_prompt(self, content: str) -> str:
+    def _build_llm_extraction_prompt(self, content: str,
+                                     existing_keys: Optional[list] = None) -> str:
         """Build a deterministic prompt instructing the LLM to return ONLY a
-        JSON object of typed facts with canonical snake_case keys.
+        compact JSON object with typed facts, entities, relations, and dates.
 
-        The schema mirrors the regex extractor's targets so the two paths can
-        be A/B'd: persistent facts, dated events, and subject/predicate/object
-        triples (including negations).
+        Cap each list at 5. No prose, no code fences. If existing_keys is
+        provided, encourage reuse of those canonical keys.
         """
+        existing_hint = ""
+        if existing_keys:
+            sample = existing_keys[:10]
+            existing_hint = (
+                "\nReuse these existing canonical keys when possible "
+                "(do NOT create variants of them):\n"
+                f"{', '.join(sample)}\n"
+            )
         return (
             "You extract persistent, reusable memory from a single message.\n"
             "Return ONLY a JSON object (no prose, no code fences) with exactly "
-            "these keys: \"facts\", \"dates\", \"triples\".\n\n"
+            "these keys: \"facts\", \"entities\", \"relations\", \"dates\".\n"
+            "Cap each list at 5 items maximum.\n\n"
             "Schema:\n"
             '{"facts":[{"key":"response_time_ms","value":"250ms","type":"metric"}],'
-            '"dates":[{"key":"deployment_deadline","date":"2024-03-15","context":"..."}],'
-            '"triples":[{"subject":"user","predicate":"never_used","object":"flask routes"}]}\n\n'
+            '"entities":[{"name":"DashboardAPI","kind":"service"}],'
+            '"relations":[{"subject":"user","predicate":"uses","object":"PostgreSQL"}],'
+            '"dates":[{"key":"deployment_deadline","date":"2024-03-15","context":"deadline"}]}\n\n'
             "Rules:\n"
             "- Extract ONLY persistent facts worth remembering later; skip "
             "transient chatter (weather, greetings, ephemeral status).\n"
@@ -4751,33 +4789,34 @@ Now respond with ONLY the JSON array, no explanation."""
             "(use different keys, e.g. response_time_ms vs response_time_target_ms).\n"
             "- Be language-agnostic: derive keys from meaning, do NOT rely on "
             "English keywords; keys are always snake_case ASCII.\n"
-            "- \"type\" is a short category such as metric, version, entity, "
-            "decision, preference, or fact.\n"
-            "- dates: ISO YYYY-MM-DD when an event is tied to a date.\n"
-            "- triples: capture relations; for negations (the user never did / "
-            "does not / refuses something) set predicate to \"never_used\".\n"
-            "- If a category has nothing, return an empty list for it.\n\n"
+            "- \"type\" is a short category: metric, state, preference, instruction.\n"
+            "- \"kind\" is one of: service, project, person, tool, component.\n"
+            "- entities: named real-world things (people, services, tools, projects, components).\n"
+            "- relations: subject-predicate-object triples; for negations (never/not/no/did_not) "
+            "set predicate to \"never_used\".\n"
+            "- dates: ISO YYYY-MM-DD when an event is tied to a date; keep context short.\n"
+            "- If a category has nothing, return an empty list for it.\n"
+            f"{existing_hint}"
             "Message:\n"
             f"{content}\n"
         )
 
     def _parse_llm_extraction(self, raw) -> dict:
         """Parse the LLM extraction output into
-        {"facts":[...],"dates":[...],"triples":[...]}.
+        {"facts":[...],"entities":[...],"relations":[...],"dates":[...]}.
 
-        Tolerates ```json fences and trailing prose. On ANY failure returns the
-        empty structure so the caller can fall through to the regex path.
+        Tolerates ```json fences and trailing prose. Truncates each list to 5
+        items defensively. On ANY failure returns the empty structure so the
+        caller can fall through to the regex path.
         """
-        empty = {"facts": [], "dates": [], "triples": []}
+        empty = {"facts": [], "entities": [], "relations": [], "dates": []}
         if not raw or not isinstance(raw, str):
             return empty
         import re as _re
         text = raw.strip()
-        # Strip code fences if present.
         fence = _re.search(r"```(?:json)?\s*(.*?)```", text, _re.DOTALL | _re.IGNORECASE)
         if fence:
             text = fence.group(1).strip()
-        # Isolate the outermost JSON object if surrounded by prose.
         if not text.startswith("{"):
             start = text.find("{")
             end = text.rfind("}")
@@ -4790,10 +4829,10 @@ Now respond with ONLY the JSON array, no explanation."""
         if not isinstance(data, dict):
             return empty
         result = dict(empty)
-        for cat in ("facts", "dates", "triples"):
+        for cat in ("facts", "entities", "relations", "dates"):
             val = data.get(cat)
             if isinstance(val, list):
-                result[cat] = [item for item in val if isinstance(item, dict)]
+                result[cat] = [item for item in val if isinstance(item, dict)][:5]
         return result
 
     def _store_llm_extraction(self, session: str, msg_idx: int, parsed: dict,
@@ -4802,13 +4841,14 @@ Now respond with ONLY the JSON array, no explanation."""
         """Persist a parsed extraction dict into the MEMORIA tables.
 
         Pure given ``parsed`` (performs no LLM call). Facts go through
-        ``_insert_fact`` (version-chaining on repeated canonical key); dates go
-        to ``memoria_timelines``; triples go to ``memoria_kg`` with negations
-        mapped to the ``negation`` predicate read by ``_memoria_negation_retrieve``.
+        ``_insert_fact`` (version-chaining on repeated canonical key); entities
+        go to ``memoria_kg`` as (name, "is_a", kind); relations go to
+        ``memoria_kg`` with negation predicates mapped to the canonical
+        ``negation`` predicate; dates go to ``memoria_timelines``.
 
         Returns per-category insert counts.
         """
-        counts = {"facts": 0, "dates": 0, "triples": 0}
+        counts = {"facts": 0, "entities": 0, "relations": 0, "dates": 0}
         parsed = parsed or {}
 
         for fact in parsed.get("facts", []):
@@ -4822,6 +4862,31 @@ Now respond with ONLY the JSON array, no explanation."""
                                  source_memory_id=source_memory_id):
                 counts["facts"] += 1
 
+        for ent in parsed.get("entities", []):
+            name = ent.get("name")
+            kind = ent.get("kind")
+            if not name or not kind:
+                continue
+            if self._insert_kg(session, str(name), "is_a", str(kind),
+                               msg_idx, confidence=0.7,
+                               source_memory_id=source_memory_id):
+                counts["entities"] += 1
+
+        _NEGATION_PREDICATES = {"never_used", "never", "not", "did_not",
+                                "does_not", "no", "negation", "refused"}
+        for rel in parsed.get("relations", []):
+            subj = rel.get("subject")
+            obj = rel.get("object")
+            pred = rel.get("predicate")
+            if not subj or not obj or not pred:
+                continue
+            pred_norm = str(pred).strip().lower()
+            mapped = 'negation' if pred_norm in _NEGATION_PREDICATES else pred_norm
+            if self._insert_kg(session, str(subj), mapped, str(obj), msg_idx,
+                               confidence=0.7,
+                               source_memory_id=source_memory_id):
+                counts["relations"] += 1
+
         for d in parsed.get("dates", []):
             date = d.get("date")
             if not date:
@@ -4831,24 +4896,6 @@ Now respond with ONLY the JSON array, no explanation."""
                                      'llm_extraction',
                                      source_memory_id=source_memory_id):
                 counts["dates"] += 1
-
-        # Predicates that express negation map to the canonical 'negation'
-        # predicate that the negation specialist (_memoria_negation_retrieve)
-        # reads. Language-agnostic: callers/LLM are told to use never_used.
-        _NEGATION_PREDICATES = {"never_used", "never", "not", "did_not",
-                                "does_not", "no", "negation", "refused"}
-        for t in parsed.get("triples", []):
-            subj = t.get("subject")
-            obj = t.get("object")
-            pred = t.get("predicate")
-            if not subj or not obj or not pred:
-                continue
-            pred_norm = str(pred).strip().lower()
-            mapped = 'negation' if pred_norm in _NEGATION_PREDICATES else pred_norm
-            if self._insert_kg(session, str(subj), mapped, str(obj), msg_idx,
-                               confidence=0.7,
-                               source_memory_id=source_memory_id):
-                counts["triples"] += 1
 
         return counts
 
@@ -5131,6 +5178,19 @@ Now respond with ONLY the JSON array, no explanation."""
         except Exception:
             timing['chrono_ms'] = 0
             specialists.append(('chrono', {"context": "", "facts": [], "source": "fallback"}))
+
+        # Specialist 5: Knowledge graph (entity/relation) retrieval.
+        # Flag-gated (default on) so graph-vs-no-graph can be A/B'd without
+        # changing storage: when off, the KG source simply does not fuse.
+        if os.environ.get("EDUMEM_KG_FUSION", "1") == "1":
+            try:
+                start = _time.perf_counter()
+                kg_result = self._memoria_kg_retrieve(query, top_k=top_k)
+                timing['kg_ms'] = (_time.perf_counter() - start) * 1000
+                specialists.append(('kg', kg_result))
+            except Exception:
+                timing['kg_ms'] = 0
+                specialists.append(('kg', {"context": "", "facts": [], "source": "fallback"}))
 
         # Build ranked lists from each specialist's results
         # Stable key for fusion: use fact's source_memory_id if available, else content hash
@@ -5785,23 +5845,29 @@ Now respond with ONLY the JSON array, no explanation."""
 
         return {"context": "", "facts": [], "source": "fallback"}
 
-    def _memoria_entity_retrieve(self, query: str, top_k: int = 10) -> dict:
-        """Query memoria_kg for entity-action pairs (predicates: requires, decision)."""
+    def _memoria_kg_retrieve(self, query: str, top_k: int = 10) -> dict:
+        """Query memoria_kg rows matching query terms via simple SQL LIKE.
+
+        Returns matching subject/predicate/object triples rendered as readable
+        text with [MSGIDX:N]. Fallback to most recent rows when no terms match.
+        """
         import re as _re
         cursor = self.conn
-
-        terms = _re.findall(r'\b[A-Z][a-z]+\b', query)
-        stop_words = {'Have', 'Did', 'Do', 'Can', 'Will', 'Would', 'Should',
-                      'What', 'When', 'Where', 'Which', 'Who', 'How', 'Why'}
-        entities = [t.lower() for t in terms if t not in stop_words and len(t) > 3]
+        stop_words = {'what', 'when', 'where', 'which', 'who', 'how', 'why',
+                      'is', 'are', 'was', 'were', 'do', 'does', 'did',
+                      'the', 'a', 'an', 'in', 'on', 'at', 'to', 'for',
+                      'of', 'with', 'i', 'you', 'it', 'this', 'that'}
+        terms = [w for w in _re.findall(r'[a-zA-Z]{3,}', query)
+                 if w.lower() not in stop_words]
 
         rows = []
-        if entities:
-            for entity in entities[:3]:
+        if terms:
+            for term in terms[:5]:
                 rows = cursor.execute(
                     "SELECT subject, predicate, object, message_idx FROM memoria_kg "
-                    "WHERE (subject LIKE ? OR object LIKE ?) AND session_id = ? LIMIT ?",
-                    (f'%{entity}%', f'%{entity}%', self.session_id, top_k)
+                    "WHERE (subject LIKE ? OR predicate LIKE ? OR object LIKE ?) "
+                    "AND session_id = ? LIMIT ?",
+                    (f'%{term}%', f'%{term}%', f'%{term}%', self.session_id, top_k)
                 ).fetchall()
                 if rows:
                     break
@@ -5815,7 +5881,7 @@ Now respond with ONLY the JSON array, no explanation."""
 
         if rows:
             facts = [dict(zip(['subject', 'predicate', 'object', 'msg_idx'], r)) for r in rows]
-            ctx_lines = [f"[{r[1]}] {r[0]} -> {r[2]}" for r in rows]
+            ctx_lines = [f"[MSGIDX:{r[3]}] {r[0]} {r[1]} {r[2]}" for r in rows]
             return {"context": "\n".join(ctx_lines), "facts": facts, "source": "memoria_kg"}
         return {"context": "", "facts": [], "source": "fallback"}
 
