@@ -942,13 +942,27 @@ class LLMClient:
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
+        # Reasoning models on NAN otherwise spend the whole max_tokens budget on
+        # hidden chain-of-thought, hit finish_reason='length', return
+        # content=None (empty answer -> score 0) and take minutes. Disable/cap
+        # reasoning per the NAN docs (https://nan.builders/docs/api):
+        #   - qwen3.x / gemma4: chat_template_kwargs.enable_thinking=false
+        #   - deepseek-v4-flash: reasoning_effort low/medium/high
+        #   - mimo-v2.5: always reasons, not configurable (avoid where latency
+        #     matters).
+        _ml = model.lower()
+        if "qwen" in _ml or "gemma" in _ml:
+            payload["chat_template_kwargs"] = {"enable_thinking": False}
+        elif "deepseek" in _ml:
+            payload["reasoning_effort"] = "low"
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
             "HTTP-Referer": "https://edumem.site",
             "X-Title": "edumem Benchmark",
         }
-        resp = _requests.post(url, json=payload, headers=headers, timeout=60)
+        resp = _requests.post(url, json=payload, headers=headers,
+                              timeout=int(os.environ.get("BEAM_LLM_TIMEOUT", "300")))
         resp.raise_for_status()
         data = resp.json()
         self.call_count += 1
