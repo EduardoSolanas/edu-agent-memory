@@ -9,6 +9,7 @@ import pytest
 
 from tools import evaluate_beam_end_to_end as beam_eval
 from tools.evaluate_beam_end_to_end import (
+    _assemble_memory_context,
     _required_rejudge_fields,
     _attach_second_pass_diagnostics,
     _record_second_pass_diagnostics,
@@ -3212,3 +3213,50 @@ def test_summary_flag_off_writes_nothing(tmp_path):
             os.environ.pop("EDUMEM_LLM_SUMMARY", None)
         else:
             os.environ["EDUMEM_LLM_SUMMARY"] = saved_sum
+
+
+# ---------------------------------------------------------------------------
+# _assemble_memory_context — relevance-sort fix
+# ---------------------------------------------------------------------------
+
+def test_assemble_memory_context_high_relevance_included():
+    """High-relevance item placed LAST in input list must appear in context
+    when the char budget is too small to include everything."""
+    low_content = "A" * 200  # each 200 chars
+    high_content = "Z" * 50   # short, high relevance
+
+    memories = [
+        {"content": low_content, "score": 0.3},
+        {"content": low_content + "B", "score": 0.3},  # different key
+        {"content": low_content + "C", "score": 0.3},
+        {"content": high_content, "score": 0.97},       # placed LAST
+    ]
+
+    max_chars = 250  # fits ~1 low item OR the high item, not all four
+
+    ctx, result_mems = _assemble_memory_context(memories, max_chars)
+
+    # High-relevance item must be included
+    high_mem = next(m for m in result_mems if m["score"] == 0.97)
+    assert high_mem["final_context_included"] is True, (
+        "High-relevance item (score=0.97) must be included but was dropped"
+    )
+    assert high_content in ctx, "High-relevance content must appear in context string"
+
+    # At least one low-relevance item must have been dropped
+    dropped = [m for m in result_mems if m["score"] == 0.3 and not m.get("final_context_included")]
+    assert dropped, "At least one low-relevance item should be dropped to fit the budget"
+
+
+def test_assemble_memory_context_descending_order():
+    """Memories in returned list must be ordered by relevance descending (stable)."""
+    memories = [
+        {"content": "low", "score": 0.1},
+        {"content": "high", "score": 0.9},
+        {"content": "mid", "score": 0.5},
+    ]
+    _ctx, result_mems = _assemble_memory_context(memories, max_chars=10000)
+    scores = [m["score"] for m in result_mems]
+    assert scores == sorted(scores, reverse=True), (
+        f"Expected descending scores, got {scores}"
+    )

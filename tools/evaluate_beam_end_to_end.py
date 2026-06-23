@@ -182,6 +182,47 @@ def _tr_python_answer_is_trustworthy(py_answer: str, timeline_size: int,
     return True
 
 
+def _assemble_memory_context(memories: list, max_chars: int) -> tuple[str, list]:
+    """Sort memories by relevance descending (stable), deduplicate, skip score<0.05,
+    build [Memory] context string up to max_chars. Mutates each mem's
+    'final_context_included' key. Returns (context_str, memories)."""
+    def _score(m):
+        s = m.get("score", m.get("relevance", 0))
+        return s if isinstance(s, (int, float)) else 0.0
+
+    sorted_mems = sorted(memories, key=_score, reverse=True)  # stable sort
+
+    seen_content: set = set()
+    parts: list = []
+    total_chars = 0
+
+    for mem in memories:
+        mem.setdefault("final_context_included", False)
+
+    for mem in sorted_mems:
+        content = mem.get("content", "")
+        content_key = content[:100]
+        if content_key in seen_content:
+            continue
+        seen_content.add(content_key)
+
+        score = _score(mem)
+        if score < 0.05:
+            continue
+
+        if total_chars + len(content) > max_chars:
+            remaining = max_chars - total_chars
+            if remaining > 100:
+                mem["final_context_included"] = True
+                parts.append(f"[Memory] {content[:remaining]}...")
+            break
+        mem["final_context_included"] = True
+        parts.append(f"[Memory] {content}")
+        total_chars += len(content)
+
+    return "\n\n".join(parts), sorted_mems
+
+
 _CTX_MATCH_STOP = {
     'when', 'does', 'do', 'did', 'what', 'how', 'where', 'which', 'who', 'why',
     'is', 'are', 'was', 'were', 'can', 'will', 'would', 'should', 'could', 'may',
@@ -3361,31 +3402,8 @@ Follow this format strictly:
 
     # Build retrieved memory context (deduplicated, relevance-sorted)
     _effective_max_chars = 24000 if _is_sum else MAX_MEMORY_CONTEXT_CHARS
-    seen_content = set()
-    memory_parts = []
-    total_chars = 0
-    for i, mem in enumerate(memories):
-        mem.setdefault("final_context_included", False)
-        content = mem.get("content", "")
-        # Deduplicate
-        content_key = content[:100]
-        if content_key in seen_content:
-            continue
-        seen_content.add(content_key)
-
-        score = mem.get("score", mem.get("relevance", 0))
-        if isinstance(score, (int, float)) and score < 0.05:
-            continue  # Skip very low relevance
-
-        if total_chars + len(content) > _effective_max_chars:
-            remaining = _effective_max_chars - total_chars
-            if remaining > 100:
-                mem["final_context_included"] = True
-                memory_parts.append(f"[Memory] {content[:remaining]}...")
-            break
-        mem["final_context_included"] = True
-        memory_parts.append(f"[Memory] {content}")
-        total_chars += len(content)
+    _mem_context_str, memories = _assemble_memory_context(memories, _effective_max_chars)
+    memory_parts = _mem_context_str.split("\n\n") if _mem_context_str else []
 
     # Build prompt with contexts (skip if full-conversation mode already set)
     if not context:
