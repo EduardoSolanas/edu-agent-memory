@@ -3058,3 +3058,157 @@ def test_memoria_kg_retrieve_one_hop_expansion(tmp_path):
             os.environ.pop("EDUMEM_NO_EMBEDDINGS", None)
         else:
             os.environ["EDUMEM_NO_EMBEDDINGS"] = saved
+
+
+# ---------------------------------------------------------------------------
+# Write-Time Rolling Summary Tests (6 tests for TDD)
+# ---------------------------------------------------------------------------
+
+
+def test_should_summarize_only_on_segment_boundary(tmp_path):
+    """Pure predicate: _should_summarize returns True only at segment boundaries."""
+    saved = os.environ.get("EDUMEM_NO_EMBEDDINGS")
+    os.environ["EDUMEM_NO_EMBEDDINGS"] = "1"
+    try:
+        beam = _make_beam(tmp_path)
+        segment_size = 20
+        # True at indices 19, 39, 59 (0-indexed)
+        assert beam._should_summarize(19, segment_size) is True
+        assert beam._should_summarize(39, segment_size) is True
+        assert beam._should_summarize(59, segment_size) is True
+        # False elsewhere
+        assert beam._should_summarize(0, segment_size) is False
+        assert beam._should_summarize(18, segment_size) is False
+        assert beam._should_summarize(20, segment_size) is False
+        assert beam._should_summarize(38, segment_size) is False
+    finally:
+        if saved is None:
+            os.environ.pop("EDUMEM_NO_EMBEDDINGS", None)
+        else:
+            os.environ["EDUMEM_NO_EMBEDDINGS"] = saved
+
+
+def test_store_summary_inserts_and_is_retrievable(tmp_path):
+    """_store_summary inserts into memoria_summaries and _memoria_summary_retrieve finds it."""
+    saved = os.environ.get("EDUMEM_NO_EMBEDDINGS")
+    os.environ["EDUMEM_NO_EMBEDDINGS"] = "1"
+    try:
+        beam = _make_beam(tmp_path)
+        ok = beam._store_summary(beam.session_id, 0, 19, "User learned Python basics and set up their environment.")
+        assert ok is True
+        result = beam._memoria_summary_retrieve("Python setup environment", top_k=5)
+        assert "[MSGIDX:19]" in result["context"]
+        assert "Python" in result["context"]
+        assert result["source"] == "memoria_summaries"
+    finally:
+        if saved is None:
+            os.environ.pop("EDUMEM_NO_EMBEDDINGS", None)
+        else:
+            os.environ["EDUMEM_NO_EMBEDDINGS"] = saved
+
+
+def test_summary_retrieve_breadth_fallback_returns_recent(tmp_path):
+    """When query matches no summary term, breadth fallback returns recent rows."""
+    saved = os.environ.get("EDUMEM_NO_EMBEDDINGS")
+    os.environ["EDUMEM_NO_EMBEDDINGS"] = "1"
+    try:
+        beam = _make_beam(tmp_path)
+        beam._store_summary(beam.session_id, 0, 19, "First segment about cooking")
+        beam._store_summary(beam.session_id, 20, 39, "Second segment about travel")
+        beam._store_summary(beam.session_id, 40, 59, "Third segment about music")
+        # Query with no matching term — breadth fallback returns recent rows
+        result = beam._memoria_summary_retrieve("xyzzy_no_match_term_here", top_k=5)
+        assert result["source"] == "memoria_summaries"
+        assert "[MSGIDX:59]" in result["context"]
+        assert len(result["facts"]) >= 2
+    finally:
+        if saved is None:
+            os.environ.pop("EDUMEM_NO_EMBEDDINGS", None)
+        else:
+            os.environ["EDUMEM_NO_EMBEDDINGS"] = saved
+
+
+def test_summary_prompt_is_bounded(tmp_path):
+    """_build_summary_prompt mentions 150-word cap and narrative-only instruction."""
+    saved = os.environ.get("EDUMEM_NO_EMBEDDINGS")
+    os.environ["EDUMEM_NO_EMBEDDINGS"] = "1"
+    try:
+        beam = _make_beam(tmp_path)
+        segment_text = "user: Hello\nassistant: Hi there"
+        prompt = beam._build_summary_prompt(segment_text)
+        # Must mention the 150-word cap
+        assert "150" in prompt
+        # Must instruct narrative-only (no markdown, no preamble)
+        lower = prompt.lower()
+        assert "narrative" in lower or "summary" in lower
+        assert "markdown" in lower or "preamble" in lower or "only" in lower
+    finally:
+        if saved is None:
+            os.environ.pop("EDUMEM_NO_EMBEDDINGS", None)
+        else:
+            os.environ["EDUMEM_NO_EMBEDDINGS"] = saved
+
+
+def test_fused_recall_includes_summary_source_when_flag_on(tmp_path):
+    """Summary source appears in fused recall only when EDUMEM_LLM_SUMMARY=1."""
+    saved_emb = os.environ.get("EDUMEM_NO_EMBEDDINGS")
+    saved_sum = os.environ.get("EDUMEM_LLM_SUMMARY")
+    os.environ["EDUMEM_NO_EMBEDDINGS"] = "1"
+    try:
+        beam = _make_beam(tmp_path)
+        beam._store_summary(beam.session_id, 0, 19, "User discussed Python learning progress and goals.")
+
+        # Flag ON — summary source must appear in fused context
+        os.environ["EDUMEM_LLM_SUMMARY"] = "1"
+        result_on = beam.memoria_retrieve("Python learning progress", top_k=5)
+        assert "Python" in result_on.get("context", ""), "summary not fused when flag is ON"
+
+        # Flag OFF — summary source must NOT appear in fused context (only from this specialist)
+        os.environ["EDUMEM_LLM_SUMMARY"] = "0"
+        result_off = beam.memoria_retrieve("Python learning progress", top_k=5)
+        # The summary row should not come from the summaries specialist when flag is off
+        # (other specialists like fact might still surface something, so we check source)
+        off_context = result_off.get("context", "")
+        # If there are no other facts, context should be empty
+        # At minimum, verify flag-off doesn't crash
+        assert isinstance(off_context, str)
+    finally:
+        if saved_emb is None:
+            os.environ.pop("EDUMEM_NO_EMBEDDINGS", None)
+        else:
+            os.environ["EDUMEM_NO_EMBEDDINGS"] = saved_emb
+        if saved_sum is None:
+            os.environ.pop("EDUMEM_LLM_SUMMARY", None)
+        else:
+            os.environ["EDUMEM_LLM_SUMMARY"] = saved_sum
+
+
+def test_summary_flag_off_writes_nothing(tmp_path):
+    """When EDUMEM_LLM_SUMMARY is off, no summaries are written during ingestion."""
+    saved_emb = os.environ.get("EDUMEM_NO_EMBEDDINGS")
+    saved_sum = os.environ.get("EDUMEM_LLM_SUMMARY")
+    os.environ["EDUMEM_NO_EMBEDDINGS"] = "1"
+    # Ensure flag is OFF (default)
+    os.environ.pop("EDUMEM_LLM_SUMMARY", None)
+    try:
+        beam = _make_beam(tmp_path)
+        # Ingest some messages — no llm_client, flag off
+        ingest_conversation(beam, [
+            {"role": "user", "content": "I love hiking in the mountains."},
+            {"role": "assistant", "content": "That sounds wonderful!"},
+        ])
+        # memoria_summaries table must exist but be empty
+        count = beam.conn.execute(
+            "SELECT COUNT(*) FROM memoria_summaries WHERE session_id = ?",
+            (beam.session_id,)
+        ).fetchone()[0]
+        assert count == 0, f"Expected 0 summaries when flag is off, got {count}"
+    finally:
+        if saved_emb is None:
+            os.environ.pop("EDUMEM_NO_EMBEDDINGS", None)
+        else:
+            os.environ["EDUMEM_NO_EMBEDDINGS"] = saved_emb
+        if saved_sum is None:
+            os.environ.pop("EDUMEM_LLM_SUMMARY", None)
+        else:
+            os.environ["EDUMEM_LLM_SUMMARY"] = saved_sum

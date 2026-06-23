@@ -1076,6 +1076,23 @@ def init_beam(db_path: Path = None):
     # --- Message index column for message threading (for future use) ---
     _add_column_if_missing(conn, "working_memory", "message_index", "INTEGER")
 
+    # --- Rolling summary table ---
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS memoria_summaries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT DEFAULT 'default',
+            seg_start INTEGER,
+            seg_end INTEGER,
+            summary TEXT NOT NULL,
+            source TEXT DEFAULT 'llm_summary',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_summaries_session "
+        "ON memoria_summaries(session_id, seg_end)"
+    )
+
 
 class _BeamConnection(sqlite3.Connection):
     """sqlite3.Connection subclass that supports deferring commits.
@@ -2713,15 +2730,21 @@ class BeamMemory:
             # Populates memoria_facts, memoria_timelines, memoria_kg for the
             # structured retrieval router. Runs silently on every remember()
             # so the MEMORIA tables stay current regardless of extract=True.
+            message_idx = message_index if message_index is not None else 0
             try:
                 self.extract_and_store_facts(
                     content,
-                    message_idx=message_index if message_index is not None else 0,
+                    message_idx=message_idx,
                     source_memory_id=existing_id,
                     source=source,
                 )
             except Exception:
                 pass  # regex extraction failures must not block memory storage
+            # Phase 2b: Write-time rolling summary (at segment boundaries)
+            try:
+                self._maybe_summarize_segment(self.session_id, message_idx)
+            except Exception:
+                pass  # summary failures must not block memory storage
             # Phase 3-4: Extract graph and consolidate veracity for dedup update
             self._ingest_graph_and_veracity(
                 existing_id, content, source, veracity, message_idx=message_index
@@ -2824,15 +2847,22 @@ class BeamMemory:
         # Phase 2: MEMORIA regex-based extraction (always-on, zero-LLM-cost).
         # Populates memoria_facts, memoria_timelines, memoria_kg for the
         # structured retrieval router. Runs on every remember() call.
+        message_idx = message_index if message_index is not None else 0
         try:
             self.extract_and_store_facts(
                 content,
-                message_idx=message_index if message_index is not None else 0,
+                message_idx=message_idx,
                 source_memory_id=memory_id,
                 source=source,
             )
         except Exception:
             pass  # regex extraction failures must not block memory storage
+
+        # Phase 2b: Write-time rolling summary (at segment boundaries)
+        try:
+            self._maybe_summarize_segment(self.session_id, message_idx)
+        except Exception:
+            pass  # summary failures must not block memory storage
 
         # Phase 3-4: Extract graph and consolidate veracity for new memory
         self._ingest_graph_and_veracity(
@@ -5192,6 +5222,17 @@ Now respond with ONLY the JSON array, no explanation."""
                 timing['kg_ms'] = 0
                 specialists.append(('kg', {"context": "", "facts": [], "source": "fallback"}))
 
+        # Specialist 6: Summary retrieval (flag-gated; default OFF).
+        if os.environ.get("EDUMEM_LLM_SUMMARY", "0") == "1":
+            try:
+                start = _time.perf_counter()
+                summary_result = self._memoria_summary_retrieve(query, top_k=top_k)
+                timing['summary_ms'] = (_time.perf_counter() - start) * 1000
+                specialists.append(('summary', summary_result))
+            except Exception:
+                timing['summary_ms'] = 0
+                specialists.append(('summary', {"context": "", "facts": [], "source": "fallback"}))
+
         # Build ranked lists from each specialist's results
         # Stable key for fusion: use fact's source_memory_id if available, else content hash
         ranked_lists = []
@@ -5843,6 +5884,133 @@ Now respond with ONLY the JSON array, no explanation."""
                 ctx_lines = [f"[Negation] user said never/not: {r[1]}" for r in rows]
                 return {"context": "\n".join(ctx_lines), "facts": facts, "source": "memoria_kg_negation"}
 
+        return {"context": "", "facts": [], "source": "fallback"}
+
+    def _should_summarize(self, message_idx: int, segment_size: int) -> bool:
+        """Return True exactly at segment boundaries."""
+        return (message_idx + 1) % segment_size == 0
+
+    def _segment_text(self, session: str, seg_start: int, seg_end: int) -> str:
+        """Pull raw messages for [seg_start, seg_end] from working_memory / episodic_memory."""
+        rows = self.conn.execute(
+            "SELECT source, content FROM working_memory "
+            "WHERE session_id = ? AND message_index BETWEEN ? AND ? "
+            "ORDER BY message_index ASC",
+            (session, seg_start, seg_end)
+        ).fetchall()
+        if not rows:
+            rows = self.conn.execute(
+                "SELECT source, content FROM episodic_memory "
+                "WHERE session_id = ? AND message_index BETWEEN ? AND ? "
+                "ORDER BY message_index ASC",
+                (session, seg_start, seg_end)
+            ).fetchall()
+        lines = [f"{r[0]}: {r[1]}" for r in rows]
+        return "\n".join(lines)
+
+    def _build_summary_prompt(self, segment_text: str, prior_summary: Optional[str] = None) -> str:
+        """Build a bounded summarization prompt."""
+        if prior_summary:
+            return (
+                f"You have an existing summary of a conversation:\n{prior_summary}\n\n"
+                f"New conversation segment:\n{segment_text}\n\n"
+                "Update the existing summary to incorporate the new segment. "
+                "Return ONLY a compact narrative summary, no markdown, no preamble, "
+                "<= 150 words."
+            )
+        return (
+            f"Conversation segment:\n{segment_text}\n\n"
+            "Return ONLY a compact narrative summary, no markdown, no preamble, "
+            "<= 150 words."
+        )
+
+    def _store_summary(self, session: str, seg_start: int, seg_end: int,
+                       summary: str, source: str = 'llm_summary') -> bool:
+        """Insert one memoria_summaries row; return True on insert."""
+        self.conn.execute(
+            "INSERT INTO memoria_summaries (session_id, seg_start, seg_end, summary, source) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (session, seg_start, seg_end, summary, source)
+        )
+        self.conn.commit()
+        return True
+
+    def _maybe_summarize_segment(self, session: str, message_idx: int) -> None:
+        """Write-time hook: summarize a segment if boundary reached, flag on, and llm_client set."""
+        if not (self._llm_client is not None
+                and os.environ.get("EDUMEM_LLM_SUMMARY", "0") == "1"):
+            return
+        segment_size = int(os.environ.get("EDUMEM_SUMMARY_SEGMENT", "20"))
+        if not self._should_summarize(message_idx, segment_size):
+            return
+        seg_end = message_idx
+        seg_start = max(0, message_idx - segment_size + 1)
+        text = self._segment_text(session, seg_start, seg_end)
+        if not text:
+            return
+        # Load most recent prior summary for rolling update
+        prior_row = self.conn.execute(
+            "SELECT summary FROM memoria_summaries WHERE session_id = ? "
+            "ORDER BY seg_end DESC LIMIT 1",
+            (session,)
+        ).fetchone()
+        prior_summary = prior_row[0] if prior_row else None
+        prompt = self._build_summary_prompt(text, prior_summary=prior_summary)
+        try:
+            from concurrent.futures import ThreadPoolExecutor, TimeoutError as _TimeoutError
+            timeout = int(os.environ.get("EDUMEM_EXTRACTION_TIMEOUT", "20"))
+            with ThreadPoolExecutor(max_workers=1) as _executor:
+                _future = _executor.submit(
+                    self._llm_client.chat,
+                    [{"role": "user", "content": prompt}],
+                    temperature=0.0, max_tokens=256,
+                )
+                raw = _future.result(timeout=timeout)
+            if not raw or not raw.strip():
+                return
+        except Exception:
+            return
+        self._store_summary(session, seg_start, seg_end, raw.strip())
+
+    def _memoria_summary_retrieve(self, query: str, top_k: int = 10) -> dict:
+        """Query memoria_summaries for rows matching query terms.
+        Falls back to most recent summaries if no term matches (breadth fallback).
+        """
+        import re as _re
+        cursor = self.conn
+        stop_words = {'what', 'when', 'where', 'which', 'who', 'how', 'why',
+                      'is', 'are', 'was', 'were', 'do', 'does', 'did',
+                      'the', 'a', 'an', 'in', 'on', 'at', 'to', 'for',
+                      'of', 'with', 'i', 'you', 'it', 'this', 'that'}
+        terms = [w for w in _re.findall(r'[a-zA-Z]{3,}', query)
+                 if w.lower() not in stop_words]
+
+        rows = []
+        if terms:
+            for term in terms[:5]:
+                rows = cursor.execute(
+                    "SELECT seg_end, summary FROM memoria_summaries "
+                    "WHERE summary LIKE ? AND session_id = ? "
+                    "ORDER BY seg_end DESC LIMIT ?",
+                    (f'%{term}%', self.session_id, top_k)
+                ).fetchall()
+                if rows:
+                    break
+
+        if not rows:
+            # Breadth fallback: return most recent summaries
+            rows = cursor.execute(
+                "SELECT seg_end, summary FROM memoria_summaries "
+                "WHERE session_id = ? ORDER BY seg_end DESC LIMIT ?",
+                (self.session_id, top_k)
+            ).fetchall()
+
+        if rows:
+            ctx_lines = [f"[MSGIDX:{r[0]}] {r[1]}" for r in rows]
+            facts = [{"seg_end": r[0], "summary": r[1],
+                      "source_memory_id": f"summary:seg_end:{r[0]}"} for r in rows]
+            return {"context": "\n".join(ctx_lines), "facts": facts,
+                    "source": "memoria_summaries"}
         return {"context": "", "facts": [], "source": "fallback"}
 
     def _memoria_kg_retrieve(self, query: str, top_k: int = 10) -> dict:
