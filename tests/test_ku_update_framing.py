@@ -1,3 +1,9 @@
+import os
+
+# Spec Part E: these tests call _insert_fact directly; keep fact-ingestion offline
+# so the semantic-recall write path doesn't attempt an embedding.
+os.environ.setdefault("EDUMEM_NO_EMBEDDINGS", "1")
+
 from edumem.core.beam import BeamMemory, init_beam
 from edumem.core.query_mode import build_system_prompt
 

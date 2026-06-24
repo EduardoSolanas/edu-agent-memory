@@ -3,6 +3,11 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+# These tests call _insert_fact directly. The semantic-recall write path would
+# otherwise attempt a (best-effort) embedding on each insert; suppress it so the
+# suite stays offline and deterministic (Spec Part E).
+os.environ.setdefault("EDUMEM_NO_EMBEDDINGS", "1")
+
 from edumem.core.beam import BeamMemory
 
 
