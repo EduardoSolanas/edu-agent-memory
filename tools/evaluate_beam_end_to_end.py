@@ -1586,79 +1586,13 @@ def ingest_conversation(beam: BeamMemory, messages: list[dict], diag: dict | Non
             except Exception:
                 pass  # Best-effort; don't fail ingestion
 
-        # [E1] Additive consolidation per batch via beam.sleep().
-        #
-        # Pre-E1 this block built a synthetic summary
-        # ("Batch N: first_3_msg_contents[:100]") + DELETEd all source
-        # working_memory rows. ~99% of message content was discarded
-        # before recall could see it -- the entire BEAM benchmark
-        # corpus was destroyed at ingest.
-        #
-        # Post-E1 (option b, depends on E3 additive sleep): backdate
-        # ONLY the batch's just-inserted rows past sleep's TTL/2
-        # cutoff and let beam.sleep() produce real LLM-generated (or
-        # AAAK-fallback) summaries on top of preserved originals.
-        # The scoped UPDATE prevents cross-batch timestamp
-        # contamination -- without the `id IN (...)` filter, a
-        # mid-sleep failure on batch N would let batch N+1's UPDATE
-        # walk every still-unconsolidated row in the session and
-        # rewrite their timestamps, corrupting per-row temporal
-        # ordering. See E1 adversarial review F1/F3.
-
-        # Skip sleep for ≤100K scale to preserve message content for retrieval
-        _skip_sleep = os.environ.get("BEAM_CURRENT_SCALE", "100K") in ("100K",)
-        if not _skip_sleep:
-            try:
-                cursor = beam.conn.cursor()
-                # Backdate is derived from WORKING_MEMORY_TTL_HOURS so it
-                # survives operator config changes via env var. sleep()'s
-                # cutoff is TTL/2, _trim's cutoff is TTL -- backdating by
-                # TTL+1 ensures the row is on the consolidatable side of
-                # sleep's cutoff while staying outside the trim window's
-                # safety margin (consolidated_at exempts from trim post-E3
-                # anyway, so the trim concern only applies pre-sleep). See
-                # E1 adversarial review F6.
-                from edumem.core.beam import WORKING_MEMORY_TTL_HOURS as _WM_TTL
-                backdate_iso = (
-                    datetime.now() - timedelta(hours=_WM_TTL + 1)
-                ).isoformat()
-                if batch_ids:
-                    placeholders = ",".join("?" * len(batch_ids))
-                    cursor.execute(
-                        f"UPDATE working_memory SET timestamp = ? "
-                        f"WHERE id IN ({placeholders}) "
-                        f"AND consolidated_at IS NULL",
-                        (backdate_iso, *batch_ids),
-                    )
-                    beam.conn.commit()
-
-                    # Consolidate: run beam.sleep() to produce episodic summaries.
-                    # Uses AAAK compression when EDUMEM_LLM_ENABLED=false
-                    # (set externally to avoid local model download/inference during
-                    # benchmark). Loop until sleep returns no_op so all eligible
-                    # rows in this batch get processed regardless of SLEEP_BATCH_SIZE.
-                    # Sleep errors are caught and logged; they don't crash ingestion.
-                    max_iters = 50
-                    while max_iters > 0:
-                        try:
-                            result = beam.sleep()
-                        except Exception as sleep_e:
-                            result = {"status": "error", "message": repr(sleep_e)}
-                        max_iters -= 1
-                        if result.get("status") in ("no_op", "error"):
-                            break
-                    # E3 contract: originals stay, so stats["wm_count"]
-                    # does NOT decrement. Pre-E1 we did stats["wm_count"]
-                    # -= ... which produced wm_count=0 always; post-E1 it
-                    # grows monotonically with input message count, which
-                    # is what the experiment actually wants to measure.
-            except Exception as e:
-                # Log the failure to stats so the operator sees it. Pre-E1
-                # the equivalent block also swallowed silently, but the
-                # consolidation IS the point of the experiment -- a silent
-                # benchmark that "succeeds" with 0 episodic rows is the
-                # exact failure mode the test suite is supposed to catch.
-                stats.setdefault("sleep_errors", []).append(repr(e))
+        # NOTE: consolidation (beam.sleep()) is intentionally NOT called here.
+        # It is an agent-lifecycle event, not an ingest side-effect: weaving it
+        # into ingest (the pre-E1 design) destroyed ~99% of message content
+        # before recall could see it. Ingest now does only ingest; the caller
+        # (an agent, or a dedicated consolidation test) decides when to
+        # consolidate. See tests/test_beam_metric_consolidation.py for the
+        # isolated consolidation coverage.
 
     stats["ingest_time_ms"] = (time.perf_counter() - start_time) * 1000
     if diag is not None:
@@ -4693,30 +4627,12 @@ def main():
                     "embedding": {},
                 }
 
-                # Ingest (includes per-batch consolidation via beam.sleep())
+                # Ingest (pure ingest — no consolidation; see ingest_conversation note).
                 os.environ["BEAM_CURRENT_SCALE"] = scale
                 t0 = time.perf_counter()
                 stats = ingest_conversation(beam, conv["messages"], diag=conv_diag, llm=llm)
                 ingest_time = time.perf_counter() - t0
                 conv_diag["ingest_diagnostics_batch"] = getattr(beam, "_last_ingest_diagnostics_batch", None)
-
-                # Post-ingestion consolidation sweep: catch any rows that the
-                # per-batch sleep loop didn't process. Uses AAAK compression
-                # (same as per-batch). LLM-based consolidation is available via
-                # EDUMEM_LLM_BASE_URL + EDUMEM_LLM_MODEL env vars.
-                _consolidation_attempts = 0
-                if os.environ.get("BEAM_CURRENT_SCALE", "100K") not in ("100K",):
-                    while _consolidation_attempts < 50:
-                        try:
-                            _sr = beam.sleep()
-                            if _sr.get("status") in ("no_op", "error"):
-                                break
-                            _consolidation_attempts += 1
-                        except Exception as _se:
-                            stats.setdefault("post_ingest_sleep_errors", []).append(repr(_se))
-                            break
-                    if _consolidation_attempts > 0:
-                        print(f"    [consolidation-sweep] LLM-based: consolidated {_consolidation_attempts} additional batch(es) post-ingest", flush=True)
 
                 print(f"    Ingested {len(conv['messages'])} msgs in {ingest_time:.1f}s "
                       f"(DB: {os.path.getsize(db_path)/1024:.0f}KB)")
