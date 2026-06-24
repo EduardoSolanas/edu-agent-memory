@@ -5024,7 +5024,9 @@ Now respond with ONLY the JSON array, no explanation."""
 
         Called from the batch ingest boundary (e.g. remember_batch) so we make
         ONE embed([...]) call over all queued texts instead of N per-fact calls.
-        Clears the queue regardless of success/failure.
+        Clears the queue regardless of success/failure. Failures (embed
+        unavailable, dimension mismatch, dup rowid) are logged at WARNING so a
+        total write-path outage is observable, not silent.
         """
         if not self._pending_fact_embeddings:
             return
@@ -5032,12 +5034,20 @@ Now respond with ONLY the JSON array, no explanation."""
         if not _e.available() or not _vec_available(self.conn, table="vec_facts"):
             self._pending_fact_embeddings = []
             return
+        _queued = len(self._pending_fact_embeddings)
+        _inserted = 0
+        _first_err = None
         try:
             pairs = self._pending_fact_embeddings
             rids = [p[0] for p in pairs]
             texts = [p[1] for p in pairs]
             embs = _e.embed(texts)
             if embs is None:
+                logger.warning(
+                    "_flush_fact_embeddings: embed() returned None for %d queued facts "
+                    "(endpoint down or EMBEDDING_DIM mismatch); vec_facts not populated.",
+                    _queued,
+                )
                 self._pending_fact_embeddings = []
                 return
             for rid, emb in zip(rids, embs):
@@ -5045,10 +5055,21 @@ Now respond with ONLY the JSON array, no explanation."""
                     continue
                 try:
                     _vec_insert(self.conn, rid, emb.tolist(), table="vec_facts")
-                except Exception:
-                    pass  # individual insert failure (e.g. dup rowid) is non-fatal
-        except Exception:
-            pass
+                    _inserted += 1
+                except Exception as e:
+                    if _first_err is None:
+                        _first_err = f"{type(e).__name__}: {e}"
+            if _inserted < _queued and _first_err is not None:
+                logger.warning(
+                    "_flush_fact_embeddings: inserted %d/%d facts into vec_facts; "
+                    "first insert error: %s",
+                    _inserted, _queued, _first_err,
+                )
+        except Exception as e:
+            logger.warning(
+                "_flush_fact_embeddings: aborted after %d/%d inserts: %s: %s",
+                _inserted, _queued, type(e).__name__, e,
+            )
         finally:
             self._pending_fact_embeddings = []
 

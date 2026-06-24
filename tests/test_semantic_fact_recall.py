@@ -319,3 +319,49 @@ def test_embed_api_reuses_one_pooled_session_across_calls(monkeypatch):
     assert out1 is not None and out2 is not None
     assert len(sessions_used) == 1, f"expected ONE reused session, got {len(sessions_used)}"
     assert sessions_used[0] is stub
+
+
+def test_flush_fact_embeddings_populates_vec_facts_live(tmp_path):
+    """Live integration test: real embed() against the endpoint populates vec_facts.
+
+    Gated by the embedding endpoint being up — skips offline (no container).
+    This is the test the dim-mismatch bug hid from: it runs the REAL write path
+    (no embed stub) and asserts a row lands in vec_facts. A config mismatch
+    (EMBEDDING_DIM vs the served model's true dim) makes _vec_insert raise a
+    dimension error, which would leave vec_facts empty -> this test fails.
+    """
+    import urllib.request as _ur
+    base = os.environ.get("EDUMEM_EMBEDDING_API_URL", "http://localhost:3002")
+    url = f"{base.rstrip('/')}/v1/embeddings"
+    try:
+        req = _ur.Request(url, data=b'{"model":"x","input":["hi"]}',
+                          headers={"Content-Type": "application/json"})
+        with _ur.urlopen(req, timeout=4) as r:
+            if r.status != 200:
+                return  # endpoint not really serving; skip
+    except Exception:
+        return  # no container; skip silently
+
+    # Real embed path: do NOT set EDUMEM_NO_EMBEDDINGS for this test.
+    os.environ.pop("EDUMEM_NO_EMBEDDINGS", None)
+    os.environ.setdefault("EDUMEM_EMBEDDING_API_URL", base)
+    os.environ.setdefault("EDUMEM_EMBEDDING_MODEL", "Alibaba-NLP/gte-modernbert-base")
+
+    import importlib
+    import edumem.core.embeddings as _e
+    importlib.reload(_e)  # pick up EMBEDDING_DIM for the configured model
+    from edumem.core import beam as _b
+    importlib.reload(_b)
+    beam = _b.BeamMemory(session_id="live", db_path=tmp_path / "live.db")
+    try:
+        beam._insert_fact("live", 1, "metric", "svc_latency_ms", "250ms",
+                          "Service latency settled at 250ms after the cache layer.", 0.5,
+                          source_memory_id="lm1")
+        beam._flush_fact_embeddings()
+        n_vec = beam.conn.execute("SELECT COUNT(*) FROM vec_facts").fetchone()[0]
+        assert n_vec >= 1, (
+            f"vec_facts empty after flush (EMBEDDING_DIM={_e.EMBEDDING_DIM}); "
+            f"likely a model/dim config mismatch the silent except:pass hid."
+        )
+    finally:
+        beam.conn.close()

@@ -106,6 +106,8 @@ def _get_embedding_dim(model_name: str) -> int:
         "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2": 384,
         "sentence-transformers/all-MiniLM-L6-v2": 384,
         "sentence-transformers/paraphrase-multilingual-mpnet-base-v2": 768,
+        # --- gte-modernbert (Alibaba-NLP, served by the OpenVINO container) ---
+        "Alibaba-NLP/gte-modernbert-base": 768,
         # --- Multilingual BGE ---
         "BAAI/bge-m3": 1024,            # M3: multilingual (100+ langs), 1024-dim
         "BAAI/bge-multilingual-gemma2": 3584,
