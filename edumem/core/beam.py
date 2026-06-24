@@ -24,6 +24,8 @@ import logging
 import threading
 import math
 
+import requests
+
 logger = logging.getLogger(__name__)
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Optional, Any, Set, Union
@@ -2369,6 +2371,71 @@ def _rrf_fuse(ranked_lists: list[list], k: int = 60) -> list:
     # Sort by descending score
     sorted_items = sorted(scores.items(), key=lambda x: x[1], reverse=True)
     return [item for item, _ in sorted_items]
+
+
+# Connection-pooled HTTP session for the cross-encoder reranker (keep-alive,
+# TCP reuse). Created once at module import.
+_FUSION_RERANK_SESSION = requests.Session()
+
+
+def _fact_render_text(fact) -> str:
+    """Extract the readable text for a fused fact.
+
+    Single source of truth shared by the cross-encoder reranker (to score
+    candidates) and the fusion context renderer (to build the prompt lines),
+    so a fact is scored on exactly the text it will be shown as.
+
+    Mirrors the body-extraction switch historically inlined in
+    `_memoria_fused_retrieve`'s render loop.
+    """
+    if not isinstance(fact, dict):
+        return str(fact)
+    if "sequence" in fact:  # chrono / sequence specialist
+        return str(fact.get("sequence", ""))
+    if "date" in fact:  # timeline specialist
+        return f"[{fact.get('date', '')}] {str(fact.get('description', ''))[:200]}"
+    if "predicate" in fact:  # entity KG specialist
+        return f"{fact.get('subject', '')} {fact.get('predicate', '')} {fact.get('object', '')}"
+    if "object" in fact:  # negation specialist
+        return f"user said never/not: {fact.get('object', '')}"
+    if "key" in fact:  # fact specialist
+        return f"{fact.get('key', '')}: {fact.get('value', '')}"
+    return ", ".join(f"{k}: {v}" for k, v in fact.items() if not k.startswith("_"))
+
+
+def _fusion_rerank(query: str, fact_texts: list) -> list | None:
+    """Cross-encoder rerank of fused MEMORIA facts.
+
+    POSTs to the reranker endpoint with `{"query": ..., "texts": [...]}` and
+    returns the parsed `[{"index": int, "score": float}, ...]` list. Returns
+    `None` on ANY failure (endpoint down, timeout, malformed response, empty
+    input, feature disabled) so callers fall through to the RRF-fused order
+    untouched. This is the single seam a test stubs to exercise the wiring
+    without a network.
+
+    Gated by `EDUMEM_FUSION_RERANK` (default ON; set to `0`/`false`/`off` to
+    disable). Endpoint from `EDUMEM_RERANKER_URL` (default
+    `http://localhost:3002/rerank`).
+    """
+    if _env_disabled("EDUMEM_FUSION_RERANK"):
+        return None
+    if not fact_texts:
+        return None
+    reranker_url = os.environ.get("EDUMEM_RERANKER_URL", "http://localhost:3002/rerank")
+    try:
+        resp = _FUSION_RERANK_SESSION.post(
+            reranker_url,
+            json={"query": query, "texts": fact_texts},
+            timeout=5,
+        )
+        resp.raise_for_status()
+        scores = resp.json()
+        if not isinstance(scores, list):
+            return None
+        return scores
+    except Exception:
+        # Optional feature: any failure degrades silently to RRF order.
+        return None
 
 
 class BeamMemory:
@@ -5301,26 +5368,9 @@ Now respond with ONLY the JSON array, no explanation."""
         # with its [MSGIDX:N] anchor when a message index is available.
         final_context_lines = []
         for specialist_name, fact in final_items:
-            if not isinstance(fact, dict):
-                final_context_lines.append(str(fact))
-                continue
-            idx = _item_msg_idx(fact)
+            idx = _item_msg_idx(fact) if isinstance(fact, dict) else None
             tag = f"[MSGIDX:{idx}] " if idx is not None else ""
-            if "sequence" in fact:  # chrono / sequence specialist
-                body = f"{fact.get('sequence', '')}"
-            elif "date" in fact:  # timeline specialist
-                body = f"[{fact.get('date', '')}] {str(fact.get('description', ''))[:200]}"
-            elif "predicate" in fact:  # entity KG specialist
-                body = f"{fact.get('subject', '')} {fact.get('predicate', '')} {fact.get('object', '')}"
-            elif "object" in fact:  # negation specialist
-                body = f"user said never/not: {fact.get('object', '')}"
-            elif "key" in fact:  # fact specialist
-                body = f"{fact.get('key', '')}: {fact.get('value', '')}"
-            else:
-                body = ", ".join(
-                    f"{k}: {v}" for k, v in fact.items() if not k.startswith("_")
-                )
-            line = f"{tag}{body}".strip()
+            line = f"{tag}{_fact_render_text(fact)}".strip()
             if line:
                 final_context_lines.append(line)
 
