@@ -1903,13 +1903,14 @@ def _in_memory_vec_search(conn: sqlite3.Connection, query_embedding: np.ndarray,
     return results[:k]
 
 
-def _effective_vec_type(conn: sqlite3.Connection) -> str:
-    """Re-detect the actual vector type used by vec_episodes."""
-    if not _vec_available(conn):
+def _effective_vec_type(conn: sqlite3.Connection, table: str = "vec_episodes") -> str:
+    """Re-detect the actual vector type used by the named vec0 table."""
+    if not _vec_available(conn, table=table):
         return "float32"
     try:
         row = conn.execute(
-            "SELECT sql FROM sqlite_master WHERE type='table' AND name='vec_episodes'"
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+            (table,),
         ).fetchone()
         if row and "int8" in row[0]:
             return "int8"
