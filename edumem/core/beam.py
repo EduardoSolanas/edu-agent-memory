@@ -1964,14 +1964,14 @@ def _vec_insert(conn: sqlite3.Connection, rowid: int, embedding: List[float], ta
         conn.commit()
 
 
-def _vec_search(conn: sqlite3.Connection, embedding: List[float], k: int = 20) -> List[Dict]:
-    """Search sqlite-vec and return rowids with distances.
+def _vec_search(conn: sqlite3.Connection, embedding: List[float], k: int = 20, table: str = "vec_episodes") -> List[Dict]:
+    """Search the named sqlite-vec table and return rowids with distances.
 
     Normalizes the query embedding to unit length before quantization so
     distances are commensurate with the stored int8 vectors (which are also
     unit-normalized at insert time — see _vec_insert).
     """
-    vec_type = _effective_vec_type(conn)
+    vec_type = _effective_vec_type(conn, table=table)
     # Normalize to unit length before quantization
     # (sqlite-vec 0.1.9 'unit' param fails at 1024-dim)
     import numpy as _np
@@ -1987,18 +1987,18 @@ def _vec_search(conn: sqlite3.Connection, embedding: List[float], k: int = 20) -
     k = int(k)
     if vec_type == "bit":
         rows = conn.execute(
-            f"SELECT rowid, distance FROM vec_episodes WHERE embedding MATCH vec_quantize_binary(?) ORDER BY distance LIMIT {k}",
+            f"SELECT rowid, distance FROM {table} WHERE embedding MATCH vec_quantize_binary(?) ORDER BY distance LIMIT {k}",
             (emb_json,)
         ).fetchall()
     elif vec_type == "int8":
         rows = conn.execute(
-            f'SELECT rowid, distance FROM vec_episodes WHERE embedding MATCH vec_quantize_int8(?, "unit") AND k={k} ORDER BY distance',
+            f'SELECT rowid, distance FROM {table} WHERE embedding MATCH vec_quantize_int8(?, "unit") AND k={k} ORDER BY distance',
             (emb_json,)
         ).fetchall()
     else:
         rows = conn.execute(
-            f"SELECT rowid, distance FROM vec_episodes WHERE embedding MATCH ? ORDER BY distance LIMIT {k}",
-            (emb_json,)
+            f"SELECT rowid, distance FROM {table} WHERE embedding MATCH ? ORDER BY distance LIMIT {k}",
+            (emb_json_)
         ).fetchall()
     return [{"rowid": r["rowid"], "distance": r["distance"]} for r in rows]
 

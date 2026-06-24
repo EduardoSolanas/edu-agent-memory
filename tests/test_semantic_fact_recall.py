@@ -77,3 +77,30 @@ def test_vec_insert_targets_named_table(tmp_path):
         assert in_episodes is None, "row leaked into vec_episodes — wrong table targeted"
     finally:
         beam.conn.close()
+
+
+def test_vec_search_targets_named_table(tmp_path):
+    """_vec_search(table=...) searches the named table.
+
+    Non-vacuous: insert a vector into vec_facts only, then _vec_search with
+    table='vec_facts' must find it while table='vec_episodes' must NOT.
+    Reverting the param (hardcoded vec_episodes) makes the facts search miss.
+    """
+    import pytest
+    from edumem.core.beam import _vec_insert, _vec_search
+    from edumem.core.embeddings import EMBEDDING_DIM
+
+    beam = _new_beam(tmp_path)
+    try:
+        if not _vec_available(beam.conn, table="vec_facts"):
+            pytest.skip("sqlite-vec not available")
+        vec = [0.01] * EMBEDDING_DIM
+        _vec_insert(beam.conn, 777, vec, table="vec_facts")
+        # Searching vec_facts must find rowid 777.
+        hits_facts = _vec_search(beam.conn, vec, k=5, table="vec_facts")
+        assert any(h["rowid"] == 777 for h in hits_facts), "vec_facts search missed the inserted row"
+        # Searching vec_episodes must NOT find it (it was inserted into vec_facts only).
+        hits_ep = _vec_search(beam.conn, vec, k=5, table="vec_episodes")
+        assert not any(h["rowid"] == 777 for h in hits_ep), "row leaked across tables"
+    finally:
+        beam.conn.close()
