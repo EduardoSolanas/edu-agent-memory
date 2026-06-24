@@ -1921,8 +1921,8 @@ def _effective_vec_type(conn: sqlite3.Connection, table: str = "vec_episodes") -
     return "float32"
 
 
-def _vec_insert(conn: sqlite3.Connection, rowid: int, embedding: List[float]):
-    """Insert embedding into sqlite-vec table with quantization via SQL functions.
+def _vec_insert(conn: sqlite3.Connection, rowid: int, embedding: List[float], table: str = "vec_episodes"):
+    """Insert embedding into the named sqlite-vec table with quantization via SQL functions.
 
     Manually normalizes the embedding to unit length before quantization.
     ``vec_quantize_int8(x, 'unit')`` in sqlite-vec 0.1.9 fails to normalize
@@ -1930,7 +1930,7 @@ def _vec_insert(conn: sqlite3.Connection, rowid: int, embedding: List[float]):
     vectors at high dimensions).  Pre-normalizing works around the bug until
     upstream sqlite-vec ships a fix.
     """
-    vec_type = _effective_vec_type(conn)
+    vec_type = _effective_vec_type(conn, table=table)
     # Normalize to unit length before quantization
     # (sqlite-vec 0.1.9 'unit' param fails at 1024-dim)
     import numpy as _np
@@ -1941,17 +1941,17 @@ def _vec_insert(conn: sqlite3.Connection, rowid: int, embedding: List[float]):
     emb_json = json.dumps(emb_arr.tolist())
     if vec_type == "bit":
         conn.execute(
-            "INSERT INTO vec_episodes(rowid, embedding) VALUES (?, vec_quantize_binary(?))",
+            f"INSERT INTO {table}(rowid, embedding) VALUES (?, vec_quantize_binary(?))",
             (rowid, emb_json)
         )
     elif vec_type == "int8":
         conn.execute(
-            "INSERT INTO vec_episodes(rowid, embedding) VALUES (?, vec_quantize_int8(?, 'unit'))",
+            f"INSERT INTO {table}(rowid, embedding) VALUES (?, vec_quantize_int8(?, 'unit'))",
             (rowid, emb_json)
         )
     else:
         conn.execute(
-            "INSERT INTO vec_episodes(rowid, embedding) VALUES (?, ?)",
+            f"INSERT INTO {table}(rowid, embedding) VALUES (?, ?)",
             (rowid, emb_json)
         )
     # Ensure the insert is committed even when the caller's connection

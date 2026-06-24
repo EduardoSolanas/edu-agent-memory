@@ -17,30 +17,63 @@ def _new_beam(tmp_path: Path) -> BeamMemory:
 
 
 def test_vec_available_checks_the_named_table(tmp_path):
-    """_vec_available(table=...) probes the given table, not vec_episodes."""
+    """_vec_available(table=...) probes the named table, not vec_episodes.
+
+    Non-vacuous: vec_facts must resolve True (it exists), a bogus table must
+    resolve False. Both differ from the no-table-arg default behavior only if
+    the param is actually threaded — reverting the param makes the bogus-table
+    probe query vec_episodes and wrongly return True.
+    """
     beam = _new_beam(tmp_path)
     try:
-        # vec_episodes and vec_facts both exist after init_beam (beam.py:738, 1059).
-        assert _vec_available(beam.conn, table="vec_episodes") in (True, False)
-        # vec_facts is created in init_beam too; probing it must not raise and
-        # must reflect ITS existence, independent of vec_episodes.
-        assert _vec_available(beam.conn, table="vec_facts") in (True, False)
-        # A nonexistent table must return False, never raise.
+        assert _vec_available(beam.conn, table="vec_facts") is True
+        # A nonexistent table must return False, never raise. If the param were
+        # ignored (hardcoded to vec_episodes), this would wrongly return True.
         assert _vec_available(beam.conn, table="vec_does_not_exist") is False
     finally:
         beam.conn.close()
 
 
 def test_effective_vec_type_reads_named_table_schema(tmp_path):
-    """_effective_vec_type(table=...) reads the named table's schema, not vec_episodes."""
+    """_effective_vec_type(table=...) reads the named table's schema.
+
+    Non-vacuous: a nonexistent table returns the float32 default (because
+    _vec_available returns False for it); vec_facts returns a real type.
+    Reverting the param makes the bogus-table call read vec_episodes and
+    return a non-default type.
+    """
     beam = _new_beam(tmp_path)
     try:
-        # Both tables created with the same effective_vec_type in init_beam, so both
-        # resolve to the same type string. The point: the call must not raise and
-        # must accept the table kwarg.
-        t_episodes = _effective_vec_type(beam.conn, table="vec_episodes")
         t_facts = _effective_vec_type(beam.conn, table="vec_facts")
-        assert t_episodes in ("bit", "int8", "float32")
-        assert t_facts == t_episodes  # both created together -> same type
+        assert t_facts in ("bit", "int8", "float32")  # real table -> real type
+        # Nonexistent table -> _vec_available False -> float32 default.
+        assert _effective_vec_type(beam.conn, table="vec_does_not_exist") == "float32"
+    finally:
+        beam.conn.close()
+
+
+def test_vec_insert_targets_named_table(tmp_path):
+    """_vec_insert(table=...) actually targets the named table.
+
+    Non-vacuous: inserting a correct-dim vector into vec_facts must SUCCEED and
+    the row must be readable back FROM vec_facts (not vec_episodes). This fails
+    if the param is ignored (row lands in vec_episodes) or if the table is
+    hardcoded.
+    """
+    from edumem.core.beam import _vec_insert
+    from edumem.core.embeddings import EMBEDDING_DIM
+
+    beam = _new_beam(tmp_path)
+    try:
+        if not _vec_available(beam.conn, table="vec_facts"):
+            import pytest
+            pytest.skip("sqlite-vec not available")
+        vec = [0.01] * EMBEDDING_DIM
+        _vec_insert(beam.conn, 12345, vec, table="vec_facts")
+        # Row must be in vec_facts, NOT in vec_episodes.
+        in_facts = beam.conn.execute("SELECT rowid FROM vec_facts WHERE rowid=12345").fetchone()
+        in_episodes = beam.conn.execute("SELECT rowid FROM vec_episodes WHERE rowid=12345").fetchone()
+        assert in_facts is not None, "row not in vec_facts — table param ignored"
+        assert in_episodes is None, "row leaked into vec_episodes — wrong table targeted"
     finally:
         beam.conn.close()
