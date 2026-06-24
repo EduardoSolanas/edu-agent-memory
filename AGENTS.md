@@ -41,6 +41,26 @@ known/unknown — so you don't rediscover it or draw wrong conclusions.
   prior judge results by `tools/generate_beam_fixture.py`. There is **no live
   judge** — grading is deterministic nugget/absence/order checks.
 
+### Measurement vs regression-guard: TWO DIFFERENT TOOLS — do not confuse them
+
+There are two pipelines that run the real system on BEAM 100K, and they answer
+different questions. Picking the wrong one wastes a run.
+
+| | **Full runner** (the MEASUREMENT) | **Live e2e test** (the REGRESSION GUARD) |
+|---|---|---|
+| Invoke | `python -m tools.evaluate_beam_end_to_end ...` (CLI, not pytest) | `EDUMEM_E2E=1 python -m pytest tests/test_beam_e2e_full.py` |
+| Grading | **Live LLM judge** (`deepseek-v4-flash`), 0-to-1 partial credit | **Static expectations** (deterministic nugget/absence/order) |
+| Output | Writes timestamped `results/<YYYYMMDD_HHMMSS>_<model>/` with `beam_e2e_results.json`, `beam_e2e_summary.json` (per-ability 0-1 scores), `paired_outcomes.jsonl`, `beam_question_validations.jsonl` | Prints pass/fail + a JSON artifact to a temp path |
+| Use for | **Measuring whether a change moved recall/quality** (the 0.654 baseline in this file came from here). Diff a new run's `beam_e2e_summary.json` against a prior baseline. | Catching regressions fast (pass/fail, no judge latency, ~11-17 min) |
+| Cost | Live judge round-trips; slower | No judge; faster |
+
+**The e2e test's pass/fail (e.g. 10/20) is NOT the project's quality score.**
+The quality score is the full runner's per-ability `avg_score` (0-1) and
+`micro_overall`. Base fix-prioritization and "did the change help" decisions on
+the **full runner**, and use the **e2e test** only as a fast regression guard
+between changes. Mixing them up leads to optimizing a static guard instead of
+real recall — a trap hit once already.
+
 ### Running the live e2e
 Requires the reranker up on `http://localhost:3002/rerank` and the NAN LLM
 endpoint. The API key lives in repo `.env` as `NAN_APY_KEY`. Each shell call is
