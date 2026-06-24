@@ -520,8 +520,26 @@ def _get_connection(db_path: Path = None) -> sqlite3.Connection:
             try:
                 conn.enable_load_extension(True)
                 sqlite_vec.load(conn)
+            except AttributeError as e:
+                # FATAL: sqlite-vec is installed but this Python was built
+                # WITHOUT --enable-loadable-sqlite-extensions, so enable_load_extension
+                # is absent and the vec0 module cannot be registered. vec tables
+                # (vec_episodes, vec_facts, vec_working) become unqueryable -> the
+                # entire vector-recall path (episodic dense, working-memory, semantic
+                # fact) silently no-ops. Fail hard rather than degrade: a silent
+                # recall regression here is far worse than a loud startup error.
+                # Fix: rebuild Python with --enable-loadable-sqlite-extensions.
+                raise RuntimeError(
+                    "sqlite-vec is installed but this Python lacks "
+                    "enable_load_extension (rebuilt without "
+                    "--enable-loadable-sqlite-extensions). vec tables are "
+                    "unavailable; vector recall cannot work. Rebuild Python "
+                    "with --enable-loadable-sqlite-extensions."
+                ) from e
             except Exception:
-                pass  # Some environments don't support load_extension
+                # Any other load failure is also fatal for the same reason.
+                logger.exception("sqlite_vec.load() failed; aborting.")
+                raise
         _thread_local.conn = conn
         _thread_local.db_path = str(path)
     return _thread_local.conn

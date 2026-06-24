@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 from pathlib import Path
 
 # Suppress embeddings for the offline unit tests in this file. The write-path
@@ -365,3 +366,41 @@ def test_flush_fact_embeddings_populates_vec_facts_live(tmp_path):
         )
     finally:
         beam.conn.close()
+
+
+def test_vec_load_failure_is_fatal_not_silent(monkeypatch, tmp_path):
+    """If the Python build lacks enable_load_extension, beam init must BLOW UP,
+    not silently degrade (the bug class that hid the dim mismatch for a full run).
+
+    Non-vacuous: stub enable_load_extension to raise AttributeError (simulating a
+    Python built without --enable-loadable-sqlite-extensions), open a beam, and
+    assert RuntimeError. Reverting to except: pass makes this FAIL — beam init
+    would succeed and vector recall would silently no-op.
+    """
+    import pytest
+    import edumem.core.beam as _b
+
+    # Force sqlite_vec to look importable so the guarded block runs.
+    monkeypatch.setattr(_b, "_SQLITE_VEC_AVAILABLE", True)
+
+    # Make enable_load_extension raise AttributeError on the next connection.
+    real_connect = sqlite3.connect
+
+    class _NoExtConn:
+        def __init__(self, real):
+            self._real = real
+        def __getattr__(self, name):
+            if name == "enable_load_extension":
+                raise AttributeError("no enable_load_extension on this build")
+            return getattr(self._real, name)
+
+    def _wrapped_connect(*a, **k):
+        return _NoExtConn(real_connect(*a, **k))
+    monkeypatch.setattr(sqlite3, "connect", _wrapped_connect)
+
+    # Reset thread-local so a fresh connection is built.
+    _b._thread_local.conn = None
+    _b._thread_local.db_path = None
+
+    with pytest.raises(RuntimeError, match="enable_load_extension"):
+        _b.BeamMemory(session_id="extlog", db_path=tmp_path / "ext.db")
