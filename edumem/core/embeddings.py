@@ -14,6 +14,11 @@ from typing import List, Optional
 from functools import lru_cache
 
 try:
+    import requests as _requests
+except ImportError:
+    _requests = None
+
+try:
     import numpy as np
 except ImportError:
     np = None
@@ -141,9 +146,19 @@ def _get_model():
 
 _EMBED_API_LOCK = threading.Lock()
 
+# Connection-pooled HTTP session for the embedding API (HTTP keep-alive, TCP/TLS
+# reuse). Created once at module import so repeated embedding calls don't pay a
+# fresh TLS handshake each time. Falls back to per-call urllib.request.urlopen
+# if `requests` is unavailable, preserving the original behavior.
+_EMBED_API_SESSION = _requests.Session() if _requests is not None else None
+
 
 def _embed_api(texts: List[str]) -> Optional[np.ndarray]:
-    """Embed texts via OpenAI-compatible API (OpenRouter or custom endpoint)."""
+    """Embed texts via OpenAI-compatible API (OpenRouter or custom endpoint).
+
+    Uses a pooled `requests.Session` for connection reuse (keep-alive); falls
+    back to per-call `urllib.request.urlopen` when `requests` is unavailable.
+    """
     global _API_CALL_COUNT
     # Require API key for OpenRouter; custom endpoints may not need one.
     base_url = os.environ.get("EDUMEM_EMBEDDING_API_URL", "https://openrouter.ai/api/v1")
@@ -155,10 +170,11 @@ def _embed_api(texts: List[str]) -> Optional[np.ndarray]:
         url = f"{base_url.rstrip('/')}/v1/embeddings"
     else:
         url = f"{base_url.rstrip('/')}/embeddings"
-    payload = json.dumps({
+    payload_dict = {
         "model": _DEFAULT_MODEL,
         "input": texts,
-    }).encode()
+    }
+    payload = json.dumps(payload_dict).encode()  # bytes for the urllib fallback
 
     headers = {
         "Content-Type": "application/json",
@@ -168,18 +184,32 @@ def _embed_api(texts: List[str]) -> Optional[np.ndarray]:
     if _OPENAI_API_KEY:
         headers["Authorization"] = f"Bearer {_OPENAI_API_KEY}"
 
+    # Custom CA bundle (NixOS, enterprise proxies, etc.). SSL_CERT_FILE takes
+    # priority, then REQUESTS_CA_BUNDLE. requests honors both via verify=;
+    # the urllib fallback uses ssl.create_default_context().
+    cert_file = os.environ.get("SSL_CERT_FILE") or os.environ.get("REQUESTS_CA_BUNDLE")
+
     with _EMBED_API_LOCK:
         for attempt in range(3):
             try:
-                req = urllib.request.Request(url, data=payload, headers=headers)
-                ctx = ssl.create_default_context()
-                # Support custom CA bundles (NixOS, enterprise proxies, etc.)
-                # SSL_CERT_FILE takes priority, then REQUESTS_CA_BUNDLE.
-                cert_file = os.environ.get("SSL_CERT_FILE") or os.environ.get("REQUESTS_CA_BUNDLE")
-                if cert_file:
-                    ctx.load_verify_locations(cert_file)
-                with urllib.request.urlopen(req, timeout=30, context=ctx) as resp:
-                    data = json.loads(resp.read())
+                if _EMBED_API_SESSION is not None:
+                    # Pooled path: one keep-alive Session reused across calls
+                    # (no per-call TCP/TLS handshake). requests honors
+                    # REQUESTS_CA_BUNDLE automatically; SSL_CERT_FILE via verify.
+                    verify = cert_file if (cert_file and os.environ.get("SSL_CERT_FILE")) else True
+                    resp = _EMBED_API_SESSION.post(
+                        url, json=payload_dict, headers=headers, timeout=30, verify=verify,
+                    )
+                    resp.raise_for_status()
+                    data = resp.json()
+                else:
+                    # Fallback: per-call urllib (no connection reuse).
+                    req = urllib.request.Request(url, data=payload, headers=headers)
+                    ctx = ssl.create_default_context()
+                    if cert_file:
+                        ctx.load_verify_locations(cert_file)
+                    with urllib.request.urlopen(req, timeout=30, context=ctx) as resp:
+                        data = json.loads(resp.read())
                 embeddings = [item["embedding"] for item in data["data"]]
                 _API_CALL_COUNT += 1
                 return np.array(embeddings, dtype=np.float32)

@@ -276,3 +276,46 @@ def test_fusion_surfaces_semantic_only_fact(tmp_path):
             beam.conn.close()
     finally:
         _e.available, _e.embed, _e.embed_query = _e_orig_available, _e_orig_embed, _e_orig_eq
+
+
+def test_embed_api_reuses_one_pooled_session_across_calls(monkeypatch):
+    """_embed_api must reuse a single module-level requests.Session (keep-alive).
+
+    Non-vacuous: stub the session's .post so no network is hit; call _embed_api
+    twice; assert both calls went through the SAME session instance (id match)
+    — proving connection pooling, not a fresh Session per call. Reverting to
+    per-call urlopen makes the second assertion fail (no shared session).
+    """
+    import edumem.core.embeddings as _e
+
+    # Point at a custom endpoint so the API-key branch is skipped.
+    monkeypatch.setenv("EDUMEM_EMBEDDING_API_URL", "http://embedding.test.local")
+    monkeypatch.setenv("EDUMEM_EMBEDDING_MODEL", "test-model")
+
+    # Force the module to create its pooled session now, then stub its .post.
+    sessions_used = []
+
+    class _FakeResp:
+        status_code = 200
+        def raise_for_status(self): return None
+        def json(self):
+            return {"data": [{"embedding": [0.0, 0.0, 0.0]}]}
+
+    # Replace the module-level pooled session with a stub that records itself.
+    class _StubSession:
+        def __init__(self):
+            sessions_used.append(self)
+        def post(self, url, json=None, headers=None, timeout=None, **kw):
+            self.last_url = url
+            return _FakeResp()
+
+    stub = _StubSession()
+    monkeypatch.setattr(_e, "_EMBED_API_SESSION", stub)
+
+    out1 = _e._embed_api(["hello"])
+    out2 = _e._embed_api(["world"])
+
+    # Both calls succeeded and used the SAME (single) session instance.
+    assert out1 is not None and out2 is not None
+    assert len(sessions_used) == 1, f"expected ONE reused session, got {len(sessions_used)}"
+    assert sessions_used[0] is stub

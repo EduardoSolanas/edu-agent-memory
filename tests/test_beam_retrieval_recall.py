@@ -20,7 +20,6 @@ import sys
 from pathlib import Path
 
 import pytest
-import requests
 
 # Gate: skip entire module unless explicitly enabled
 pytestmark = pytest.mark.skipif(
@@ -52,64 +51,12 @@ from tools.evaluate_beam_end_to_end import (
 )
 from edumem.core.beam import BeamMemory
 
-# ============================================================
-#  Connection-pooled embedding: monkey-patch _embed_api to use
-#  a requests.Session (HTTP keep-alive, TCP connection reuse)
-# ============================================================
-
-_EMBED_SESSION = requests.Session()
-
-from edumem.core import embeddings as _emb_mod
-
-_orig_embed_api = _emb_mod._embed_api
-
-
-def _pooled_embed_api(texts):
-    """Replacement for edumem.core.embeddings._embed_api with connection pooling."""
-    import numpy as _np
-    import os as _os
-
-    base_url = _os.environ.get("EDUMEM_EMBEDDING_API_URL", "https://openrouter.ai/api/v1")
-    is_custom = "openrouter.ai" not in base_url
-
-    if is_custom and not base_url.endswith("/v1"):
-        url = f"{base_url.rstrip('/')}/v1/embeddings"
-    else:
-        url = f"{base_url.rstrip('/')}/embeddings"
-
-    payload = {
-        "model": _emb_mod._DEFAULT_MODEL,
-        "input": texts,
-    }
-    headers = {
-        "Content-Type": "application/json",
-        "HTTP-Referer": "https://edumem.site",
-        "X-Title": "edumem Embedding",
-    }
-    api_key = _emb_mod._OPENAI_API_KEY
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
-
-    with _emb_mod._EMBED_API_LOCK:
-        for attempt in range(3):
-            try:
-                resp = _EMBED_SESSION.post(url, json=payload, headers=headers, timeout=30)
-                resp.raise_for_status()
-                data = resp.json()
-                embeddings = [item["embedding"] for item in data["data"]]
-                _emb_mod._API_CALL_COUNT += 1
-                return _np.array(embeddings, dtype=_np.float32)
-            except Exception as e:
-                if "429" in str(e) or "rate" in str(e).lower():
-                    import time as _time
-                    _time.sleep(2 ** attempt)
-                    continue
-                return None
-
-    return None
-
-
-_emb_mod._embed_api = _pooled_embed_api
+# NOTE: connection pooling for the embedding API now lives in production
+# (`edumem.core.embeddings._EMBED_API_SESSION`, a module-level requests.Session).
+# This module no longer shadows `_embed_api` — the import-time monkey-patch that
+# did so was process-wide pollution (it replaced _embed_api for every test in
+# the suite, not just this one). The live benchmark now uses the real pooled
+# path directly.
 
 # NOTE: the cross-encoder reranker now lives in the real pipeline
 # (`edumem.core.beam._fusion_rerank`, called from `_memoria_fused_retrieve`),
