@@ -2789,27 +2789,6 @@ def _inject_temporal_cheatsheet(memories: list, question: str) -> str:
     return "\n".join(lines)
 
 
-def _apply_rerank_scores(memories: list, scores: list, top_n: int) -> list:
-    """Merge cross-encoder scores into memories and tier-sort.
-
-    Only a prefix of `memories` is sent to the reranker, so only those carry a
-    `rerank_score`. Cross-encoder scores and the original 0-1 `score` are on
-    different scales, so we sort in two tiers: every reranked memory ranks above
-    the un-reranked tail; within each tier we sort by the relevant score. This
-    prevents an unreviewed tail memory with a high raw score from leapfrogging a
-    reranked candidate.
-    """
-    for item in scores:
-        idx = item["index"]
-        if idx < len(memories):
-            memories[idx]["rerank_score"] = item["score"]
-    memories.sort(
-        key=lambda m: (1, m["rerank_score"]) if "rerank_score" in m else (0, m.get("score", 0)),
-        reverse=True,
-    )
-    return memories[:top_n]
-
-
 def _probe_reranker(url: str) -> dict:
     """Check reranker availability with a real request."""
     import requests as _rr
@@ -2820,47 +2799,6 @@ def _probe_reranker(url: str) -> dict:
         return {"ok": True, "status_code": resp.status_code, "response_type": type(payload).__name__}
     except Exception as exc:
         return {"ok": False, "error": type(exc).__name__, "message": str(exc)}
-
-
-def _rerank(question: str, memories: list, top_n: int = 30, diag: dict | None = None) -> list:
-    """Re-score candidates with local cross-encoder reranker."""
-    import requests as _rr
-    _reranker_url = os.environ.get("EDUMEM_RERANKER_URL", "http://localhost:3002/rerank")
-    texts = [m.get("content", "")[:500] for m in memories[:top_n * 2]]
-    if not texts:
-        return memories
-    if diag is not None:
-        rerank_diag = diag.setdefault("reranker", {
-            "url": _reranker_url,
-            "calls": 0,
-            "successes": 0,
-            "failures": 0,
-            "fallbacks": 0,
-            "scores_recorded": 0,
-            "errors": [],
-            "health": None,
-        })
-        rerank_diag["calls"] += 1
-    else:
-        rerank_diag = None
-    try:
-        resp = _rr.post(_reranker_url, json={"query": question, "texts": texts}, timeout=5)
-        resp.raise_for_status()
-        scores = resp.json()
-        memories = _apply_rerank_scores(memories, scores, top_n)
-        if rerank_diag is not None:
-            rerank_diag["successes"] += 1
-            rerank_diag["scores_recorded"] += len(scores) if isinstance(scores, list) else 0
-    except Exception as exc:
-        if rerank_diag is not None:
-            rerank_diag["failures"] += 1
-            rerank_diag["fallbacks"] += 1
-            rerank_diag.setdefault("errors", []).append({
-                "class": type(exc).__name__,
-                "message": str(exc),
-            })
-        return memories[:top_n]
-    return memories
 
 
 def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
@@ -3039,12 +2977,11 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
     except Exception:
         pass  # MEMORIA retrieval is best-effort
 
-    # ---- Reranking (Phase 5.5: local cross-encoder) ----
-    # Ordering (EO) is graded by tau-b over ALL items, so keep a wider reranked set
-    # for ordering queries -- the char-budgeted context builder trims later. A flat
-    # top_k cap here would drop topic mentions and make the ordering incomplete.
-    _rerank_top_n = top_k * 3 if is_ordering_query(question) else top_k
-    memories = _rerank(question, memories, top_n=_rerank_top_n, diag=diag)
+    # Cross-encoder reranking now happens inside `_memoria_fused_retrieve`
+    # (edumem.core.beam._fusion_rerank), reordering the fused MEMORIA facts by
+    # query relevance. The harness no longer reranks the message-level memories
+    # here: that re-ranked the bundled MEMORIA blob (memories[0]) rather than the
+    # facts inside it, so it could not surface the right facts.
 
     # ---- EO: Sort by message_index for ordering queries ----
     if is_ordering_query(question):
