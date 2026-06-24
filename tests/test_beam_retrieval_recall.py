@@ -111,113 +111,11 @@ def _pooled_embed_api(texts):
 
 _emb_mod._embed_api = _pooled_embed_api
 
-# ============================================================
-#  Cross-encoder reranker: monkey-patch _memoria_fused_retrieve
-#  to add a reranker step after RRF fusion (Hindsight pattern:
-#  RRF → cross-encoder reranker → token-limit trim)
-# ============================================================
-
-_RERANK_SESSION = requests.Session()
-_RERANK_AVAILABLE = False
-try:
-    _RERANK_SESSION.get("http://localhost:3002/health", timeout=2)
-    _RERANK_AVAILABLE = True
-except Exception:
-    pass
-
-from edumem.core.beam import BeamMemory as _BeamMemory
-
-_orig_memoria_fused = _BeamMemory._memoria_fused_retrieve
-
-
-def _patched_memoria_fused(self, query: str, top_k: int = 10) -> dict:
-    """Original RRF fusion + cross-encoder reranker after fusion."""
-    result = _orig_memoria_fused(self, query, top_k=top_k)
-    facts = result.get("facts", [])
-    if not facts:
-        return result
-
-    # Convert facts to text for reranker scoring
-    texts = []
-    for f in facts:
-        if isinstance(f, dict):
-            parts = []
-            for k, v in f.items():
-                if k.startswith("_"):
-                    continue
-                if isinstance(v, (str, int, float)):
-                    parts.append(str(v))
-                elif isinstance(v, list) and all(isinstance(x, str) for x in v):
-                    parts.extend(v)
-            texts.append(" | ".join(parts))
-        else:
-            texts.append(str(f))
-
-    if not _RERANK_AVAILABLE:
-        return result
-
-    try:
-        rerank_url = "http://localhost:3002/rerank"
-        resp = _RERANK_SESSION.post(
-            rerank_url,
-            json={"query": query, "texts": texts},
-            timeout=30,
-        )
-        resp.raise_for_status()
-        rerank_data = resp.json()
-        # rerank returns sorted results: [{"index": idx, "score": score}, ...]
-        # Reorder facts by reranker score descending
-        score_map = {item["index"]: item["score"] for item in rerank_data}
-        scored = [(score_map.get(i, 0.0), i, f) for i, f in enumerate(facts)]
-        scored.sort(key=lambda x: (-x[0], x[1]))
-        reranked_facts = [item[2] for item in scored[:top_k]]
-
-        # Rebuild context string matching _memoria_fused_retrieve's format
-        from edumem.core import query_mode as _qmode
-        def _item_msg_idx(item):
-            if not isinstance(item, dict):
-                return None
-            return (item.get("message_idx") or item.get("msg_idx")
-                    or item.get("updated_msg_idx") or item.get("valid_from_msg_idx"))
-
-        if _qmode.is_ordering_query(query):
-            reranked_facts.sort(key=lambda f: (_item_msg_idx(f) if _item_msg_idx(f) is not None else 1 << 30))
-
-        context_lines = []
-        for f in reranked_facts:
-            if not isinstance(f, dict):
-                context_lines.append(str(f))
-                continue
-            idx = _item_msg_idx(f)
-            tag = f"[MSGIDX:{idx}] " if idx is not None else ""
-            if "sequence" in f:
-                body = str(f.get("sequence", ""))
-            elif "date" in f:
-                body = f"[{f.get('date', '')}] {str(f.get('description', ''))[:200]}"
-            elif "predicate" in f:
-                body = f"{f.get('subject', '')} {f.get('predicate', '')} {f.get('object', '')}"
-            elif "object" in f and f.get("source") == "negation":
-                body = f"user said never/not: {f.get('object', '')}"
-            elif "key" in f:
-                body = f"{f.get('key', '')}: {f.get('value', '')}"
-            else:
-                body = ", ".join(f"{k}: {v}" for k, v in f.items() if not k.startswith("_"))
-            line = f"{tag}{body}".strip()
-            if line:
-                context_lines.append(line)
-
-        result["context"] = "\n".join(context_lines)
-        result["facts"] = reranked_facts
-        result["reranked"] = True
-    except Exception as e:
-        # reranker unavailable or failed; fall through to RRF-only result
-        pass
-
-    return result
-
-
-_BeamMemory._memoria_fused_retrieve = _patched_memoria_fused
-
+# NOTE: the cross-encoder reranker now lives in the real pipeline
+# (`edumem.core.beam._fusion_rerank`, called from `_memoria_fused_retrieve`),
+# so this module no longer shadows `_memoria_fused_retrieve`. The reranker
+# fires automatically when the endpoint at EDUMEM_RERANKER_URL is up; if it
+# is down, fusion degrades silently to RRF order.
 
 # ============================================================
 #  Nugget helpers

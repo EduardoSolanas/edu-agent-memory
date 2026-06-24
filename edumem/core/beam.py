@@ -5336,6 +5336,21 @@ Now respond with ONLY the JSON array, no explanation."""
                 if isinstance(fact_item, dict):
                     final_ids.add(fact_item.get("source_memory_id", key))
 
+        # ---- Cross-encoder rerank: reorder fused facts by query relevance ----
+        # Runs after RRF fusion; the EO msg_idx sort below still wins for
+        # ordering queries. None (endpoint down / disabled) keeps RRF order.
+        reranked = False
+        _fact_texts = [_fact_render_text(f) for _, f in final_items]
+        _scores = _fusion_rerank(query, _fact_texts)
+        if _scores is not None:
+            _score_map = {item["index"]: item["score"] for item in _scores}
+            # Stable enumerate index (avoids O(n^2) list.index + unhashable-dict pitfalls).
+            _indexed = list(enumerate(final_items))
+            _indexed.sort(key=lambda pair: -_score_map.get(pair[0], 0.0))
+            final_items = [item for _, item in _indexed]
+            final_facts = [f for _, f in final_items]
+            reranked = True
+
         from . import query_mode as _query_mode
 
         # Message-index extraction is specialist-aware: facts expose `message_idx`
@@ -5381,6 +5396,7 @@ Now respond with ONLY the JSON array, no explanation."""
             "facts": final_facts,
             "source": "rrf_fused",
             "source_memory_ids": list(final_ids),
+            "reranked": reranked,
             "rrf_timing": timing,
         }
 
