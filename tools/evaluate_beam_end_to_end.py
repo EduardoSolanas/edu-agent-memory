@@ -2867,7 +2867,8 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
                       conversation_messages: list = None, top_k: int = DEFAULT_TOP_K,
                       ability: str = None,
                       diag: dict | None = None,
-                      return_memories: bool = False):
+                      return_memories: bool = False,
+                      context_only: bool = False):
     """Retrieve memories and have LLM answer, with context strategy based on conversation size.
 
     Pure recall is the default. Set `EDUMEM_BENCHMARK_PURE_RECALL=0`
@@ -3329,7 +3330,11 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
             _pass2_limit = 16000 if is_ordering_query(question) else 6000
             if len(pass2_ctx) > _pass2_limit:
                 pass2_ctx = pass2_ctx[:_pass2_limit] + "...[truncated]"
-            
+
+            # context_only: return assembled pass-2 context without calling LLM
+            if context_only:
+                return pass2_ctx
+
             # Inject temporal cheatsheet for TR/EO questions
             _pass2_temporal_cheat = _inject_temporal_cheatsheet(all_mems, question)
 
@@ -3414,6 +3419,10 @@ Follow this format strictly:
             context_blocks.append("RETRIEVED MEMORIES:\n" + "\n\n".join(memory_parts))
         
         context = "\n\n".join(context_blocks) if context_blocks else "[No memories found]"
+
+    # context_only mode: return assembled context without calling the answer LLM
+    if context_only:
+        return context
 
     # If we found a direct context→value match, return it immediately (zero LLM cost)
     if context_answer:

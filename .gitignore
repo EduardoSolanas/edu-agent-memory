@@ -24,6 +24,7 @@ data/
 *.jsonl
 *.csv
 memories_dump.json
+tests/.beam_recall_cache/
 
 # Credentials / Environments
 .env
