@@ -5934,6 +5934,52 @@ Now respond with ONLY the JSON array, no explanation."""
             "source_memory_ids": list(p_ids | s_ids),
         }
 
+    def _memoria_semantic_retrieve(self, query: str, top_k: int = 10) -> dict:
+        """Semantic KNN over vec_facts (repurposed). 7th fusion specialist.
+
+        Finds facts whose key/value share no literal tokens with the query
+        (the ABS/SUM 0.000-recall case). Best-effort: returns fallback when
+        embeddings/vec unavailable. Filters to LIVE facts (valid_to_msg_idx
+        IS NULL) so superseded values never surface.
+        """
+        from . import embeddings as _e
+        if not _e.available() or not _vec_available(self.conn, table="vec_facts"):
+            return {"context": "", "facts": [], "source": "fallback"}
+        try:
+            q_emb = _e.embed_query(query)
+            if q_emb is None:
+                return {"context": "", "facts": [], "source": "fallback"}
+            hits = _vec_search(self.conn, q_emb.tolist() if hasattr(q_emb, "tolist") else list(q_emb),
+                               k=top_k * 2, table="vec_facts")
+            if not hits:
+                return {"context": "", "facts": [], "source": "fallback"}
+            rids = [h["rowid"] for h in hits]
+            qmarks = ",".join("?" * len(rids))
+            rows = self.conn.execute(
+                f"SELECT fact_type, key, value, context_snippet, previous_value, "
+                f"updated_msg_idx, version_id, source_memory_id, message_idx, "
+                f"valid_from_msg_idx, id "
+                f"FROM memoria_facts WHERE id IN ({qmarks}) "
+                f"AND session_id = ? AND valid_to_msg_idx IS NULL",
+                (*rids, self.session_id),
+            ).fetchall()
+            # Reorder to match _vec_search distance ranking (rids = nearest first).
+            by_id = {r[10]: r for r in rows}
+            ordered = [by_id[r] for r in rids if r in by_id]
+            cols = ['type', 'key', 'value', 'context', 'previous_value',
+                    'updated_msg_idx', 'version_id', 'source_memory_id',
+                    'message_idx', 'valid_from_msg_idx', 'id']
+            facts = []
+            ctx_lines = []
+            for r in ordered:
+                d = dict(zip(cols, r))
+                d['source_memory_id'] = f"semantic:fact:{r[10]}"  # synthetic fusion key
+                facts.append(d)
+                ctx_lines.append(f"{r[1]}: {r[2]}")  # readable body, mirroring fact-specialist render
+            return {"context": "\n".join(ctx_lines), "facts": facts, "source": "memoria_semantic"}
+        except Exception:
+            return {"context": "", "facts": [], "source": "fallback"}
+
     def _memoria_timeline_retrieve(self, query: str, top_k: int = 10) -> dict:
         """Query memoria_timelines for chronological events matching query terms."""
         import re as _re

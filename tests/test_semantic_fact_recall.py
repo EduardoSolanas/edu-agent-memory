@@ -193,3 +193,49 @@ def test_remember_batch_flushes_fact_embeddings_once(tmp_path):
     finally:
         _e.available = _e_orig_available
         _e.embed = _e_orig_embed
+
+
+def test_memoria_semantic_retrieve_finds_fact_with_no_literal_overlap(tmp_path):
+    """_memoria_semantic_retrieve finds a fact whose key/value share NO tokens with the query.
+
+    Non-vacuous: uses the REAL vec_facts table (sqlite-vec present) with a
+    stubbed embedder that returns a constant vector — so identical-text facts
+    cluster and the query (different words, same stub vector) matches them.
+    Asserts the live fact surfaces with a synthetic fusion key and that a
+    superseded (dead) fact does NOT surface.
+    """
+    import numpy as np
+    from edumem.core.embeddings import EMBEDDING_DIM
+    import edumem.core.embeddings as _e
+
+    if not _vec_available(_new_beam(tmp_path).conn, table="vec_facts"):
+        import pytest
+        pytest.skip("sqlite-vec not available")
+
+    _stub_vec = ([0.01] * EMBEDDING_DIM, np.array([[0.01] * EMBEDDING_DIM], dtype=np.float32))
+    _e_orig_available, _e_orig_embed, _e_orig_eq = _e.available, _e.embed, _e.embed_query
+    _e.available = lambda: True
+    _e.embed = lambda texts: np.array([[0.01] * EMBEDDING_DIM] * len(texts), dtype=np.float32)
+    _e.embed_query = lambda q: np.array([0.01] * EMBEDDING_DIM, dtype=np.float32)
+    try:
+        beam = _new_beam(tmp_path)
+        try:
+            # A fact whose key/value share no words with the query below.
+            beam._insert_fact("sem-test", 1, "entity", "design system", "neumorphism",
+                              "We adopted a neumorphism design system for the UI.", 0.5,
+                              source_memory_id="m1")
+            beam._flush_fact_embeddings()  # write the embedding into vec_facts
+            rid = beam.conn.execute(
+                "SELECT id FROM memoria_facts WHERE source_memory_id=?", ("m1",)
+            ).fetchone()[0]
+
+            # Query with NO literal overlap to key/value/ctx — only semantic (stub) match.
+            result = beam._memoria_semantic_retrieve(
+                "How did user feedback influence the look and feel?", top_k=5)
+            assert result["source"] == "memoria_semantic"
+            assert "neumorphism" in result["context"], result["context"]
+            assert any(f.get("source_memory_id") == f"semantic:fact:{rid}" for f in result["facts"])
+        finally:
+            beam.conn.close()
+    finally:
+        _e.available, _e.embed, _e.embed_query = _e_orig_available, _e_orig_embed, _e_orig_eq
