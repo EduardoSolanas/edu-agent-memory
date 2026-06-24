@@ -20,6 +20,7 @@ import json
 import os
 import re
 import tempfile
+import time
 from pathlib import Path
 
 import pytest
@@ -341,16 +342,20 @@ def e2e_answers():
 
         # Ingest conversation
         print(f"[E2E] Ingesting {len(conv['messages'])} messages...")
+        _t0 = time.perf_counter()
         ingest_conversation(beam, conv["messages"], diag={}, llm=llm)
+        print(f"[E2E] Ingest done in {time.perf_counter() - _t0:.2f}s")
 
         # Generate answers for all questions (recall + synthesis, no judge)
         print(f"[E2E] Generating answers for {len(conv['questions'])} questions...")
         answers = {}
+        _q_t0 = time.perf_counter()
         for i, q in enumerate(conv['questions']):
             qid = f"1:q{i}"
             ability_name = q.get('ability', 'IE')
             ability = ABILITY_MAP.get(ability_name, ability_name)
 
+            _t = time.perf_counter()
             result = answer_with_memory(
                 llm, beam, q['question'],
                 conversation_messages=conv['messages'],
@@ -358,6 +363,7 @@ def e2e_answers():
                 diag={},
                 return_memories=False
             )
+            _q_s = time.perf_counter() - _t
 
             # Handle tuple return in case return_memories was True
             if isinstance(result, tuple):
@@ -367,7 +373,9 @@ def e2e_answers():
 
             answer = answer or ""
             answers[qid] = answer
-            print(f"[E2E] {qid}: {answer[:80]}")
+            print(f"[E2E] {qid} [{ability}] {_q_s:.2f}s: {answer[:60]}")
+
+        print(f"\n[E2E] {len(answers)} answers in {time.perf_counter() - _q_t0:.2f}s")
 
         print(f"\n[E2E] Answer generation complete. Generated: {len(answers)}")
 
