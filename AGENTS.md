@@ -167,7 +167,7 @@ fusion doesn't distinguish content-facts from temporal-noise.
 | **Hindsight** | 4 (sem, BM25, graph, temporal) | RRF | Cross-encoder | Token-limit |
 | **Memo** | 3 (sem, BM25, entity) | Additive score | Optional | Top-k cap |
 | **Honcho** | Reasoning-first (distill→conclusions) | Intent-driven | N/A | Token-budget |
-| **edumem MEMORIA** | 6 specialists (fact, timeline, negation, chrono, KG, summary) | RRF (k=60) | Cross-encoder (`_fusion_rerank` in `_memoria_fused_retrieve`: RRF → rerank → EO-sort; gated `EDUMEM_FUSION_RERANK`, default ON; None-on-failure keeps RRF order) | Score threshold + dedup |
+| **edumem MEMORIA** | 7 specialists (fact, timeline, negation, chrono, KG, summary, **semantic-KNN-over-facts**) | RRF (k=60) | Cross-encoder (`_fusion_rerank` in `_memoria_fused_retrieve`: RRF → rerank → EO-sort; gated `EDUMEM_FUSION_RERANK`, default ON; None-on-failure keeps RRF order) | Score threshold + dedup |
 | **edumem polyphonic** (gated) | 4 voices (vector, graph, fact, temporal) | RRF (k=60) | **None** (diversity rerank is disabled: returns 0.0) | Token budget |
 
 ~~Key gap vs Hindsight: no cross-encoder reranker after RRF fusion.~~ **Now
@@ -189,3 +189,30 @@ upper-bound-only improvement signal on the live recall benchmark.
 4. **Ability-aware intent routing** — Gap #1 in AGENTS.md: `routing_ability =
    None` in pure-recall mode disables versioned-fact surfacing. Fixing this
    would activate CR/TR/EO specialist merge branches.
+
+## Semantic recall over versioned facts (2026-06-24)
+
+The 7th fusion specialist (`_memoria_semantic_retrieve`) adds embedding-based
+recall over `memoria_facts` via the repurposed `vec_facts` table, targeting the
+ABS/PF **0.000 recall** case where a paraphrased query shares no literal tokens
+with any fact's key/value.
+
+- **Write path:** live facts (plain + new-version + change-new branches; date
+  branch skipped for content quality; dead/superseded rows never enqueued) are
+  embedded (`context_snippet` text, else `key: value`) and queued, then
+  `_flush_fact_embeddings()` does ONE batched `embed([...])` at the
+  `remember_batch` boundary (no N per-fact commits). Supersession adds a
+  `DELETE FROM vec_facts` cleanup hook so stale values never surface.
+- **Read path:** the specialist runs KNN over `vec_facts`, joins back to
+  `memoria_facts` filtered to `valid_to_msg_idx IS NULL`, assigns a synthetic
+  `source_memory_id: semantic:fact:{rid}` fusion key, and RRF-combines with the
+  6 lexical specialists.
+- **Infra:** the 4 vec helpers (`_vec_available`/`_effective_vec_type`/
+  `_vec_insert`/`_vec_search`) gained a `table` param (threaded into internal
+  calls) so the facts table reuses the proven vec_episodes contract.
+- **No new flag:** gated by `EDUMEM_NO_EMBEDDINGS` + `_vec_available(table=)`.
+- **Backfill is out of scope (write-time-only):** the cached recall DB
+  (`tests/.beam_recall_cache/beam_100K_conv0.db`) must be rebuilt to populate
+  `vec_facts` before the live benchmark can show the ABS/PF lift.
+- Tests: `tests/test_semantic_fact_recall.py` (9 cases, all non-vacuous — each
+  fails if its covered wiring is reverted).
