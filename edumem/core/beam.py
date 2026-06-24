@@ -5372,6 +5372,18 @@ Now respond with ONLY the JSON array, no explanation."""
                 timing['summary_ms'] = 0
                 specialists.append(('summary', {"context": "", "facts": [], "source": "fallback"}))
 
+        # Specialist 7: Semantic KNN over vec_facts (paraphrase reach for ABS/SUM).
+        # Always attempted; returns fallback when embeddings/vec unavailable so it
+        # is a no-op offline. Filters to LIVE facts (valid_to_msg_idx IS NULL).
+        try:
+            start = _time.perf_counter()
+            semantic_result = self._memoria_semantic_retrieve(query, top_k=top_k)
+            timing['semantic_ms'] = (_time.perf_counter() - start) * 1000
+            specialists.append(('semantic', semantic_result))
+        except Exception:
+            timing['semantic_ms'] = 0
+            specialists.append(('semantic', {"context": "", "facts": [], "source": "fallback"}))
+
         # Build ranked lists from each specialist's results
         # Stable key for fusion: use fact's source_memory_id if available, else content hash
         ranked_lists = []

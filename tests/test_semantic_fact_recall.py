@@ -239,3 +239,40 @@ def test_memoria_semantic_retrieve_finds_fact_with_no_literal_overlap(tmp_path):
             beam.conn.close()
     finally:
         _e.available, _e.embed, _e.embed_query = _e_orig_available, _e_orig_embed, _e_orig_eq
+
+
+def test_fusion_surfaces_semantic_only_fact(tmp_path):
+    """memoria_retrieve (full fusion) surfaces a fact found ONLY by the semantic specialist.
+
+    Non-vacuous: the query shares no tokens with the fact's key/value/ctx, so
+    the lexical fact specialist finds nothing; only the 7th semantic specialist
+    can surface it. Reverting the specialist wiring makes this fail.
+    """
+    import numpy as np
+    from edumem.core.embeddings import EMBEDDING_DIM
+    import edumem.core.embeddings as _e
+
+    if not _vec_available(_new_beam(tmp_path).conn, table="vec_facts"):
+        import pytest
+        pytest.skip("sqlite-vec not available")
+
+    _e_orig_available, _e_orig_embed, _e_orig_eq = _e.available, _e.embed, _e.embed_query
+    _e.available = lambda: True
+    _e.embed = lambda texts: np.array([[0.01] * EMBEDDING_DIM] * len(texts), dtype=np.float32)
+    _e.embed_query = lambda q: np.array([0.01] * EMBEDDING_DIM, dtype=np.float32)
+    try:
+        beam = _new_beam(tmp_path)
+        try:
+            beam._insert_fact("sem-test", 1, "entity", "design system", "neumorphism",
+                              "We adopted a neumorphism design system for the UI.", 0.5,
+                              source_memory_id="m1")
+            beam._flush_fact_embeddings()
+            # Query with NO literal overlap — only the semantic specialist can find it.
+            result = beam.memoria_retrieve("How did user feedback influence the look and feel?", top_k=5)
+            assert "neumorphism" in result["context"], (
+                f"semantic-only fact not surfaced by fusion: {result['context']!r}"
+            )
+        finally:
+            beam.conn.close()
+    finally:
+        _e.available, _e.embed, _e.embed_query = _e_orig_available, _e_orig_embed, _e_orig_eq
