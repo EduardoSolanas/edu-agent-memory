@@ -104,3 +104,31 @@ def test_vec_search_targets_named_table(tmp_path):
         assert not any(h["rowid"] == 777 for h in hits_ep), "row leaked across tables"
     finally:
         beam.conn.close()
+
+
+def test_embed_fact_enqueues_pending_for_live_fact(tmp_path):
+    """_insert_fact enqueues a live fact for batch embedding (text = context_snippet).
+
+    Non-vacuous: the pending list must contain (rowid, text) with the
+    context_snippet text, NOT key:value, and only when embeddings are available.
+    """
+    beam = _new_beam(tmp_path)
+    try:
+        beam._pending_fact_embeddings = []  # ensure clean
+        # Force embeddings available + stub so no real model loads.
+        import edumem.core.embeddings as _e
+        _e_orig = _e.available
+        _e.available = lambda: True
+        try:
+            beam._insert_fact("sem-test", 5, "metric", "api_latency_ms", "120ms",
+                              "The API latency was measured at 120ms during load test.", 0.5,
+                              source_memory_id="m5")
+        finally:
+            _e.available = _e_orig
+        # One pending entry, text is the context_snippet (not key:value).
+        assert len(beam._pending_fact_embeddings) == 1, beam._pending_fact_embeddings
+        rid, text = beam._pending_fact_embeddings[0]
+        assert "120ms" in text
+        assert text.startswith("The API latency"), text  # context_snippet, not "api_latency_ms: 120ms"
+    finally:
+        beam.conn.close()

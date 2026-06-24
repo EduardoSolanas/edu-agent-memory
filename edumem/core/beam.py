@@ -2453,6 +2453,10 @@ class BeamMemory:
         self.author_id = author_id
         self.author_type = author_type
         self.channel_id = channel_id or session_id  # default channel = session
+        # Deferred fact-embedding queue: (rowid, embed_text). Flushed by
+        # _flush_fact_embeddings() at the batch ingest boundary so we do ONE
+        # batched embed() call instead of N per-fact embeds + N commits.
+        self._pending_fact_embeddings: list = []
         # Coerce path-like inputs (e.g. tempfile-produced strings) to a
         # Path so downstream consumers like _get_connection that do
         # `path.parent.mkdir(...)` don't blow up with
@@ -4997,6 +5001,51 @@ Now respond with ONLY the JSON array, no explanation."""
 
         return counts
 
+    def _embed_fact_enqueue(self, rowid: int, ctx: str, key: str, value: str) -> None:
+        """Enqueue a LIVE fact for batch embedding. Best-effort; never raises.
+
+        Embed text is context_snippet when present (carries semantic content),
+        else "{key}: {value}". The actual embed+insert happens in
+        _flush_fact_embeddings to avoid N per-fact commits.
+        """
+        text = (ctx or "").strip() or f"{key}: {value}".strip()
+        if not text or rowid is None:
+            return
+        self._pending_fact_embeddings.append((rowid, text))
+
+    def _flush_fact_embeddings(self) -> None:
+        """Batch-embed all pending facts and insert into vec_facts. Best-effort.
+
+        Called from the batch ingest boundary (e.g. remember_batch) so we make
+        ONE embed([...]) call over all queued texts instead of N per-fact calls.
+        Clears the queue regardless of success/failure.
+        """
+        if not self._pending_fact_embeddings:
+            return
+        from . import embeddings as _e
+        if not _e.available() or not _vec_available(self.conn, table="vec_facts"):
+            self._pending_fact_embeddings = []
+            return
+        try:
+            pairs = self._pending_fact_embeddings
+            rids = [p[0] for p in pairs]
+            texts = [p[1] for p in pairs]
+            embs = _e.embed(texts)
+            if embs is None:
+                self._pending_fact_embeddings = []
+                return
+            for rid, emb in zip(rids, embs):
+                if emb is None:
+                    continue
+                try:
+                    _vec_insert(self.conn, rid, emb.tolist(), table="vec_facts")
+                except Exception:
+                    pass  # individual insert failure (e.g. dup rowid) is non-fatal
+        except Exception:
+            pass
+        finally:
+            self._pending_fact_embeddings = []
+
     def _insert_fact(self, session: str, msg_idx: int, ftype: str,
                      key: str, value: str, ctx: str, importance: float,
                      source_memory_id: Optional[str] = None):
@@ -5036,25 +5085,35 @@ Now respond with ONLY the JSON array, no explanation."""
                 "WHERE id = ?",
                 (msg_idx, existing[0])
             )
+            # Cleanup hook: drop the superseded fact's vec row so the semantic
+            # index never surfaces a stale value (Spec Part C/D cleanup).
+            try:
+                self.conn.execute("DELETE FROM vec_facts WHERE rowid = ?", (existing[0],))
+            except Exception:
+                pass
             # Insert new version with previous_value pointer
             prev_version = self.conn.execute(
                 "SELECT version_id FROM memoria_facts WHERE id = ?",
                 (existing[0],)
             ).fetchone()
             new_version = (prev_version[0] + 1) if prev_version else 1
-            self.conn.execute(
+            _cur = self.conn.execute(
                 "INSERT INTO memoria_facts (session_id, message_idx, fact_type, key, value, "
                 "context_snippet, importance, version_id, previous_value, updated_msg_idx, "
                 "valid_from_msg_idx, source_memory_id) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (session, msg_idx, ftype, key, value, ctx, importance,
                  new_version, existing[1], msg_idx, msg_idx, source_memory_id))
+            if ftype != 'date':  # skip date branch by content-quality (generic keys)
+                self._embed_fact_enqueue(_cur.lastrowid, ctx, key, value)
         else:
-            self.conn.execute(
+            _cur = self.conn.execute(
                 "INSERT INTO memoria_facts (session_id, message_idx, fact_type, key, value, "
                 "context_snippet, importance, valid_from_msg_idx, source_memory_id) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (session, msg_idx, ftype, key, value, ctx, importance, msg_idx, source_memory_id))
+            if ftype != 'date':
+                self._embed_fact_enqueue(_cur.lastrowid, ctx, key, value)
         return True
 
     def _insert_change_fact(self, session: str, msg_idx: int,
