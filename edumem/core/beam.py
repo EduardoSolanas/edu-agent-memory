@@ -1355,11 +1355,11 @@ def _temporal_boost(memory_timestamp_str: str, query_time: datetime,
     return math.exp(-hours_delta / halflife_hours)
 
 
-def _vec_available(conn: sqlite3.Connection) -> bool:
+def _vec_available(conn: sqlite3.Connection, table: str = "vec_episodes") -> bool:
     if not _SQLITE_VEC_AVAILABLE:
         return False
     try:
-        conn.execute("SELECT 1 FROM vec_episodes LIMIT 0")
+        conn.execute(f"SELECT 1 FROM {table} LIMIT 0")
         return True
     except Exception:
         return False
