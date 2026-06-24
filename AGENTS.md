@@ -113,3 +113,79 @@ CAVEATS for whoever continues:
   reached the prompt; instrument the actual assembled context instead.
 - Do not claim versioning "fixed" CR/EO/TR from storage metrics alone — and note
   it can't help at all until gap #1 is addressed.
+
+## Retrieval-recall benchmark analysis (2026-06-24)
+
+### What was done
+
+Added **cached DB** (`tests/.beam_recall_cache/beam_100K_conv0.db`) to avoid
+re-ingesting the BEAM 100K conversation (~11 min). The test fixture
+`get_cached_beam_and_conv()` builds once, reuses on subsequent runs. Also
+monkey-patched `_embed_api` with `requests.Session` connection pooling. The
+Hindsight-style cross-encoder reranker was then **wired into the real
+pipeline** — `_fusion_rerank` in `_memoria_fused_retrieve` reorders fused
+facts by query relevance after RRF (default ON, gated
+`EDUMEM_FUSION_RERANK`; the EO msg_idx sort still wins for ordering queries;
+None-on-failure keeps RRF order). The redundant test monkey-patch and the
+harness `_rerank` (which re-ranked the wrong object) were removed.
+
+### Performance
+
+| Change | Time | Improvement |
+|--------|------|-------------|
+| Original (no cache, no pooling) | ~11 min ingest + 436s | — |
+| + Cached DB (skip ingest) | 436s | skip 11-min ingest |
+| + Connection pooling (`requests.Session`) | **103s** | 4.2× faster |
+| + Container down (embedding timeout) | ~33s/question | 30s timeout each |
+
+Container warm: **103s** for 20 questions (~5s/question). Full benchmark:
+**0.347 overall recall** (passes 0.30 gate).
+
+### The 67% waste
+
+~65% of rubric nuggets are NOT found (0.347 recall). The 30 facts retrieved per
+question are **dominated by generic timeline/milestone scaffolding** regardless
+of question topic. Example: ABS question "How did user feedback influence
+UI/UX?" retrieved only date-range milestones — zero user feedback or UI/UX
+content. The MEMORIA specialists all return similar date-heavy context; RRF
+fusion doesn't distinguish content-facts from temporal-noise.
+
+**Abilities sorted by recall:**
+
+| Ability | Recall | Problem |
+|---------|--------|---------|
+| IE/KU/MR/CR/IF | 0.500-0.750 | Works when facts contain exact values |
+| EO | 0.300-0.367 | Retrieves generic timeline, not topic ordering |
+| TR | 0.250 | Wrong date pair anchored |
+| SUM | 0.100 | Retrieved snippets lack narrative structure |
+| ABS/PF | **0.000** | No relevant facts retrieved at all |
+
+### Architecture comparison with Hindsight / Mem0 / Honcho
+
+| System | Signals | Fusion | Reranker | Context trim |
+|--------|---------|--------|----------|-------------|
+| **Hindsight** | 4 (sem, BM25, graph, temporal) | RRF | Cross-encoder | Token-limit |
+| **Memo** | 3 (sem, BM25, entity) | Additive score | Optional | Top-k cap |
+| **Honcho** | Reasoning-first (distill→conclusions) | Intent-driven | N/A | Token-budget |
+| **edumem MEMORIA** | 6 specialists (fact, timeline, negation, chrono, KG, summary) | RRF (k=60) | Cross-encoder (`_fusion_rerank` in `_memoria_fused_retrieve`: RRF → rerank → EO-sort; gated `EDUMEM_FUSION_RERANK`, default ON; None-on-failure keeps RRF order) | Score threshold + dedup |
+| **edumem polyphonic** (gated) | 4 voices (vector, graph, fact, temporal) | RRF (k=60) | **None** (diversity rerank is disabled: returns 0.0) | Token budget |
+
+~~Key gap vs Hindsight: no cross-encoder reranker after RRF fusion.~~ **Now
+closed:** the reranker at `localhost:3002/rerank` is wired into
+`_memoria_fused_retrieve` via `_fusion_rerank`. Caveat remains: it only
+re-orders existing fused facts — it cannot retrieve NEW ones, so it is an
+upper-bound-only improvement signal on the live recall benchmark.
+
+### What to try next
+
+1. **Enable polyphonic recall** (`EDUMEM_POLYPHONIC_RECALL=1`) — 4 voices with
+   RRF fusion + context budget. May improve diversity over MEMORIA's 6
+   specialists (which overlap heavily on temporal data).
+2. ~~**Add cross-encoder reranker after RRF**~~ — **done** (wired into
+   `_memoria_fused_retrieve` as `_fusion_rerank`, see above).
+3. **Specialist deduplication** — MEMORIA's 6 specialists all return similar
+   date/milestone facts. Deduplicate across specialist outputs before RRF
+   (content hash, not just memory_id).
+4. **Ability-aware intent routing** — Gap #1 in AGENTS.md: `routing_ability =
+   None` in pure-recall mode disables versioned-fact surfacing. Fixing this
+   would activate CR/TR/EO specialist merge branches.
