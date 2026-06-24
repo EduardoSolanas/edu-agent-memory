@@ -7,9 +7,10 @@ import re
 
 # Preserve ordinary spelling, numeric values, and identifiers. Extremely long
 # repeated-character runs and ultra-long single tokens are pathological and
-# should be collapsed/truncated before tokenization. Collapse 3+ repeats and
-# truncate continuous non-space runs longer than 200 chars to a safe prefix.
-_REPEATED_CHARACTER = re.compile(r"(.)\1{2,}")
+# should be collapsed/truncated before tokenization. Collapse 8+ repeats (so
+# normal values like "1000", "coool", "version_1111111" survive) and truncate
+# continuous non-space runs longer than 200 chars, preserving both head and tail.
+_REPEATED_CHARACTER = re.compile(r"(.)\1{7,}")
 _TRUNCATION_MARKER = " ... "
 
 
@@ -33,8 +34,8 @@ def sanitize_rerank_text(text: str, *, max_utf8_bytes: int = 352) -> str:
 
     This sanitizer additionally guards against two pathological cases that
     can trigger out-of-bounds writes in compiled tokenizers:
-      - extremely long single-token runs (base64, hashes) -> truncate to 40 chars
-      - repeated-character grids (===== or ─────) -> collapse 3+ repeats to 2
+      - extremely long single-token runs (base64, hashes) -> keep head + tail (40 each) with ellipsis
+      - repeated-character grids (========= or ─────────) -> collapse 8+ repeats to 2
     """
     minimum_budget = len(_TRUNCATION_MARKER.encode("utf-8")) + 2
     if max_utf8_bytes < minimum_budget:
@@ -44,8 +45,15 @@ def sanitize_rerank_text(text: str, *, max_utf8_bytes: int = 352) -> str:
 
     # Truncate pathological ultra-long single-token sequences (e.g. base64,
     # long hashes, or blown-up logs with no whitespace). Keep a meaningful
-    # 40-char prefix and an ellipsis so the reranker retains key tokens.
-    cleaned = re.sub(r"\S{200,}", lambda m: m.group(0)[:40] + "...", cleaned)
+    # head and tail with an ellipsis so the reranker retains key tokens from
+    # both ends (conclusions/current values frequently occur at the end).
+    def _truncate_long_token(match: "re.Match[str]") -> str:
+        token = match.group(0)
+        if len(token) <= 90:  # short enough to keep whole
+            return token
+        return token[:40] + "..." + token[-40:]
+
+    cleaned = re.sub(r"\S{200,}", _truncate_long_token, cleaned)
 
     # Collapse consecutive identical characters (3 or more -> 2). This avoids
     # exponential subword generation inside compiled tokenizers.
