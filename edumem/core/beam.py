@@ -5150,9 +5150,15 @@ Now respond with ONLY the JSON array, no explanation."""
                 "UPDATE memoria_facts SET valid_to_msg_idx = ? WHERE id = ?",
                 (msg_idx, existing[0])
             )
+            # Cleanup hook: drop the superseded fact's vec row (Spec Part C/D cleanup).
+            try:
+                self.conn.execute("DELETE FROM vec_facts WHERE rowid = ?", (existing[0],))
+            except Exception:
+                pass
             new_version = (existing[2] or 0) + 1
         else:
-            # Insert old value as the first version (already superseded)
+            # Insert old value as the first version (already superseded). This is a
+            # DEAD row (valid_to set) — never enqueue it for embedding.
             self.conn.execute(
                 "INSERT INTO memoria_facts (session_id, message_idx, fact_type, key, value, "
                 "context_snippet, importance, version_id, valid_from_msg_idx, "
@@ -5162,14 +5168,15 @@ Now respond with ONLY the JSON array, no explanation."""
                  msg_idx, msg_idx, source_memory_id))
             new_version = 1
 
-        # Insert new value as current version
-        self.conn.execute(
+        # Insert new value as current version (LIVE) — enqueue for embedding.
+        _cur = self.conn.execute(
             "INSERT INTO memoria_facts (session_id, message_idx, fact_type, key, value, "
             "context_snippet, importance, version_id, previous_value, "
             "updated_msg_idx, valid_from_msg_idx, source_memory_id) "
             "VALUES (?, ?, 'change', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (session, msg_idx, key, new_value, ctx, importance,
              new_version, old_value, msg_idx, msg_idx, source_memory_id))
+        self._embed_fact_enqueue(_cur.lastrowid, ctx, key, new_value)
         return True
 
     def _insert_timeline(self, session: str, date: str, msg_idx: int,

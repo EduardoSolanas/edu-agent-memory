@@ -132,3 +132,29 @@ def test_embed_fact_enqueues_pending_for_live_fact(tmp_path):
         assert text.startswith("The API latency"), text  # context_snippet, not "api_latency_ms: 120ms"
     finally:
         beam.conn.close()
+
+
+def test_insert_change_fact_enqueues_only_new_row(tmp_path):
+    """_insert_change_fact enqueues the NEW row only; the old (dead) row is not enqueued.
+
+    Non-vacuous: exactly one pending entry (the new value text), referencing
+    new_value not old_value.
+    """
+    beam = _new_beam(tmp_path)
+    try:
+        beam._pending_fact_embeddings = []
+        import edumem.core.embeddings as _e
+        _e_orig = _e.available
+        _e.available = lambda: True
+        try:
+            beam._insert_change_fact("sem-test", 2, "svc_latency",
+                                     "100ms", "200ms", "latency changed to 200ms", 0.5,
+                                     source_memory_id="m2")
+        finally:
+            _e.available = _e_orig
+        # Exactly ONE pending entry (the new row); the dead old row is not enqueued.
+        assert len(beam._pending_fact_embeddings) == 1, beam._pending_fact_embeddings
+        rid, text = beam._pending_fact_embeddings[0]
+        assert "200ms" in text and "changed to 200ms" in text  # new value + its context
+    finally:
+        beam.conn.close()
