@@ -158,3 +158,38 @@ def test_insert_change_fact_enqueues_only_new_row(tmp_path):
         assert "200ms" in text and "changed to 200ms" in text  # new value + its context
     finally:
         beam.conn.close()
+
+
+def test_remember_batch_flushes_fact_embeddings_once(tmp_path):
+    """remember_batch flushes pending fact embeddings in ONE batched embed call.
+
+    Non-vacuous: stub embed to count calls; after remember_batch, embed was
+    called exactly once with all queued texts (not N times).
+    """
+    import edumem.core.embeddings as _e
+    embed_calls = []
+    _e_orig_available = _e.available
+    _e_orig_embed = _e.embed
+
+    def _fake_embed(texts):
+        embed_calls.append(list(texts))
+        import numpy as np
+        from edumem.core.embeddings import EMBEDDING_DIM
+        return np.zeros((len(texts), EMBEDDING_DIM))
+    _e.available = lambda: True
+    _e.embed = _fake_embed
+    try:
+        beam = _new_beam(tmp_path)
+        try:
+            # Queue two facts directly via the enqueue API, then call remember_batch
+            # with an empty list to trigger the boundary flush.
+            beam._embed_fact_enqueue(101, "ctx alpha", "k1", "v1")
+            beam._embed_fact_enqueue(102, "ctx bravo", "k2", "v2")
+            beam.remember_batch([])
+            assert len(embed_calls) == 1, embed_calls
+            assert len(embed_calls[0]) == 2  # both facts in ONE batched call
+        finally:
+            beam.conn.close()
+    finally:
+        _e.available = _e_orig_available
+        _e.embed = _e_orig_embed

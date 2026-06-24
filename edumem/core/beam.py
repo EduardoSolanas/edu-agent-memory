@@ -3310,6 +3310,12 @@ class BeamMemory:
             "rows": batch_diagnostics,
             "totals": batch_totals,
         }
+        # Flush any fact embeddings queued by _insert_fact/_insert_change_fact
+        # during this batch — one batched embed() call, not N per-fact calls.
+        try:
+            self._flush_fact_embeddings()
+        except Exception:
+            pass
         return ids
 
     def _ingest_graph_and_veracity(self, memory_id: str, content: str,
