@@ -104,6 +104,77 @@ def _make_beam(tmp_path: Path):
     return beam_mod.BeamMemory(db_path=tmp_path / "beam.db", session_id="test-session")
 
 
+def test_spo_fact_id_is_content_addressed_not_batch_scoped():
+    """SPO fact_id must be deterministic from (session, subject, predicate, object),
+    not include batch/message id, so identical triples collapse via INSERT OR IGNORE."""
+    from edumem.core.beam import _spo_fact_id
+
+    session_id = "test-session"
+    subject, predicate, obj = "DashboardAPI", "uses", "FastAPI"
+
+    # Same triple -> same id
+    id1 = _spo_fact_id(session_id, subject, predicate, obj)
+    id2 = _spo_fact_id(session_id, subject, predicate, obj)
+    assert id1 == id2, "Same SPO should yield same fact_id"
+
+    # Different object -> different id
+    id3 = _spo_fact_id(session_id, subject, predicate, "Django")
+    assert id1 != id3, "Different object should yield different fact_id"
+
+    # Different session -> different id
+    id4 = _spo_fact_id("other-session", subject, predicate, obj)
+    assert id1 != id4, "Different session should yield different fact_id"
+
+
+def test_facts_table_dedups_identical_triple(tmp_path):
+    """INSERT OR IGNORE with content-addressed fact_id should dedup identical
+    triples across different source messages."""
+    import os
+    from pathlib import Path
+    from edumem.core.beam import _spo_fact_id
+
+    saved_no_embeddings = os.environ.get("EDUMEM_NO_EMBEDDINGS")
+    os.environ["EDUMEM_NO_EMBEDDINGS"] = "1"
+    beam = _make_beam(tmp_path)
+    try:
+        subject, predicate, obj = "DashboardAPI", "uses", "FastAPI"
+        fact_id = _spo_fact_id(beam.session_id, subject, predicate, obj)
+
+        # Insert the same triple twice with different source messages
+        cursor = beam.conn.cursor()
+        cursor.execute(
+            "INSERT OR IGNORE INTO facts "
+            "(fact_id, session_id, subject, predicate, object, "
+            "timestamp, source_msg_id, confidence) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (fact_id, beam.session_id, subject, predicate, obj,
+             "2026-06-25T00:00:00Z", "m1", 0.9),
+        )
+        cursor.execute(
+            "INSERT OR IGNORE INTO facts "
+            "(fact_id, session_id, subject, predicate, object, "
+            "timestamp, source_msg_id, confidence) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (fact_id, beam.session_id, subject, predicate, obj,
+             "2026-06-25T01:00:00Z", "m2", 0.9),
+        )
+        beam.conn.commit()
+
+        # Assert only one row exists (deduped)
+        cursor.execute(
+            "SELECT COUNT(*) FROM facts WHERE subject=? AND predicate=? AND object=?",
+            (subject, predicate, obj),
+        )
+        count = cursor.fetchone()[0]
+        assert count == 1, f"Expected 1 row, got {count} (dedup failed)"
+    finally:
+        beam.conn.close()
+        if saved_no_embeddings is None:
+            os.environ.pop("EDUMEM_NO_EMBEDDINGS", None)
+        else:
+            os.environ["EDUMEM_NO_EMBEDDINGS"] = saved_no_embeddings
+
+
 def _json_request(url: str, payload: dict | None = None) -> object:
     data = None
     headers = {}
@@ -3260,3 +3331,69 @@ def test_assemble_memory_context_descending_order():
     assert scores == sorted(scores, reverse=True), (
         f"Expected descending scores, got {scores}"
     )
+
+
+def _no_embed_beam(tmp_path):
+    import os as _os
+    _os.environ["EDUMEM_NO_EMBEDDINGS"] = "1"
+    return _make_beam(tmp_path)
+
+
+def test_insert_fact_dedups_same_value_across_sources(tmp_path):
+    """Same fact (type+key+value) re-mentioned in different messages/sources
+    must collapse to ONE live row -- not accumulate (the flask_version x22 bug)."""
+    saved = os.environ.get("EDUMEM_NO_EMBEDDINGS")
+    beam = _no_embed_beam(tmp_path)
+    try:
+        beam._insert_fact("s", 1, "metric", "flask_version", "2.3.1", "c1", 0.7, source_memory_id="m1")
+        beam._insert_fact("s", 20, "metric", "flask_version", "2.3.1", "c2", 0.7, source_memory_id="m20")
+        n = beam.conn.execute(
+            "SELECT COUNT(*) FROM memoria_facts WHERE key='flask_version' "
+            "AND value='2.3.1' AND valid_to_msg_idx IS NULL"
+        ).fetchone()[0]
+        assert n == 1, f"expected 1 live row, got {n}"
+    finally:
+        beam.conn.close()
+        if saved is None: os.environ.pop("EDUMEM_NO_EMBEDDINGS", None)
+        else: os.environ["EDUMEM_NO_EMBEDDINGS"] = saved
+
+
+def test_insert_fact_version_chains_on_changed_value(tmp_path):
+    """Dedup must NOT break version-chaining: same key, new value still supersedes."""
+    saved = os.environ.get("EDUMEM_NO_EMBEDDINGS")
+    beam = _no_embed_beam(tmp_path)
+    try:
+        beam._insert_fact("s", 1, "metric", "flask_version", "2.3.1", "c", 0.7, source_memory_id="m1")
+        beam._insert_fact("s", 5, "metric", "flask_version", "2.4.0", "c", 0.7, source_memory_id="m2")
+        live = [r[0] for r in beam.conn.execute(
+            "SELECT value FROM memoria_facts WHERE key='flask_version' AND valid_to_msg_idx IS NULL").fetchall()]
+        assert live == ["2.4.0"], live
+        pv = beam.conn.execute(
+            "SELECT previous_value FROM memoria_facts WHERE key='flask_version' "
+            "AND valid_to_msg_idx IS NULL").fetchone()[0]
+        assert pv == "2.3.1", pv
+    finally:
+        beam.conn.close()
+        if saved is None: os.environ.pop("EDUMEM_NO_EMBEDDINGS", None)
+        else: os.environ["EDUMEM_NO_EMBEDDINGS"] = saved
+
+
+def test_insert_fact_dedups_duplicate_dates_keeps_distinct(tmp_path):
+    """Dates can't version-chain (deadline vs start coexist), but exact-duplicate
+    dates must still collapse to one row."""
+    saved = os.environ.get("EDUMEM_NO_EMBEDDINGS")
+    beam = _no_embed_beam(tmp_path)
+    try:
+        beam._insert_fact("s", 1, "date", "iso_date", "2024-03-15", "c", 0.7, source_memory_id="m1")
+        beam._insert_fact("s", 9, "date", "iso_date", "2024-03-15", "c", 0.7, source_memory_id="m2")
+        beam._insert_fact("s", 12, "date", "iso_date", "2024-04-15", "c", 0.7, source_memory_id="m3")
+        n_dup = beam.conn.execute(
+            "SELECT COUNT(*) FROM memoria_facts WHERE key='iso_date' AND value='2024-03-15'").fetchone()[0]
+        n_total = beam.conn.execute(
+            "SELECT COUNT(*) FROM memoria_facts WHERE key='iso_date'").fetchone()[0]
+        assert n_dup == 1, f"duplicate date not collapsed: {n_dup}"
+        assert n_total == 2, f"distinct dates should coexist: {n_total}"
+    finally:
+        beam.conn.close()
+        if saved is None: os.environ.pop("EDUMEM_NO_EMBEDDINGS", None)
+        else: os.environ["EDUMEM_NO_EMBEDDINGS"] = saved

@@ -1210,6 +1210,13 @@ def _deferred_commits(conn: sqlite3.Connection):
 def _generate_id(content: str) -> str:
     return hashlib.sha256(f"{content}{datetime.now().isoformat()}".encode()).hexdigest()[:16]
 
+def _spo_fact_id(session_id: str, subject: str, predicate: str, object_: str) -> str:
+    """Deterministic content-addressed id for an SPO triple, so the same triple
+    (regardless of which message/batch mentioned it) dedups via INSERT OR IGNORE."""
+    return hashlib.sha256(
+        f"{session_id}:{subject}:{predicate}:{object_}".encode()
+    ).hexdigest()[:24]
+
 def _sanitize_utf8(text: str) -> str:
     """Ensure text is valid UTF-8, stripping or replacing invalid bytes.
 
@@ -3265,12 +3272,14 @@ class BeamMemory:
                 # SPO facts -> facts table
                 facts = self._extraction_client.extract_facts(batch_msgs)
                 if facts:
-                    import hashlib as _hl
                     _cursor = self.conn.cursor()
                     for fact in facts:
-                        _fid = _hl.sha256(
-                            f"{fact.get('subject','')}:{fact.get('predicate','')}:{fact.get('object','')}:{ids[0] if ids else ''}".encode()
-                        ).hexdigest()[:24]
+                        _fid = _spo_fact_id(
+                            self.session_id,
+                            fact.get("subject", ""),
+                            fact.get("predicate", "stated"),
+                            fact.get("object", "")
+                        )
                         _cursor.execute(
                             "INSERT OR IGNORE INTO facts "
                             "(fact_id, session_id, subject, predicate, object, "
@@ -5038,13 +5047,20 @@ Now respond with ONLY the JSON array, no explanation."""
     def _insert_fact(self, session: str, msg_idx: int, ftype: str,
                      key: str, value: str, ctx: str, importance: float,
                      source_memory_id: Optional[str] = None):
-        dedupe_msg_idx = msg_idx if msg_idx is not None else -1
+        # Semantic dedup (Mem0-style): a fact is identified by (type, key, value),
+        # NOT by which message mentioned it. If a LIVE fact with the same
+        # type+key+value already exists, this is the same fact re-stated -- skip
+        # it (and its embedding) instead of accumulating duplicates. The old
+        # source/message-scoped check let the same value from different messages
+        # pile up (e.g. flask_version=2.3.1 stored 22x), flooding vec_facts with
+        # identical vectors. Scoped to live rows so a value that was superseded
+        # and later re-stated still re-chains over the current version below.
         exists = self.conn.execute(
             "SELECT 1 FROM memoria_facts "
-            "WHERE session_id = ? AND (source_memory_id = ? OR message_idx = ?) "
-            "AND fact_type = ? AND key = ? AND value = ? "
+            "WHERE session_id = ? AND fact_type = ? AND key = ? AND value = ? "
+            "AND valid_to_msg_idx IS NULL "
             "LIMIT 1",
-            (session, source_memory_id, dedupe_msg_idx, ftype, key, value),
+            (session, ftype, key, value),
         ).fetchone()
         if exists:
             return False
