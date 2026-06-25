@@ -34,7 +34,7 @@ from tools.evaluate_beam_end_to_end import (
     answer_with_memory,
 )
 
-BUDGETS = [1500, 3000, 6000, 12000, 16000]
+BUDGETS = [2000, 4000, 8000, 16000, 48000]
 
 
 def _measure_recall_at_budget(beam, questions: list[dict], budget: int) -> tuple[float, dict, float]:
