@@ -2988,6 +2988,9 @@ class BeamMemory:
         default_veracity = clamp_veracity(
             veracity, context="remember_batch.default"
         )
+        # Collect batch messages for cloud extraction (SPO facts + conclusions).
+        # Populated during the per-item loop below; consumed after the flush.
+        batch_msgs: list = []
         for item in items:
             # --- Content sanitization: extract binary payloads to blob storage ---
             from edumem.core.content_sanitizer import sanitize_content as _sanitize
@@ -3032,6 +3035,7 @@ class BeamMemory:
             item_source = item.get("source", "conversation")
             item_message_index = item.get("message_index")
             meta_by_id[memory_id] = (item_source, item_veracity, item_message_index)
+            batch_msgs.append({"role": item_source, "content": item["content"]})
             item_recorded_at = item.get("recorded_at") or item.get("timestamp") or timestamp
             item_occurred_at = item.get("occurred_at") or parse_relative_date(item["content"], item_recorded_at) or item_recorded_at.split('T')[0]
 
@@ -3248,6 +3252,59 @@ class BeamMemory:
             self._flush_fact_embeddings()
         except Exception:
             pass
+
+        # Cloud LLM extraction (SPO facts + Hindsight-style conclusions).
+        # Runs when use_cloud=True so the library and benchmark share one
+        # pipeline. Best-effort: never fails the batch.
+        if getattr(self, 'use_cloud', False) and batch_msgs:
+            try:
+                if self._extraction_client is None:
+                    from edumem.extraction import ExtractionClient
+                    self._extraction_client = ExtractionClient()
+
+                # SPO facts -> facts table
+                facts = self._extraction_client.extract_facts(batch_msgs)
+                if facts:
+                    import hashlib as _hl
+                    _cursor = self.conn.cursor()
+                    for fact in facts:
+                        _fid = _hl.sha256(
+                            f"{fact.get('subject','')}:{fact.get('predicate','')}:{fact.get('object','')}:{ids[0] if ids else ''}".encode()
+                        ).hexdigest()[:24]
+                        _cursor.execute(
+                            "INSERT OR IGNORE INTO facts "
+                            "(fact_id, session_id, subject, predicate, object, "
+                            "timestamp, source_msg_id, confidence) "
+                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                            (_fid, self.session_id, fact.get("subject", ""),
+                             fact.get("predicate", "stated"), fact.get("object", ""),
+                             fact.get("timestamp", ""), fact.get("source_msg_id", ""),
+                             fact.get("confidence", 0.7)))
+                    self.conn.commit()
+
+                # Conclusions -> memoria_facts fact_type='conclusion'
+                # (embeds into vec_facts, surfaces via the semantic specialist)
+                try:
+                    conclusions = self._extraction_client.extract_conclusions(batch_msgs)
+                except Exception:
+                    conclusions = []
+                for concl in conclusions:
+                    _text = (concl or {}).get("text", "")
+                    _theme = (concl or {}).get("theme", "general")
+                    if _text:
+                        self._insert_fact(
+                            self.session_id, 0, "conclusion", _theme, _text, _text,
+                            float((concl or {}).get("confidence", 0.7)),
+                            source_memory_id=f"concl-{_theme}-{ids[0] if ids else ''}",
+                        )
+                # Flush conclusion embeddings in the same batch
+                try:
+                    self._flush_fact_embeddings()
+                except Exception:
+                    pass
+            except Exception:
+                pass  # Cloud extraction is best-effort
+
         return ids
 
     def _ingest_graph_and_veracity(self, memory_id: str, content: str,

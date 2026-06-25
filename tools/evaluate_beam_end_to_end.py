@@ -1565,62 +1565,9 @@ def ingest_conversation(beam: BeamMemory, messages: list[dict], diag: dict | Non
             )
             diag["embedding"] = embed_diag
 
-        # Cloud fact extraction: extract facts from batch if enabled
-        if getattr(beam, 'use_cloud', False):
-            try:
-                from edumem.extraction import ExtractionClient
-                if beam._extraction_client is None:
-                    beam._extraction_client = ExtractionClient()
-                facts = beam._extraction_client.extract_facts(batch_msgs)
-                if facts:
-                    cursor = beam.conn.cursor()
-                    import hashlib
-                    for fact in facts:
-                        fact_id = hashlib.sha256(
-                            f"{fact.get('subject','')}:{fact.get('predicate','')}:{fact.get('object','')}:{batch_start}".encode()
-                        ).hexdigest()[:24]
-                        cursor.execute("""
-                            INSERT OR IGNORE INTO facts
-                            (fact_id, session_id, subject, predicate, object,
-                             timestamp, source_msg_id, confidence)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                        """, (
-                            fact_id,
-                            beam.session_id,
-                            fact.get("subject", ""),
-                            fact.get("predicate", "stated"),
-                            fact.get("object", ""),
-                            fact.get("timestamp", ""),
-                            fact.get("source_msg_id", ""),
-                            fact.get("confidence", 0.7),
-                        ))
-                    beam.conn.commit()
-                    stats["fact_count"] = stats.get("fact_count", 0) + len(facts)
-
-                # Conclusion extraction (Hindsight-style synthesis for SUM recall).
-                # Synthesized insights -> memoria_facts fact_type='conclusion', which
-                # the semantic-recall specialist (vec_facts) embeds and surfaces. SPO
-                # triples above can't serve narrative questions; conclusions can.
-                try:
-                    conclusions = beam._extraction_client.extract_conclusions(batch_msgs)
-                except Exception:
-                    conclusions = []
-                for concl in conclusions:
-                    text = (concl or {}).get("text", "")
-                    theme = (concl or {}).get("theme", "general")
-                    if not text:
-                        continue
-                    # ctx = the conclusion text itself (it's self-contained synthesis);
-                    # key/value carry theme + text so _fact_render_text + the embedder
-                    # both capture the full sentence.
-                    if beam._insert_fact(
-                        beam.session_id, batch_start, "conclusion", theme, text, text,
-                        float((concl or {}).get("confidence", 0.7)),
-                        source_memory_id=f"concl-{batch_start}-{theme}",
-                    ):
-                        stats["conclusion_count"] = stats.get("conclusion_count", 0) + 1
-            except Exception:
-                pass  # Best-effort; don't fail ingestion
+        # Cloud LLM extraction (SPO facts + conclusions) now runs inside
+        # beam.remember_batch() when use_cloud=True — the library and benchmark
+        # share one pipeline. No harness-side extraction needed here.
 
         # NOTE: consolidation (beam.sleep()) is intentionally NOT called here.
         # It is an agent-lifecycle event, not an ingest side-effect: weaving it
