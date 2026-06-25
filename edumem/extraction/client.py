@@ -231,3 +231,47 @@ class ExtractionClient:
             )
 
         return []
+
+    def extract_conclusions(self, messages: list) -> list:
+        """Extract synthesized CONCLUSIONS from a batch of messages.
+
+        Hindsight-style synthesis for SUM/narrative recall: full self-contained
+        insight sentences spanning multiple messages, NOT atomic SPO triples.
+        Returns a list of dicts: {text, theme, source, confidence}. Empty list
+        on failure or when the batch has nothing synthesis-worthy.
+        """
+        from .prompts import CONCLUSION_SYSTEM_PROMPT, CONCLUSION_USER_TEMPLATE
+
+        conversation_text = ""
+        for i, msg in enumerate(messages):
+            role = msg.get("role", "unknown")
+            content = msg.get("content", "")
+            if content.strip():
+                conversation_text += f"[{i}] [{role}]: {content}\n"
+
+        if not conversation_text.strip():
+            return []
+
+        chat_messages = [
+            {"role": "system", "content": CONCLUSION_SYSTEM_PROMPT},
+            {"role": "user", "content": CONCLUSION_USER_TEMPLATE.format(
+                conversation_text=conversation_text)},
+        ]
+
+        response = self.chat(chat_messages, temperature=0.0, max_tokens=4096)
+        if not response:
+            return []
+
+        try:
+            json_start = response.find("[")
+            json_end = response.rfind("]") + 1
+            if json_start >= 0 and json_end > json_start:
+                conclusions = _json.loads(response[json_start:json_end])
+                if isinstance(conclusions, list):
+                    return conclusions
+        except (_json.JSONDecodeError, ValueError):
+            logger.warning(
+                "ExtractionClient.extract_conclusions: JSON parse failed; "
+                "%d chars returned", len(response),
+            )
+        return []

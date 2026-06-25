@@ -197,6 +197,13 @@ def get_cached_beam_and_conv():
         beam = BeamMemory(db_path=CACHE_DB, session_id=session_id)
         print(f"[cache] Ingesting conversation {conv['id']} ({len(conv['messages'])} messages)...", flush=True)
         ingest_conversation(beam, conv["messages"], llm=None)
+        # Consolidate once after ingest (force=True: benchmark data is fresh "now",
+        # so an age-gated sleep would no-op). Populates the episodic layer.
+        try:
+            while beam.sleep(force=True).get("status") not in ("no_op", "error"):
+                pass
+        except Exception:
+            pass
         print(f"[cache] Ingestion complete.", flush=True)
 
     return beam, conv

@@ -1583,6 +1583,29 @@ def ingest_conversation(beam: BeamMemory, messages: list[dict], diag: dict | Non
                         ))
                     beam.conn.commit()
                     stats["fact_count"] = stats.get("fact_count", 0) + len(facts)
+
+                # Conclusion extraction (Hindsight-style synthesis for SUM recall).
+                # Synthesized insights -> memoria_facts fact_type='conclusion', which
+                # the semantic-recall specialist (vec_facts) embeds and surfaces. SPO
+                # triples above can't serve narrative questions; conclusions can.
+                try:
+                    conclusions = beam._extraction_client.extract_conclusions(batch_msgs)
+                except Exception:
+                    conclusions = []
+                for concl in conclusions:
+                    text = (concl or {}).get("text", "")
+                    theme = (concl or {}).get("theme", "general")
+                    if not text:
+                        continue
+                    # ctx = the conclusion text itself (it's self-contained synthesis);
+                    # key/value carry theme + text so _fact_render_text + the embedder
+                    # both capture the full sentence.
+                    if beam._insert_fact(
+                        beam.session_id, batch_start, "conclusion", theme, text, text,
+                        float((concl or {}).get("confidence", 0.7)),
+                        source_memory_id=f"concl-{batch_start}-{theme}",
+                    ):
+                        stats["conclusion_count"] = stats.get("conclusion_count", 0) + 1
             except Exception:
                 pass  # Best-effort; don't fail ingestion
 
@@ -4633,6 +4656,17 @@ def main():
                 stats = ingest_conversation(beam, conv["messages"], diag=conv_diag, llm=llm)
                 ingest_time = time.perf_counter() - t0
                 conv_diag["ingest_diagnostics_batch"] = getattr(beam, "_last_ingest_diagnostics_batch", None)
+
+                # Consolidate: one explicit agent-lifecycle pass after ingest completes.
+                # force=True because benchmark data is freshly timestamped "now", so a
+                # normal age-gated sleep() would no-op. Populates episodic_memory +
+                # vec_episodes so the episodic/summary recall specialists have data.
+                # Best-effort: consolidation must never abort the run.
+                try:
+                    while beam.sleep(force=True).get("status") not in ("no_op", "error"):
+                        pass
+                except Exception as _se:
+                    stats.setdefault("post_ingest_sleep_errors", []).append(repr(_se))
 
                 print(f"    Ingested {len(conv['messages'])} msgs in {ingest_time:.1f}s "
                       f"(DB: {os.path.getsize(db_path)/1024:.0f}KB)")
