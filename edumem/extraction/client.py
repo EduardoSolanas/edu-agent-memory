@@ -124,23 +124,29 @@ class ExtractionClient:
         temperature: float,
         max_tokens: int,
     ) -> str:
-        """Single API call via urllib."""
+        """Single API call.
+
+        Uses `requests` (not urllib) because some providers (e.g. NAN via
+        Cloudflare) block the default Python-urllib User-Agent with HTTP 403
+        error 1010. Mirrors the LLMClient header set in evaluate_beam_end_to_end.
+        """
+        import requests as _requests
         url = f"{self.base_url}/chat/completions"
-        payload = _json.dumps(
-            {
-                "model": model,
-                "messages": messages,
-                "temperature": temperature,
-                "max_tokens": max_tokens,
-            }
-        ).encode()
+        payload = {
+            "model": model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
+            "HTTP-Referer": "https://edumem.site",
+            "X-Title": "edumem Extraction",
         }
-        req = urllib.request.Request(url, data=payload, headers=headers)
-        resp = urllib.request.urlopen(req, timeout=60)
-        data = _json.loads(resp.read())
+        resp = _requests.post(url, json=payload, headers=headers, timeout=60)
+        resp.raise_for_status()
+        data = resp.json()
         self.call_count += 1
         return data["choices"][0]["message"]["content"]
 
