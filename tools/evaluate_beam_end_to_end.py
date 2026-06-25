@@ -775,13 +775,20 @@ def _summarize_reranker_run(question_results: list[dict], preflight: dict | None
     return _finalize_reranker_run_health(preflight, summary)
 
 # --- Config ---
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+# The LLM API key for the answer/judge path. EDUMEM_LLM_API_KEY is the canonical
+# key used across the LLM path (answer, judge, extraction, consolidation).
+# OPENROUTER_API_KEY is read only as a deprecated fallback for callers that
+# still set it.
+OPENROUTER_API_KEY = (
+    os.environ.get("EDUMEM_LLM_API_KEY", "")
+    or os.environ.get("OPENROUTER_API_KEY", "")
+)
 if not OPENROUTER_API_KEY:
     # Try to load from file -- check opencode first, then openrouter
     for _kf in ["/tmp/opencode_key.txt", "/tmp/openrouter_key.txt"]:
         _key_file = Path(_kf)
         if _key_file.exists():
-            with open(_key_file) as f:
+            with open(_kf) as f:
                 _content = f.read().strip()
             if "export" in _content:
                 OPENROUTER_API_KEY = _content.split("=", 1)[1].strip().strip('"').strip("'")
@@ -789,8 +796,14 @@ if not OPENROUTER_API_KEY:
                 OPENROUTER_API_KEY = _content
             break
 NVIDIA_API_KEY = os.environ.get("NVIDIA_API_KEY", "")
-OPENROUTER_BASE_URL = os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
-DEFAULT_MODEL = "deepseek-v4-flash"
+# The LLM base URL. EDUMEM_LLM_BASE_URL is canonical (shared with the
+# consolidation/extraction path); OPENROUTER_BASE_URL is a deprecated fallback.
+OPENROUTER_BASE_URL = (
+    os.environ.get("EDUMEM_LLM_BASE_URL", "")
+    or os.environ.get("OPENROUTER_BASE_URL", "")
+    or "https://openrouter.ai/api/v1"
+)
+DEFAULT_MODEL = os.environ.get("EDUMEM_LLM_MODEL", "deepseek-v4-flash")
 CONSOLIDATION_MODEL = "deepseek/deepseek-v4-flash"  # Cheap model for LLM-based consolidation summaries
 FALLBACK_MODELS = []  # Disabled -- fallback cascade burned $30 in credits
 DEFAULT_TOP_K = 10  # Memories to retrieve per question
@@ -4437,7 +4450,7 @@ def main():
     parser.add_argument("--dry-run", action="store_true",
                         help="Download data and print stats, don't evaluate")
     parser.add_argument("--use-cloud", action="store_true",
-                        help="Enable LLM fact extraction (cloud tier). Requires OPENROUTER_API_KEY.")
+                        help="Enable LLM fact extraction (cloud tier). Requires EDUMEM_LLM_API_KEY.")
     parser.add_argument("--config-id", default=None,
                         help="Run identifier written into the paired-outcomes "
                              "JSONL alongside results JSON. Defaults to a "

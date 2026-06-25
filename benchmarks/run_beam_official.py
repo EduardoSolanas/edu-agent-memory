@@ -217,9 +217,13 @@ def main() -> None:
     elif args.provider == "openrouter":
         base_url = "https://openrouter.ai/api/v1"
         model = args.model or "openai/gpt-4o-mini"
-        api_key = args.api_key or os.getenv("OPENROUTER_API_KEY") or dot_env.get("OPENROUTER_API_KEY")
+        api_key = (
+            args.api_key
+            or os.getenv("EDUMEM_LLM_API_KEY") or os.getenv("OPENROUTER_API_KEY")
+            or dot_env.get("EDUMEM_LLM_API_KEY") or dot_env.get("OPENROUTER_API_KEY")
+        )
         if not api_key:
-            print("[!] Error: No OpenRouter API key found in env or .env (expected OPENROUTER_API_KEY)")
+            print("[!] Error: No LLM API key found in env or .env (expected EDUMEM_LLM_API_KEY)")
             sys.exit(1)
     elif args.provider == "openai":
         base_url = "https://api.openai.com/v1"

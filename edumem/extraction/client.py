@@ -17,10 +17,18 @@ DEFAULT_EXTRACTION_MODEL = os.environ.get(
     "EDUMEM_EXTRACTION_MODEL",
     "google/gemini-2.5-flash",
 )
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
-OPENROUTER_BASE_URL = os.environ.get(
-    "OPENROUTER_BASE_URL",
-    "https://openrouter.ai/api/v1",
+# The LLM API key for chat-based extraction. Single env var (EDUMEM_LLM_API_KEY)
+# is the canonical key used across the LLM path (answer, judge, extraction,
+# consolidation). OPENROUTER_API_KEY is read only as a deprecated fallback for
+# callers that still set it.
+EXTRACTION_API_KEY = (
+    os.environ.get("EDUMEM_LLM_API_KEY", "")
+    or os.environ.get("OPENROUTER_API_KEY", "")
+)
+OPENROUTER_BASE_URL = (
+    os.environ.get("EDUMEM_LLM_BASE_URL", "")
+    or os.environ.get("OPENROUTER_BASE_URL", "")
+    or "https://openrouter.ai/api/v1"
 ).rstrip("/")
 FALLBACK_MODELS = [
     "google/gemini-flash-latest",
@@ -38,7 +46,7 @@ class ExtractionClient:
         base_url: str = None,
     ):
         self.model = model or DEFAULT_EXTRACTION_MODEL
-        self.api_key = api_key or OPENROUTER_API_KEY
+        self.api_key = api_key or EXTRACTION_API_KEY
         self.base_url = (base_url or OPENROUTER_BASE_URL).rstrip("/")
         self.call_count = 0
 

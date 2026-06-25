@@ -74,7 +74,7 @@ def _is_api_model(model_name: str) -> bool:
     # Distinct from the substring/prefix checks above because the default fastembed
     # model id (BAAI/bge-small-en-v1.5) shares the same vendor-prefix shape as those
     # OpenRouter models — pure name-pattern matching would silently break fastembed
-    # users that also have OPENROUTER_API_KEY set for chat. Requiring an explicit
+    # users that also have EDUMEM_LLM_API_KEY set for chat. Requiring an explicit
     # env flag keeps local-first behavior the default while giving a clean opt-in
     # for OpenRouter-hosted embedding models.
     if os.environ.get("EDUMEM_EMBEDDINGS_VIA_API", "").strip().lower() in ("1", "true", "yes", "on"):

@@ -96,8 +96,10 @@ def main():
                 
     # 2. Run Official BEAM End-to-End Benchmark
     print("\n--- STEP 2: Running Official BEAM End-to-End ---")
+    _llm_key = os.getenv("EDUMEM_LLM_API_KEY") or os.getenv("NAN_APY_KEY") or os.getenv("OPENAI_API_KEY", "")
     beam_env = {
-        "OPENROUTER_API_KEY": os.getenv("NAN_APY_KEY") or os.getenv("OPENAI_API_KEY", ""),
+        "EDUMEM_LLM_API_KEY": _llm_key,
+        "OPENROUTER_API_KEY": _llm_key,  # deprecated fallback for un-migrated callers
         "OPENROUTER_BASE_URL": os.getenv("CHAT_MODEL_BASE_URL", "https://api.nan.builders/v1"),
         "PYTHONPATH": str(EDUMEM_ROOT)
     }

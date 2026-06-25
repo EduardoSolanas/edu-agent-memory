@@ -13,7 +13,8 @@ class JudgeLLM:
         import openai
         self.client = openai.OpenAI(
             base_url="https://openrouter.ai/api/v1",
-            api_key=os.environ["OPENROUTER_API_KEY"],
+            api_key=(os.environ.get("EDUMEM_LLM_API_KEY")
+                     or os.environ.get("OPENROUTER_API_KEY", "")),
         )
     def judge_relevance(self, question: str, fact_text: str) -> bool:
         try:

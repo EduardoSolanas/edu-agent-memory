@@ -2,7 +2,8 @@
 
 100% open source (MIT). Same engine runs on Free (self-hosted) and Cloud (managed).
 
-Self-hosted users provide their own OpenRouter API key via OPENROUTER_API_KEY env var.
+Self-hosted users provide their own LLM API key via the EDUMEM_LLM_API_KEY env var
+(OPENROUTER_API_KEY is still read as a deprecated fallback).
 Cloud users get managed extraction through the edumem Cloud service.
 """
 

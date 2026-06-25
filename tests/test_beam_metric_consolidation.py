@@ -155,9 +155,9 @@ def test_canonical_metric_key_separates_target_from_observation(tmp_path):
     reason="requires explicit live-LLM opt-in",
 )
 def test_live_metric_consolidation_preserves_subjects_and_target(tmp_path):
-    api_key = os.environ.get("OPENROUTER_API_KEY")
+    api_key = os.environ.get("EDUMEM_LLM_API_KEY") or os.environ.get("OPENROUTER_API_KEY")
     if not api_key:
-        pytest.skip("OPENROUTER_API_KEY is not configured")
+        pytest.skip("EDUMEM_LLM_API_KEY is not configured")
     client = LLMClient(
         model="qwen3.6",
         api_key=api_key,
