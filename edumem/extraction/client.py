@@ -44,6 +44,20 @@ OPENROUTER_BASE_URL = (
     or os.environ.get("OPENROUTER_BASE_URL", "")
     or "https://openrouter.ai/api/v1"
 ).rstrip("/")
+def _reasoning_payload_extra(model: str) -> dict:
+    """Per-model reasoning control so reasoning models don't spend the whole
+    max_tokens budget on hidden chain-of-thought (-> content=None, minutes per
+    call, empty extractions). Mirrors the answer-path LLMClient: qwen/gemma use
+    chat_template_kwargs.enable_thinking=False; deepseek uses reasoning_effort=low.
+    """
+    ml = (model or "").lower()
+    if "qwen" in ml or "gemma" in ml:
+        return {"chat_template_kwargs": {"enable_thinking": False}}
+    if "deepseek" in ml:
+        return {"reasoning_effort": "low"}
+    return {}
+
+
 def _fallback_models() -> list:
     """Extraction fallback models, tried in order after the primary fails.
 
@@ -55,6 +69,25 @@ def _fallback_models() -> list:
     return [m.strip() for m in
             os.environ.get("EDUMEM_EXTRACTION_FALLBACK_MODELS", "").split(",")
             if m.strip()]
+
+
+def _reasoning_payload_extra(model: str) -> dict:
+    """Return extra payload fields to disable/limit reasoning for models that
+    otherwise spend max_tokens on hidden chain-of-thought, producing null
+    content and taking minutes per call.
+
+    Mirrors the answer-path LLMClient in tools/evaluate_beam_end_to_end.py.
+
+    Per NAN docs (https://nan.builders/docs/api):
+      - qwen3.x / gemma4: chat_template_kwargs.enable_thinking=false
+      - deepseek-v4-flash: reasoning_effort low
+    """
+    _ml = model.lower()
+    if "qwen" in _ml or "gemma" in _ml:
+        return {"chat_template_kwargs": {"enable_thinking": False}}
+    if "deepseek" in _ml:
+        return {"reasoning_effort": "low"}
+    return {}
 
 
 class ExtractionClient:
@@ -167,6 +200,7 @@ class ExtractionClient:
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
+        payload.update(_reasoning_payload_extra(model))
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",

@@ -121,3 +121,14 @@ def test_extraction_fallback_models_default_empty(monkeypatch):
     assert _fallback_models() == []
     monkeypatch.setenv("EDUMEM_EXTRACTION_FALLBACK_MODELS", "a/model, b/model")
     assert _fallback_models() == ["a/model", "b/model"]
+
+
+def test_extraction_reasoning_payload_disables_qwen_thinking():
+    """ExtractionClient must disable reasoning for qwen/gemma (else the model
+    spends max_tokens on hidden chain-of-thought -> null content, minutes/call,
+    empty extractions). Mirrors the answer-path LLMClient."""
+    from edumem.extraction.client import _reasoning_payload_extra
+    assert _reasoning_payload_extra("qwen3.6") == {"chat_template_kwargs": {"enable_thinking": False}}
+    assert _reasoning_payload_extra("gemma4") == {"chat_template_kwargs": {"enable_thinking": False}}
+    assert _reasoning_payload_extra("deepseek-v4-flash") == {"reasoning_effort": "low"}
+    assert _reasoning_payload_extra("google/gemini-2.5-flash") == {}
