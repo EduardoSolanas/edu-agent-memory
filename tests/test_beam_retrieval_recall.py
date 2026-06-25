@@ -43,6 +43,26 @@ _setup_retrieval_env()
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+
+def _setup_write_llm_env():
+    """Cache BUILD uses the LLM (use_cloud extraction: facts + conclusions via
+    qwen3.6). Point the canonical EDUMEM_LLM_* vars at NAN/qwen3.6, loading the
+    key from .env if not already in the environment. Only the one-time build
+    needs this; the recall test reads the cached output with NO LLM."""
+    if not os.environ.get("EDUMEM_LLM_API_KEY"):
+        env_path = PROJECT_ROOT / ".env"
+        if env_path.exists():
+            for line in env_path.read_text(encoding="utf-8", errors="replace").splitlines():
+                line = line.strip()
+                if line.startswith("NAN_APY_KEY=") and "=" in line:
+                    key = line.split("=", 1)[1].strip().strip('"').strip("'")
+                    if key:
+                        os.environ["EDUMEM_LLM_API_KEY"] = key
+                    break
+    os.environ.setdefault("EDUMEM_LLM_BASE_URL", "https://api.nan.builders/v1")
+    os.environ.setdefault("EDUMEM_LLM_MODEL", "qwen3.6")
+
+
 from tools.evaluate_beam_end_to_end import (
     ABILITY_MAP,
     answer_with_memory,
@@ -191,10 +211,14 @@ def get_cached_beam_and_conv():
         print(f"[cache] reusing existing DB at {CACHE_DB}", flush=True)
         beam = BeamMemory(db_path=CACHE_DB, session_id=session_id)
     else:
-        # Build cache
-        print(f"[cache] building... (this will take ~11 minutes)", flush=True)
+        # Build cache WITH the LLM (use_cloud=True): the WRITE step extracts
+        # facts + conclusions via qwen3.6 into the cached DB. The recall test
+        # then reads this cached output with NO LLM -- the LLM is a one-time
+        # write cost; recall is free, offline and deterministic.
+        print(f"[cache] building with LLM extraction (use_cloud=True)...", flush=True)
+        _setup_write_llm_env()
         CACHE_DB.parent.mkdir(parents=True, exist_ok=True)
-        beam = BeamMemory(db_path=CACHE_DB, session_id=session_id)
+        beam = BeamMemory(db_path=CACHE_DB, session_id=session_id, use_cloud=True)
         print(f"[cache] Ingesting conversation {conv['id']} ({len(conv['messages'])} messages)...", flush=True)
         ingest_conversation(beam, conv["messages"], llm=None)
         # Consolidate once after ingest (force=True: benchmark data is fresh "now",
