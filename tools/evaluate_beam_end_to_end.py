@@ -3259,6 +3259,27 @@ Follow this format strictly:
 
     context = ""  # Built below from memories
 
+    # Cross-encoder rerank the FULL candidate set by query relevance before the
+    # char-budget truncation. The upstream strategies score on different scales
+    # (RRF rank, importance, recency) on which generic date/timeline facts float
+    # high; without a single relevance signal, a small context budget keeps that
+    # noise and truncates the answer-bearing facts (recall@small budget stays
+    # low even though the fact IS retrieved). One cross-encoder pass over all
+    # candidates gives _assemble_memory_context a relevance-ordered score so the
+    # relevant facts survive a small context. None (endpoint down) keeps order.
+    if memories and not is_ordering_query(question):
+        try:
+            from edumem.core.beam import _fusion_rerank as _ce_rerank
+            _cand_texts = [str(m.get("content", "")) for m in memories]
+            _rr = _ce_rerank(question, _cand_texts)
+            if _rr is not None:
+                _rmap = {it["index"]: it["score"] for it in _rr}
+                for _i, _m in enumerate(memories):
+                    if _i in _rmap:
+                        _m["score"] = float(_rmap[_i])
+        except Exception:
+            pass
+
     # Build retrieved memory context (deduplicated, relevance-sorted)
     _effective_max_chars = 24000 if _is_sum else MAX_MEMORY_CONTEXT_CHARS
     _mem_context_str, memories = _assemble_memory_context(memories, _effective_max_chars)

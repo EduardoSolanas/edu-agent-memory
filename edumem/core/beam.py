@@ -5428,6 +5428,16 @@ Now respond with ONLY the JSON array, no explanation."""
         _scores = _fusion_rerank(query, _fact_texts)
         if _scores is not None:
             _score_map = {item["index"]: item["score"] for item in _scores}
+            # Propagate the cross-encoder relevance onto each fact's `score`
+            # (indices still match _fact_texts here, before reorder). Downstream
+            # context assembly truncates by `score`; without this it re-sorts by
+            # the stale RRF/specialist score and UNDOES this rerank, so generic
+            # date/timeline noise wins a small context budget and the relevant
+            # facts get dropped. Writing the relevance through keeps content
+            # facts ahead of noise into a small context.
+            for _orig_i, (_spec, _f) in enumerate(final_items):
+                if isinstance(_f, dict):
+                    _f["score"] = float(_score_map.get(_orig_i, _f.get("score", 0.0) or 0.0))
             # Stable enumerate index (avoids O(n^2) list.index + unhashable-dict pitfalls).
             _indexed = list(enumerate(final_items))
             _indexed.sort(key=lambda pair: -_score_map.get(pair[0], 0.0))
