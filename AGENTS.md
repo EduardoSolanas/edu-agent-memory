@@ -5,6 +5,80 @@ ABS, CR, EO, IE, IF, KU, MR, PF, SUM, TR). This file explains how the BEAM
 evaluation and tests fit together, how to run them, and what is currently
 known/unknown — so you don't rediscover it or draw wrong conclusions.
 
+## Environment & invocation reference (canonical — 2026-06-25)
+
+### LLM provider (answer / judge / extraction / consolidation)
+The whole LLM path keys off ONE canonical pair. `OPENROUTER_*` is read only as a
+**deprecated fallback** — prefer the `EDUMEM_LLM_*` names. On the NAN stack the key
+is `NAN_APY_KEY` in repo `.env`; base_url is `https://api.nan.builders/v1`.
+
+| Var | Purpose | Default |
+|---|---|---|
+| `EDUMEM_LLM_API_KEY` | LLM key (answer/judge/extraction). Fallback: `OPENROUTER_API_KEY`. | — |
+| `EDUMEM_LLM_BASE_URL` | OpenAI-compatible base URL. Fallback: `OPENROUTER_BASE_URL` → `https://openrouter.ai/api/v1`. | openrouter.ai |
+| `EDUMEM_LLM_MODEL` | Canonical chat model (answer). NAN = `qwen3.6`. | — |
+| `EDUMEM_EXTRACTION_MODEL` | Fact+conclusion extraction model. Resolves `EDUMEM_EXTRACTION_MODEL` → `EDUMEM_LLM_MODEL` → `google/gemini-2.5-flash`. So on NAN it follows qwen3.6 automatically (the gemini default 401s on NAN → silent no-op). | `EDUMEM_LLM_MODEL` |
+| `EDUMEM_EXTRACTION_FALLBACK_MODELS` | Comma-sep extraction fallbacks. | empty |
+| `EDUMEM_JUDGE_MODEL` | Judge model (full runner uses `--judge-model`). NAN = `deepseek-v4-flash`. | — |
+| `BEAM_LLM_TIMEOUT` | Answer-LLM request timeout (s). | 300 |
+| `EDUMEM_EXTRACTION_TIMEOUT` | ExtractionClient/summary call timeout (s). | 20 |
+
+**Reasoning models are handled automatically (no env var):** both the answer
+`LLMClient` and `ExtractionClient` send `chat_template_kwargs={"enable_thinking":
+false}` for `qwen*`/`gemma*` and `reasoning_effort="low"` for `deepseek*`. Without
+it, qwen3.6 spends the whole `max_tokens` budget on hidden chain-of-thought →
+`content=None`, minutes/call, empty output. Any new qwen client MUST do this.
+
+### Write-time extraction modes (there are TWO — do not run both)
+| Mechanism | Enabled by | Produces |
+|---|---|---|
+| `ExtractionClient` (`self._extraction_client`) | `BeamMemory(use_cloud=True)` / full runner `--use-cloud` | SPO facts → `facts` table; **conclusions** → `memoria_facts` (`fact_type='conclusion'`); via `EDUMEM_EXTRACTION_MODEL` |
+| `self._llm_client` paths | pass `llm_client=` into `BeamMemory` **and** a flag | `EDUMEM_LLM_EXTRACTION=1`: MEMORIA entities/relations/dates JSON schema (OVERLAPS with ExtractionClient — running both double-extracts facts); `EDUMEM_LLM_SUMMARY=1`: rolling-summary track; `EDUMEM_LLM_FACT_CONSOLIDATION` (default 1): consolidation |
+
+The cache/benchmark uses `use_cloud=True` (ExtractionClient). Offline
+(`use_cloud=False`, no `llm_client`) = regex only (`episodic_graph` SPO + regex
+MEMORIA), no LLM. Passing `llm_client` to *also* turn on `EDUMEM_LLM_EXTRACTION`
+re-introduces the duplication that was just removed — don't, unless replacing
+ExtractionClient outright.
+
+### Dedup (Mem0-style)
+- `memoria_facts`: `_insert_fact` dedups by `(fact_type, key, value)` over **live**
+  rows (skips the dup AND its embedding); same key + new value still
+  version-chains; distinct dates coexist.
+- `facts` (SPO): `_spo_fact_id(session, s, p, o)` is content-addressed so
+  `INSERT OR IGNORE` collapses identical triples across batches.
+
+### Embeddings / reranker
+| Var | Default |
+|---|---|
+| `EDUMEM_EMBEDDING_API_URL` | http://localhost:3002 |
+| `EDUMEM_EMBEDDING_MODEL` | Alibaba-NLP/gte-modernbert-base (768-dim) |
+| `EDUMEM_EMBEDDINGS_VIA_API` | set `1` to use the API embedder |
+| `EDUMEM_RERANKER_URL` | http://localhost:3002/rerank |
+| `EDUMEM_NO_EMBEDDINGS` | set `1` for offline (FTS/keyword only; no dense, no `vec_facts`) |
+
+### Invocations
+- **Full runner (MEASUREMENT, live judge):**
+  ```bash
+  export EDUMEM_LLM_API_KEY="$(grep -E '^NAN_APY_KEY=' .env | cut -d= -f2- | tr -d '\r\"')"
+  export EDUMEM_LLM_BASE_URL="https://api.nan.builders/v1"
+  python tools/evaluate_beam_end_to_end.py --scales 100K --case-index 0 \
+    --model qwen3.6 --judge-model deepseek-v4-flash --pure-recall [--use-cloud] \
+    --output-dir results/<tag>
+  ```
+  Knobs: `BEAM_QUESTION_WORKERS` (4), `EDUMEM_MAX_CONTEXT_CHARS` (16000),
+  `EDUMEM_BENCHMARK_PURE_RECALL` (on; `--pure-recall`).
+- **Pre-LLM retrieval-recall test (deterministic, NO answer/judge LLM):**
+  ```bash
+  EDUMEM_RETRIEVAL_E2E=1 python -m pytest tests/test_beam_retrieval_recall.py -q -s
+  ```
+  Builds `tests/.beam_recall_cache/beam_100K_conv0.db` ONCE with `use_cloud=True`
+  (qwen3.6 facts+conclusions; key auto-loaded from `.env`), then measures nugget
+  recall in the assembled context. Reruns reuse the cache → seconds, offline.
+  **Delete the cache dir to rebuild after any extraction/prompt change.**
+- **Context-budget sweep:** `EDUMEM_RETRIEVAL_E2E=1 python tools/retrieval_budget_sweep.py`
+  (recall vs `EDUMEM_MAX_CONTEXT_CHARS`).
+
 ## Architecture essentials
 
 - **Versioned facts** live in the `memoria_facts` table (`edumem/core/beam.py`).
@@ -66,11 +140,12 @@ Requires the reranker up on `http://localhost:3002/rerank` and the NAN LLM
 endpoint. The API key lives in repo `.env` as `NAN_APY_KEY`. Each shell call is
 fresh, so set env + run pytest in ONE command (Git Bash):
 ```
-export OPENROUTER_API_KEY="$(grep -E '^NAN_APY_KEY=' .env | head -1 | cut -d= -f2- | tr -d '\r\"')"
-export OPENROUTER_BASE_URL="https://api.nan.builders/v1"
+export EDUMEM_LLM_API_KEY="$(grep -E '^NAN_APY_KEY=' .env | head -1 | cut -d= -f2- | tr -d '\r\"')"
+export EDUMEM_LLM_BASE_URL="https://api.nan.builders/v1"
 export EDUMEM_E2E=1
 export EDUMEM_E2E_ANSWER_MODEL="qwen3.6"
 python -m pytest tests/test_beam_e2e_full.py -v -s
+# (OPENROUTER_API_KEY / OPENROUTER_BASE_URL still work as deprecated fallbacks.)
 ```
 A full run is ~30–40 min. The fixture marks each question `hard` (passed in the
 baseline → regression guard) or `xfail` (known-failing → a target to flip). When
@@ -139,8 +214,10 @@ CAVEATS for whoever continues:
 ### What was done
 
 Added **cached DB** (`tests/.beam_recall_cache/beam_100K_conv0.db`) to avoid
-re-ingesting the BEAM 100K conversation (~11 min). The test fixture
-`get_cached_beam_and_conv()` builds once, reuses on subsequent runs. Also
+re-ingesting the BEAM 100K conversation. The test fixture
+`get_cached_beam_and_conv()` builds once **with `use_cloud=True`** (so the cache
+reflects the real qwen3.6 facts+conclusions pipeline, not regex), reuses on
+subsequent runs. Delete `tests/.beam_recall_cache/` to force a rebuild. Also
 monkey-patched `_embed_api` with `requests.Session` connection pooling. The
 Hindsight-style cross-encoder reranker was then **wired into the real
 pipeline** — `_fusion_rerank` in `_memoria_fused_retrieve` reorders fused
