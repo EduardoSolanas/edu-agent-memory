@@ -13,10 +13,24 @@ import urllib.request
 logger = logging.getLogger(__name__)
 
 # ── Defaults ──────────────────────────────────────────────────────────────
-DEFAULT_EXTRACTION_MODEL = os.environ.get(
-    "EDUMEM_EXTRACTION_MODEL",
-    "google/gemini-2.5-flash",
-)
+def _default_extraction_model() -> str:
+    """Resolve the model used for fact + conclusion extraction.
+
+    Defaults to the canonical chat model (EDUMEM_LLM_MODEL) so extraction runs on
+    the SAME provider/endpoint as the answer path -- e.g. qwen3.6 on NAN.
+    Otherwise the google/gemini default silently no-ops against a NAN base_url
+    (NAN does not serve Gemini), producing zero facts/conclusions. Precedence:
+    EDUMEM_EXTRACTION_MODEL (explicit override) > EDUMEM_LLM_MODEL (canonical
+    chat model) > google/gemini-2.5-flash (self-hosted / OpenRouter fallback).
+    """
+    return (
+        os.environ.get("EDUMEM_EXTRACTION_MODEL")
+        or os.environ.get("EDUMEM_LLM_MODEL")
+        or "google/gemini-2.5-flash"
+    )
+
+
+DEFAULT_EXTRACTION_MODEL = _default_extraction_model()
 # The LLM API key for chat-based extraction. Single env var (EDUMEM_LLM_API_KEY)
 # is the canonical key used across the LLM path (answer, judge, extraction,
 # consolidation). OPENROUTER_API_KEY is read only as a deprecated fallback for
@@ -30,10 +44,17 @@ OPENROUTER_BASE_URL = (
     or os.environ.get("OPENROUTER_BASE_URL", "")
     or "https://openrouter.ai/api/v1"
 ).rstrip("/")
-FALLBACK_MODELS = [
-    "google/gemini-flash-latest",
-     # Fallback: older
-]
+def _fallback_models() -> list:
+    """Extraction fallback models, tried in order after the primary fails.
+
+    Default EMPTY: a hardcoded cross-provider fallback (e.g. a Gemini model) is
+    dead weight on a NAN endpoint -- if the primary qwen3.6 call fails, falling
+    back to a model the endpoint can't serve just fails again. Opt in via
+    EDUMEM_EXTRACTION_FALLBACK_MODELS (comma-separated) for OpenRouter setups.
+    """
+    return [m.strip() for m in
+            os.environ.get("EDUMEM_EXTRACTION_FALLBACK_MODELS", "").split(",")
+            if m.strip()]
 
 
 class ExtractionClient:
@@ -45,7 +66,7 @@ class ExtractionClient:
         api_key: str = None,
         base_url: str = None,
     ):
-        self.model = model or DEFAULT_EXTRACTION_MODEL
+        self.model = model or _default_extraction_model()
         self.api_key = api_key or EXTRACTION_API_KEY
         self.base_url = (base_url or OPENROUTER_BASE_URL).rstrip("/")
         self.call_count = 0
@@ -84,7 +105,7 @@ class ExtractionClient:
         diag.record_attempt("cloud")
 
         models_to_try = [self.model] + [
-            m for m in FALLBACK_MODELS if m != self.model
+            m for m in _fallback_models() if m != self.model
         ]
         last_exc = None
 

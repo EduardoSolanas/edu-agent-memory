@@ -91,3 +91,33 @@ def test_conclusion_stored_and_retrievable_as_semantic_fact(monkeypatch, tmp_pat
             beam.conn.close()
     finally:
         _e.available, _e.embed, _e.embed_query = _orig_av, _orig_em, _orig_eq
+
+
+def test_extraction_model_follows_canonical_llm_model(monkeypatch):
+    """Extraction (facts + conclusions) must default to the canonical chat model
+    EDUMEM_LLM_MODEL (e.g. qwen3.6 on NAN) so it runs on the SAME provider as the
+    answer path. Otherwise the google/gemini default silently no-ops against a
+    NAN base_url. Precedence: EDUMEM_EXTRACTION_MODEL > EDUMEM_LLM_MODEL > gemini."""
+    from edumem.extraction.client import _default_extraction_model
+    from edumem.extraction import ExtractionClient
+
+    monkeypatch.delenv("EDUMEM_EXTRACTION_MODEL", raising=False)
+    monkeypatch.delenv("EDUMEM_LLM_MODEL", raising=False)
+    assert _default_extraction_model() == "google/gemini-2.5-flash"
+
+    monkeypatch.setenv("EDUMEM_LLM_MODEL", "qwen3.6")
+    assert _default_extraction_model() == "qwen3.6"
+    assert ExtractionClient().model == "qwen3.6"
+
+    monkeypatch.setenv("EDUMEM_EXTRACTION_MODEL", "explicit-model")
+    assert _default_extraction_model() == "explicit-model"  # explicit override wins
+
+
+def test_extraction_fallback_models_default_empty(monkeypatch):
+    """Fallback models default to EMPTY (no hardcoded cross-provider model that
+    would just fail again on a NAN endpoint); opt in via env."""
+    from edumem.extraction.client import _fallback_models
+    monkeypatch.delenv("EDUMEM_EXTRACTION_FALLBACK_MODELS", raising=False)
+    assert _fallback_models() == []
+    monkeypatch.setenv("EDUMEM_EXTRACTION_FALLBACK_MODELS", "a/model, b/model")
+    assert _fallback_models() == ["a/model", "b/model"]
