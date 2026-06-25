@@ -1416,84 +1416,6 @@ def _extract_and_store_entities(beam: "BeamMemory", memory_id: str, content: str
         pass
 
 
-def _extract_and_store_facts(beam: "BeamMemory", memory_id: str, content: str, source: str = ""):
-    """
-    Extract structured facts from content using LLM and store as annotations
-    + facts table. Called internally by remember() when extract=True.
-
-    Stores in TWO places:
-    1. AnnotationStore with kind="fact" (post-E6; was TripleStore pre-E6)
-    2. facts table (structured SPO facts for fact_recall())
-
-    Post-E6 note: writes formerly used TripleStore.add_facts() which
-    silently invalidated each prior fact via (subject, predicate) auto-
-    invalidation. AnnotationStore.add_many is append-only so all facts
-    coexist.
-    """
-    try:
-        from edumem.core.extraction import extract_facts_safe
-        from edumem.core.annotations import filter_facts
-
-        facts = extract_facts_safe(content)
-        if not facts:
-            return
-
-        # Filter to match the legacy filtering applied by TripleStore.add_facts.
-        kept = filter_facts(facts)
-        if kept:
-            beam.annotations.add_many(
-                memory_id=memory_id,
-                kind="fact",
-                values=kept,
-                source=source,
-                confidence=0.7,
-            )
-
-        # ALSO store in facts table (new cloud extraction path) -- uses the
-        # full facts list (matching pre-E6 behavior).
-        _store_facts_in_table(beam, memory_id, content, source, facts)
-
-    except Exception:
-        # Fact extraction is best-effort; never fail remember() because of it
-        pass
-
-
-def _store_facts_in_table(beam: "BeamMemory", memory_id: str,
-                          content: str, source: str, facts: list):
-    """Store extracted free-text facts as simple SPO entries in the facts table."""
-    import hashlib
-    cursor = beam.conn.cursor()
-    timestamp = __import__('datetime').datetime.now().isoformat()
-    
-    for i, fact_text in enumerate(facts):
-        # Derive subject from source, predicate = "stated", object = fact text
-        subject = source or "user"
-        fact_id = hashlib.sha256(
-            f"{memory_id}:fact:{i}:{fact_text[:50]}".encode()
-        ).hexdigest()[:24]
-
-        try:
-            cursor.execute("""
-                INSERT OR IGNORE INTO facts
-                (fact_id, session_id, subject, predicate, object,
-                 timestamp, source_msg_id, confidence)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                fact_id,
-                beam.session_id,
-                subject,
-                "stated",
-                fact_text,
-                timestamp,
-                memory_id,
-                0.7,
-            ))
-        except Exception:
-            continue  # Best-effort per fact
-    
-    beam.conn.commit()
-
-
 def _find_memories_by_entity(beam: "BeamMemory", entity_name: str, threshold: float = 0.8) -> List[str]:
     """
     Find memory IDs that mention an entity (or similar entity via fuzzy match).
@@ -2814,8 +2736,6 @@ class BeamMemory:
             # contract on duplicate-content writes (see C12.a /review note).
             if extract_entities:
                 _extract_and_store_entities(self, existing_id, content)
-            if extract:
-                _extract_and_store_facts(self, existing_id, content, source)
             # Phase 2: MEMORIA regex-based extraction (always-on, zero-LLM-cost).
             # Populates memoria_facts, memoria_timelines, memoria_kg for the
             # structured retrieval router. Runs silently on every remember()
@@ -2929,10 +2849,6 @@ class BeamMemory:
         # --- Entity extraction ---
         if extract_entities:
             _extract_and_store_entities(self, memory_id, content)
-
-        # --- Structured fact extraction ---
-        if extract:
-            _extract_and_store_facts(self, memory_id, content, source)
 
         # Phase 2: MEMORIA regex-based extraction (always-on, zero-LLM-cost).
         # Populates memoria_facts, memoria_timelines, memoria_kg for the
@@ -3288,8 +3204,6 @@ class BeamMemory:
                     row_diag.update(diag)
                 if extract_entities:
                     _extract_and_store_entities(self, memory_id, row_content)
-                if extract:
-                    _extract_and_store_facts(self, memory_id, row_content, item_source)
                 # Phase 2: MEMORIA regex-based extraction for every batch row.
                 try:
                     self.extract_and_store_facts(
@@ -3361,41 +3275,14 @@ class BeamMemory:
             "SELECT COUNT(*) FROM consolidated_facts WHERE superseded_by IS NOT NULL"
         ).fetchone()[0]
 
-        # Phase 3: Episodic graph extraction
+        # Phase 3: Episodic graph extraction (gist only; fact extraction removed
+        # — it overlapped with the working MEMORIA regex + cloud paths and
+        # produced nothing because the underlying LLM was never configured).
+        facts = []
         if self.episodic_graph is not None:
             try:
                 gist = self.episodic_graph.extract_gist(content, memory_id)
                 self.episodic_graph.store_gist(gist, memory_id)
-
-                facts = self.episodic_graph.extract_facts(content, memory_id)
-                unique_facts = []
-                seen_fact_keys: Set[tuple] = set()
-                def _fact_field(fact, name: str):
-                    if isinstance(fact, dict):
-                        return fact.get(name)
-                    return getattr(fact, name, None)
-                for fact in facts:
-                    fact_key = (_fact_field(fact, "subject"),
-                                _fact_field(fact, "predicate"),
-                                _fact_field(fact, "object"))
-                    if fact_key in seen_fact_keys:
-                        continue
-                    seen_fact_keys.add(fact_key)
-                    unique_facts.append(fact)
-
-                facts = unique_facts
-                for fact in facts:
-                    self.episodic_graph.store_fact(fact, memory_id)
-
-                # Link graph edges between gist and facts
-                for fact in facts:
-                    self.episodic_graph.add_edge(GraphEdge(
-                        source=gist.id,
-                        target=fact.id,
-                        edge_type="ctx",
-                        weight=fact.confidence,
-                        timestamp=datetime.now().isoformat()
-                    ))
             except Exception:
                 pass  # Graph failures are non-blocking
 

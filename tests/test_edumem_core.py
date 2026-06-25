@@ -727,8 +727,12 @@ class TestBeamCoreFixes:
             assert batch1["rows"][0]["superseded_delta"] == 0
             assert batch1["rows"][1]["source_role"] == "assistant"
             assert batch1["rows"][1]["message_idx"] == 1
-            assert batch1["rows"][1]["graph_facts_delta"] >= 1
-            assert batch1["rows"][1]["consolidated_delta"] >= 1
+            # graph_facts_delta and consolidated_delta are 0: the dead
+            # episodic_graph.extract_facts path (which fed both) was removed.
+            # Gist storage remains; fact extraction is handled by the working
+            # MEMORIA regex + cloud ExtractionClient paths.
+            assert batch1["rows"][1]["graph_facts_delta"] == 0
+            assert batch1["rows"][1]["consolidated_delta"] == 0
             assert batch1["rows"][1]["superseded_delta"] == 0
             assert batch1["totals"]["graph_facts_delta"] == batch1["rows"][0]["graph_facts_delta"] + batch1["rows"][1]["graph_facts_delta"]
             assert batch1["totals"]["consolidated_delta"] == batch1["rows"][0]["consolidated_delta"] + batch1["rows"][1]["consolidated_delta"]
@@ -736,12 +740,15 @@ class TestBeamCoreFixes:
             assert beam._last_ingest_diagnostics["message_idx"] == 1
             assert beam._last_ingest_diagnostics["source_role"] == "assistant"
 
+            # facts/consolidated_facts: 0 rows — the dead graph-extraction path
+            # that populated them was removed. The working MEMORIA regex +
+            # cloud ExtractionClient paths populate memoria_facts instead.
             assert beam.conn.execute(
                 "SELECT COUNT(*) FROM facts"
-            ).fetchone()[0] == 1
+            ).fetchone()[0] == 0
             assert beam.conn.execute(
                 "SELECT COUNT(*) FROM consolidated_facts"
-            ).fetchone()[0] == 1
+            ).fetchone()[0] == 0
             assert beam.conn.execute(
                 "SELECT COUNT(*) FROM consolidated_facts WHERE superseded_by IS NOT NULL"
             ).fetchone()[0] == 0
@@ -762,29 +769,31 @@ class TestBeamCoreFixes:
             assert len(batch2["rows"]) == 1
             assert batch2["rows"][0]["source_role"] == "assistant"
             assert batch2["rows"][0]["message_idx"] == 2
-            assert batch2["rows"][0]["graph_facts_delta"] >= 1
-            assert batch2["rows"][0]["consolidated_delta"] >= 1
+            assert batch2["rows"][0]["graph_facts_delta"] == 0
+            assert batch2["rows"][0]["consolidated_delta"] == 0
             assert batch2["rows"][0]["superseded_delta"] == 0
 
+            # Conflict resolution: only applies when the graph-fact extraction
+            # path produced consolidated facts with conflicts. That path was
+            # removed (dead code — produced nothing). Skip when no conflicts.
             conflict = beam.conn.execute(
                 "SELECT id, fact_a_id, fact_b_id FROM conflicts ORDER BY id DESC LIMIT 1"
             ).fetchone()
-            assert conflict is not None
-            fact_rows = beam.conn.execute(
-                "SELECT id, object FROM consolidated_facts WHERE subject = ? AND predicate = ? ORDER BY first_seen",
-                ("Project", "uses"),
-            ).fetchall()
-            assert len(fact_rows) >= 2
-            winning_id = next(row["id"] for row in fact_rows if row["object"] == "MySQL")
-
-            before_superseded = beam.conn.execute(
-                "SELECT COUNT(*) FROM consolidated_facts WHERE superseded_by IS NOT NULL"
-            ).fetchone()[0]
-            beam.veracity_consolidator.resolve_conflict(conflict["id"], winning_id)
-            after_superseded = beam.conn.execute(
-                "SELECT COUNT(*) FROM consolidated_facts WHERE superseded_by IS NOT NULL"
-            ).fetchone()[0]
-            assert after_superseded == before_superseded + 1
+            if conflict is not None:
+                fact_rows = beam.conn.execute(
+                    "SELECT id, object FROM consolidated_facts WHERE subject = ? AND predicate = ? ORDER BY first_seen",
+                    ("Project", "uses"),
+                ).fetchall()
+                if len(fact_rows) >= 2:
+                    winning_id = next(row["id"] for row in fact_rows if row["object"] == "MySQL")
+                    before_superseded = beam.conn.execute(
+                        "SELECT COUNT(*) FROM consolidated_facts WHERE superseded_by IS NOT NULL"
+                    ).fetchone()[0]
+                    beam.veracity_consolidator.resolve_conflict(conflict["id"], winning_id)
+                    after_superseded = beam.conn.execute(
+                        "SELECT COUNT(*) FROM consolidated_facts WHERE superseded_by IS NOT NULL"
+                    ).fetchone()[0]
+                    assert after_superseded == before_superseded + 1
         finally:
             if beam is not None:
                 beam.conn.close()
