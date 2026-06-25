@@ -24,7 +24,9 @@ data/
 *.jsonl
 *.csv
 memories_dump.json
-tests/.beam_recall_cache/
+
+# Committed recall-test fixture (force-tracked past the *.db rule above)
+!tests/.beam_recall_cache/beam_100K_conv0.db
 
 # Credentials / Environments
 .env
