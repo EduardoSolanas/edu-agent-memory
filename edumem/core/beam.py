@@ -2346,6 +2346,18 @@ def _fact_render_text(fact) -> str:
         return f"{fact.get('subject', '')} {fact.get('predicate', '')} {fact.get('object', '')}"
     if "object" in fact:  # negation specialist
         return f"user said never/not: {fact.get('object', '')}"
+    if fact.get("type") == "duration":  # duration derived facts
+        return f"[Duration] {fact.get('key', '')}: {fact.get('value', '')}"
+    if "instruction" in fact:  # instruction specialist
+        topic = fact.get('topic', '')
+        return f"[Instruction] {topic}: {fact.get('instruction', '')}"
+    if "preference" in fact:  # preference specialist
+        topic = fact.get('topic', '')
+        evolution = fact.get('evolution', '')
+        line = f"[Preference] {topic}: {fact.get('preference', '')}"
+        if evolution:
+            line += f" (was: {evolution})"
+        return line
     if "key" in fact:  # fact specialist
         return f"{fact.get('key', '')}: {fact.get('value', '')}"
     return ", ".join(f"{k}: {v}" for k, v in fact.items() if not k.startswith("_"))
@@ -4290,58 +4302,16 @@ class BeamMemory:
         if source_memory_id is None and message_idx is not None:
             source_memory_id = f"msgidx:{message_idx}"
 
-        # Flag-gated LLM extraction path (A/B against regex). Default OFF.
-        # On any failure or empty parse, fall through to the regex path below
-        # so extraction is never lost.
-        if (self._llm_client is not None
-                and os.environ.get("EDUMEM_LLM_EXTRACTION", "0") == "1"):
-            try:
-                # Load existing canonical keys for the session to guide reuse
-                existing_keys = [
-                    r[0] for r in self.conn.execute(
-                        "SELECT DISTINCT key FROM memoria_facts "
-                        "WHERE session_id = ? AND fact_type != 'date'",
-                        (self.session_id,)
-                    ).fetchall()
-                ]
-                prompt = self._build_llm_extraction_prompt(
-                    content, existing_keys=existing_keys or None
-                )
-                from concurrent.futures import ThreadPoolExecutor, TimeoutError as _TimeoutError
-                timeout = int(os.environ.get("EDUMEM_EXTRACTION_TIMEOUT", "20"))
-                with ThreadPoolExecutor(max_workers=1) as _executor:
-                    _future = _executor.submit(
-                        self._llm_client.chat,
-                        [{"role": "user", "content": prompt}],
-                        temperature=0.0, max_tokens=512,
-                    )
-                    raw = _future.result(timeout=timeout)
-                parsed = self._parse_llm_extraction(raw)
-                if parsed.get("facts") or parsed.get("entities") or parsed.get("relations") or parsed.get("dates"):
-                    ctx = self._context_snippet(content, 0)
-                    stored = self._store_llm_extraction(
-                        self.session_id, message_idx, parsed, ctx,
-                        source_memory_id=source_memory_id)
-                    return {
-                        "metric": stored["facts"], "date": stored["dates"],
-                        "version": 0, "entity": stored["entities"], "sequence": 0,
-                        "timeline": stored["dates"], "negation": stored["relations"],
-                        "decision": 0,
-                    }
-            except Exception:
-                pass  # fall through to regex path
-        """Extract structured facts from a message and store in facts/timelines/kg tables.
-        Uses regex patterns matching the BEAM benchmark oracles.
-        Language-aware: detects language and uses language-specific patterns.
-        Returns dict of counts per fact_type."""
-        counts = {"metric": 0, "date": 0, "version": 0, "entity": 0,
-                  "sequence": 0, "timeline": 0, "negation": 0, "decision": 0}
         session = self.session_id
+        # ------------------------------------------------------------------
+        # Step 1: Regex extraction first — collect metadata, store results
+        # ------------------------------------------------------------------
         is_user_source = _is_user_authored_source(source)
-
-        # Language detection
         lang = self.detect_language(content)
         pat = self.MULTILINGUAL_PATTERNS.get(lang, self.MULTILINGUAL_PATTERNS['en'])
+
+        # Collect regex-extracted keys to guide LLM (avoid duplicates)
+        _regex_extracted_keys: list[str] = []
 
         # Metrics: numbers with units — use finditer for position info
         _metric_re_iter = list(_re.finditer(
@@ -4404,6 +4374,7 @@ class BeamMemory:
                 key = key.replace('_%', '_pct')
                 if not key.endswith('_pct'):
                     key = f"{prefix}_pct" if prefix else 'pct'
+            _regex_extracted_keys.append(key)
             # Collect as a candidate for LLM consolidation
             metric_candidates.append({
                 "raw_key": key,
@@ -4411,6 +4382,9 @@ class BeamMemory:
                 "context": self._context_snippet(content, m.start()),
                 "msg_idx": message_idx
             })
+
+        counts: dict = {"metric": 0, "date": 0, "version": 0, "entity": 0,
+                  "sequence": 0, "timeline": 0, "negation": 0, "decision": 0}
 
         # Batch canonicalize all metrics via LLM (or fallback to raw_keys)
         if metric_candidates:
@@ -4459,6 +4433,7 @@ class BeamMemory:
             name = m.group(1).strip()
             ver = m.group(2)
             key = f"{name.lower().replace(' ', '_')}_version"
+            _regex_extracted_keys.append(key)
             if self._insert_fact(session, message_idx, 'version', key, ver,
                                  self._context_snippet(content, m.start()), 0.7,
                                  source_memory_id=source_memory_id):
@@ -4472,6 +4447,7 @@ class BeamMemory:
             if name.lower() in ('running', 'using', 'installed', 'upgraded', 'currently'):
                 continue
             key = f"{name.lower().replace(' ', '_')}_version"
+            _regex_extracted_keys.append(key)
             if ver not in _seen_versions:
                 _seen_versions.add(ver)
                 if self._insert_fact(session, message_idx, 'version', key, ver,
@@ -4497,12 +4473,14 @@ class BeamMemory:
                         break
             if self._insert_kg(session, 'user', 'negation', obj[:80], message_idx, 0.75, source_memory_id=source_memory_id):
                 counts["negation"] += 1
+                _regex_extracted_keys.append(f"negation:{obj[:30]}")
 
         # Decisions — language-aware
         for m in _re.finditer(pat['decision'], content, _re.IGNORECASE):
             decision = m.group(1).strip()
             if self._insert_kg(session, 'user', 'decision', decision, message_idx, 0.65, source_memory_id=source_memory_id):
                 counts["decision"] += 1
+                _regex_extracted_keys.append(f"decision:{decision[:30]}")
 
         # Entity-action pairs (MR support) — language-aware
         for m in _re.finditer(pat['entity'], content, _re.IGNORECASE):
@@ -4523,7 +4501,7 @@ class BeamMemory:
         # Change patterns: "switched/changed/moved from X to Y"
         _change_from_to_re = _re.compile(
             r'(?:switched|changed|moved|migrated|transitioned|upgraded|downgraded|converted|replaced)\s+'
-            r'(?:from\s+)?(.{2,40}?)\s+to\s+(.{2,40}?)(?:\s+(?:for|because|due|since|as)|[.,;!?\n]|$)',
+            r'(?:from\s+)?(.{2,40}?)\s+to\s+(.{2,40}?)(?:\s+(?:for|because|due|since|as)|[.,;!\?\n]|$)',
             _re.IGNORECASE
         )
         for m in _change_from_to_re.finditer(content):
@@ -4560,6 +4538,7 @@ class BeamMemory:
                                          self._context_snippet(content, m.start()),
                                          source_memory_id=source_memory_id):
                 counts["change"] = counts.get("change", 0) + 1
+                _regex_extracted_keys.append(f"change:{key}")
 
         # Date change patterns: "postponed/rescheduled X from D1 to D2"
         _date_change_re = _re.compile(
@@ -4580,6 +4559,7 @@ class BeamMemory:
                                          self._context_snippet(content, m.start()),
                                          source_memory_id=source_memory_id):
                 counts["change"] = counts.get("change", 0) + 1
+                _regex_extracted_keys.append(f"change:{key}")
 
         if is_user_source:
             # Instructions (IF support): language-aware
@@ -4602,6 +4582,7 @@ class BeamMemory:
                     source_memory_id=source_memory_id,
                 ):
                     counts["instruction"] = counts.get("instruction", 0) + 1
+                    _regex_extracted_keys.append(f"instruction:{topic}")
 
             # Preferences (PF support): evolving user tastes — language-aware
             for m in _re.finditer(pat['preference'], content, _re.IGNORECASE):
@@ -4628,9 +4609,62 @@ class BeamMemory:
                     source_memory_id=source_memory_id,
                 ):
                     counts["preference"] = counts.get("preference", 0) + 1
+                    _regex_extracted_keys.append(f"preference:{topic}")
 
         self.conn.commit()
         counts["_lang"] = lang  # Tag extraction with detected language
+
+        # ------------------------------------------------------------------
+        # Step 2: LLM extraction — complementary, guided by regex output
+        # ------------------------------------------------------------------
+        if self._llm_client is not None:
+            try:
+                # Combine session-level existing keys with this message's regex output
+                existing_keys = [
+                    r[0] for r in self.conn.execute(
+                        "SELECT DISTINCT key FROM memoria_facts "
+                        "WHERE session_id = ? AND fact_type != 'date'",
+                        (self.session_id,)
+                    ).fetchall()
+                ]
+                prompt = self._build_llm_extraction_prompt(
+                    content, existing_keys=existing_keys or None,
+                    regex_extracted=_regex_extracted_keys
+                )
+                from concurrent.futures import ThreadPoolExecutor, TimeoutError as _TimeoutError
+                timeout = int(os.environ.get("EDUMEM_EXTRACTION_TIMEOUT", "20"))
+                with ThreadPoolExecutor(max_workers=1) as _executor:
+                    _future = _executor.submit(
+                        self._llm_client.chat,
+                        [{"role": "user", "content": prompt}],
+                        temperature=0.0, max_tokens=512,
+                    )
+                    raw = _future.result(timeout=timeout)
+                parsed = self._parse_llm_extraction(raw)
+                if parsed.get("facts") or parsed.get("entities") or parsed.get("relations") or parsed.get("dates"):
+                    ctx = self._context_snippet(content, 0)
+                    stored = self._store_llm_extraction(
+                        self.session_id, message_idx, parsed, ctx,
+                        source_memory_id=source_memory_id)
+                    counts["entity"] += stored["entities"]
+                    counts["negation"] += stored["relations"]
+                    counts["llm_facts"] = counts.get("llm_facts", 0) + stored["facts"]
+                    counts["date"] += stored["dates"]
+                    counts["timeline"] += stored["dates"]
+            except Exception:
+                pass  # LLM failure is best-effort, regex already ran
+
+        counts["_regex_keys"] = _regex_extracted_keys
+
+        # Derive duration facts from accumulated timeline entries
+        if counts.get("timeline", 0) > 0:
+            try:
+                dur_count = self._derive_durations(session, max_pairs=15)
+                if dur_count > 0:
+                    counts["duration"] = dur_count
+            except Exception:
+                pass
+
         return counts
 
     def _build_canonicalize_prompt(self, existing, candidates) -> str:
@@ -4834,12 +4868,14 @@ Now respond with ONLY the JSON array, no explanation."""
     # LLM-based write-time fact extraction (flag-gated, Mem0/Hindsight-style)
     # ------------------------------------------------------------------
     def _build_llm_extraction_prompt(self, content: str,
-                                     existing_keys: Optional[list] = None) -> str:
+                                     existing_keys: Optional[list] = None,
+                                     regex_extracted: Optional[list[str]] = None) -> str:
         """Build a deterministic prompt instructing the LLM to return ONLY a
         compact JSON object with typed facts, entities, relations, and dates.
 
         Cap each list at 5. No prose, no code fences. If existing_keys is
-        provided, encourage reuse of those canonical keys.
+        provided, encourage reuse of those canonical keys. If regex_extracted
+        is provided, tell the LLM to skip those exact keys (regex already got them).
         """
         existing_hint = ""
         if existing_keys:
@@ -4849,6 +4885,49 @@ Now respond with ONLY the JSON array, no explanation."""
                 "(do NOT create variants of them):\n"
                 f"{', '.join(sample)}\n"
             )
+        regex_hint = ""
+        if regex_extracted:
+            negations, decisions, changes, instructions, preferences = [], [], [], [], []
+            versions, durations, metrics_other = [], [], []
+            for k in regex_extracted:
+                if k.startswith("negation:"):
+                    negations.append(k[len("negation:"):])
+                elif k.startswith("decision:"):
+                    decisions.append(k[len("decision:"):])
+                elif k.startswith("change:"):
+                    changes.append(k[len("change:"):])
+                elif k.startswith("instruction:"):
+                    instructions.append(k[len("instruction:"):])
+                elif k.startswith("preference:"):
+                    preferences.append(k[len("preference:"):])
+                elif k.endswith("_version"):
+                    versions.append(k)
+                elif k.endswith("_duration"):
+                    durations.append(k)
+                else:
+                    metrics_other.append(k)
+            lines = ["=== ALREADY EXTRACTED (regex) ==="]
+            if metrics_other:
+                lines.append("METRICS: " + ", ".join(metrics_other))
+            if versions:
+                lines.append("VERSIONS: " + ", ".join(versions))
+            if decisions:
+                lines.append("DECISIONS: " + "; ".join(decisions))
+            if instructions:
+                lines.append("INSTRUCTIONS: " + "; ".join(instructions))
+            if preferences:
+                lines.append("PREFERENCES: " + "; ".join(preferences))
+            if negations:
+                lines.append("NEGATIONS: " + "; ".join(negations))
+            if changes:
+                lines.append("CHANGES: " + "; ".join(changes))
+            if durations:
+                lines.append("DURATIONS: " + ", ".join(durations))
+            lines.append("=== FOCUS ON COMPLEMENTARY EXTRACTION ===")
+            lines.append("Extract entity types, relationships, and conclusions that the regex scanner cannot detect.")
+            regex_hint = "\n" + "\n".join(lines) + "\n"
+        else:
+            regex_hint = "\n(No regex-extracted keys for this message — extract all relevant facts.)\n"
         return (
             "You extract persistent, reusable memory from a single message.\n"
             "Return ONLY a JSON object (no prose, no code fences) with exactly "
@@ -4876,6 +4955,7 @@ Now respond with ONLY the JSON array, no explanation."""
             "- dates: ISO YYYY-MM-DD when an event is tied to a date; keep context short.\n"
             "- If a category has nothing, return an empty list for it.\n"
             f"{existing_hint}"
+            f"{regex_hint}"
             "Message:\n"
             f"{content}\n"
         )
@@ -5120,6 +5200,91 @@ Now respond with ONLY the JSON array, no explanation."""
             if ftype != 'date':
                 self._embed_fact_enqueue(_cur.lastrowid, ctx, key, value)
         return True
+
+    _DATE_FORMATS: tuple = (
+        "%Y-%m-%d", "%B %d, %Y", "%B %d %Y", "%b %d, %Y", "%b %d %Y",
+        "%d %B %Y", "%d %b %Y", "%m/%d/%Y",
+    )
+
+    @staticmethod
+    def _parse_date_flexible(date_str: str) -> Optional[Any]:
+        """Parse a date string in multiple formats. Returns datetime or None."""
+        formats = BeamMemory._DATE_FORMATS
+        for fmt in formats:
+            try:
+                return datetime.strptime(date_str.strip(), fmt)
+            except (ValueError, AttributeError):
+                continue
+        return None
+
+    def _derive_durations(self, session: str, max_pairs: int = 15) -> int:
+        """Derive interval facts from related timeline events.
+
+        Pairs dates that share topic words, computes duration, and stores as
+        fact_type='duration'. Bounded to max_pairs; only related pairs (shared
+        topic words) are included.
+
+        Returns the number of duration facts inserted.
+        """
+        entries = self.conn.execute(
+            "SELECT date, message_idx, description FROM memoria_timelines "
+            "WHERE session_id = ? ORDER BY date ASC",
+            (session,)
+        ).fetchall()
+
+        if len(entries) < 2:
+            return 0
+
+        parsed = []
+        for d, mi, desc in entries:
+            dt = self._parse_date_flexible(d)
+            if dt is not None:
+                parsed.append((dt, mi, d, desc))
+
+        if len(parsed) < 2:
+            return 0
+
+        parsed.sort(key=lambda x: x[0])
+
+        inserted = 0
+        # Limit to recent pairs to avoid combinatorial explosion
+        for i in range(len(parsed)):
+            if inserted >= max_pairs:
+                break
+            for j in range(i + 1, min(i + 8, len(parsed))):
+                if inserted >= max_pairs:
+                    break
+                dt_a, mi_a, date_a, desc_a = parsed[i]
+                dt_b, mi_b, date_b, desc_b = parsed[j]
+                days = (dt_b - dt_a).days
+                weeks = days / 7.0
+                # Score by shared topic words between descs
+                words_a = set(w.lower() for w in desc_a.split())
+                words_b = set(w.lower() for w in desc_b.split())
+                # Remove common stopwords
+                stop = {'the', 'my', 'a', 'an', 'and', 'of', 'in', 'to',
+                        'for', 'with', 'on', 'that', 'this', 'is', 'it'}
+                words_a -= stop
+                words_b -= stop
+                shared = words_a & words_b
+
+                if not shared:
+                    continue
+
+                weeks_str = f"{weeks:.1f} weeks" if weeks >= 1 else f"{days} days"
+
+                # Build a key from shared words + the date range
+                topic_key = '_'.join(sorted(shared))[:40]
+                fact_key = f"{topic_key}_duration"
+                value = f"{weeks_str} ({date_a} -> {date_b})"
+
+                ctx = f"{desc_a} .. {desc_b}"
+                if self._insert_fact(session, mi_b, 'duration', fact_key,
+                                     value, ctx, 0.7,
+                                     source_memory_id=f"dur:{date_a}:{date_b}"):
+                    inserted += 1
+
+        return inserted
 
     def _insert_change_fact(self, session: str, msg_idx: int,
                             key: str, old_value: str, new_value: str,
@@ -5382,6 +5547,26 @@ Now respond with ONLY the JSON array, no explanation."""
         except Exception:
             timing['semantic_ms'] = 0
             specialists.append(('semantic', {"context": "", "facts": [], "source": "fallback"}))
+
+        # Specialist 8: Instruction retrieval (explicit user instructions like "always X").
+        try:
+            start = _time.perf_counter()
+            instr_result = self._memoria_instruction_retrieve(query, top_k=top_k)
+            timing['instruction_ms'] = (_time.perf_counter() - start) * 1000
+            specialists.append(('instruction', instr_result))
+        except Exception:
+            timing['instruction_ms'] = 0
+            specialists.append(('instruction', {"context": "", "facts": [], "source": "fallback"}))
+
+        # Specialist 9: Preference retrieval (user preferences like "I prefer Y").
+        try:
+            start = _time.perf_counter()
+            pref_result = self._memoria_preference_retrieve(query, top_k=top_k)
+            timing['preference_ms'] = (_time.perf_counter() - start) * 1000
+            specialists.append(('preference', pref_result))
+        except Exception:
+            timing['preference_ms'] = 0
+            specialists.append(('preference', {"context": "", "facts": [], "source": "fallback"}))
 
         # Build ranked lists from each specialist's results
         # Stable key for fusion: use fact's source_memory_id if available, else content hash
@@ -5907,7 +6092,7 @@ Now respond with ONLY the JSON array, no explanation."""
     def _compute_date_delta(old_val: str, new_val: str):
         """Try to compute days between two date-like strings. Returns string or None."""
         from datetime import datetime
-        for fmt in ('%Y-%m-%d', '%B %d, %Y', '%B %d %Y', '%b %d, %Y', '%b %d %Y'):
+        for fmt in BeamMemory._DATE_FORMATS:
             try:
                 d1 = datetime.strptime(old_val.strip(), fmt)
                 d2 = datetime.strptime(new_val.strip(), fmt)

@@ -65,6 +65,7 @@ def _setup_write_llm_env():
 
 from tools.evaluate_beam_end_to_end import (
     ABILITY_MAP,
+    LLMClient,
     answer_with_memory,
     ingest_conversation,
     load_beam_dataset,
@@ -191,7 +192,8 @@ CACHE_DB = PROJECT_ROOT / "tests" / ".beam_recall_cache" / "beam_100K_conv0.db"
 def get_cached_beam_and_conv():
     """Return (beam, conv) for BEAM 100K conv 0, reusing a cached ingested DB.
 
-    Builds the DB once (ingest with llm=None) if missing; otherwise just opens it.
+    Builds the DB once (ingest with LLM extraction: use_cloud + llm_client)
+    if missing; otherwise just opens it.
     - Always loads conversation metadata (cheap, needed for questions).
     - If CACHE_DB exists: open BeamMemory and return (beam, conv) WITHOUT re-ingesting.
     - If it does NOT exist: create parent dir, ingest conversation, then return (beam, conv).
@@ -211,16 +213,18 @@ def get_cached_beam_and_conv():
         print(f"[cache] reusing existing DB at {CACHE_DB}", flush=True)
         beam = BeamMemory(db_path=CACHE_DB, session_id=session_id)
     else:
-        # Build cache WITH the LLM (use_cloud=True): the WRITE step extracts
-        # facts + conclusions via qwen3.6 into the cached DB. The recall test
-        # then reads this cached output with NO LLM -- the LLM is a one-time
-        # write cost; recall is free, offline and deterministic.
-        print(f"[cache] building with LLM extraction (use_cloud=True)...", flush=True)
+        # Build cache WITH both LLM extraction paths:
+        #   - use_cloud=True: ExtractionClient for SPO facts + conclusions
+        #   - llm_client: new bounded JSON schema
+        # The recall test then reads this cached output with NO LLM.
+        print(f"[cache] building with LLM extraction (use_cloud=True + llm_client)...", flush=True)
         _setup_write_llm_env()
+        llm = LLMClient(model=os.environ.get("EDUMEM_LLM_MODEL", "qwen3.6"))
         CACHE_DB.parent.mkdir(parents=True, exist_ok=True)
-        beam = BeamMemory(db_path=CACHE_DB, session_id=session_id, use_cloud=True)
+        beam = BeamMemory(db_path=CACHE_DB, session_id=session_id,
+                          use_cloud=True, llm_client=llm)
         print(f"[cache] Ingesting conversation {conv['id']} ({len(conv['messages'])} messages)...", flush=True)
-        ingest_conversation(beam, conv["messages"], llm=None)
+        ingest_conversation(beam, conv["messages"], llm=llm)
         # Consolidate once after ingest (force=True: benchmark data is fresh "now",
         # so an age-gated sleep would no-op). Populates the episodic layer.
         try:

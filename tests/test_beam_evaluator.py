@@ -2655,7 +2655,7 @@ def test_fused_recall_non_ordering_query_unaffected(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# LLM-based write-time fact extraction (flag-gated: EDUMEM_LLM_EXTRACTION)
+# LLM-based write-time fact extraction
 # ---------------------------------------------------------------------------
 
 class _RecordingLLMClient:
@@ -2800,10 +2800,8 @@ def test_store_extraction_chains_and_routes(tmp_path):
 
 def test_extraction_truncation_falls_back_to_regex(tmp_path):
     saved = os.environ.get("EDUMEM_NO_EMBEDDINGS")
-    saved_flag = os.environ.get("EDUMEM_LLM_EXTRACTION")
     saved_consol = os.environ.get("EDUMEM_LLM_FACT_CONSOLIDATION")
     os.environ["EDUMEM_NO_EMBEDDINGS"] = "1"
-    os.environ.pop("EDUMEM_LLM_EXTRACTION", None)
     os.environ["EDUMEM_LLM_FACT_CONSOLIDATION"] = "0"
     try:
         beam_mod = pytest.importorskip("edumem.core.beam")
@@ -2820,8 +2818,6 @@ def test_extraction_truncation_falls_back_to_regex(tmp_path):
             os.environ.pop("EDUMEM_NO_EMBEDDINGS", None)
         else:
             os.environ["EDUMEM_NO_EMBEDDINGS"] = saved
-        if saved_flag is not None:
-            os.environ["EDUMEM_LLM_EXTRACTION"] = saved_flag
         if saved_consol is None:
             os.environ.pop("EDUMEM_LLM_FACT_CONSOLIDATION", None)
         else:
@@ -2883,10 +2879,8 @@ def test_fused_recall_includes_kg_source(tmp_path):
 def test_llm_extraction_happy_path_flag_on(tmp_path):
     """Full end-to-end: flag ON, client returns valid JSON → correct counts + storage."""
     saved = os.environ.get("EDUMEM_NO_EMBEDDINGS")
-    saved_flag = os.environ.get("EDUMEM_LLM_EXTRACTION")
     saved_consol = os.environ.get("EDUMEM_LLM_FACT_CONSOLIDATION")
     os.environ["EDUMEM_NO_EMBEDDINGS"] = "1"
-    os.environ["EDUMEM_LLM_EXTRACTION"] = "1"
     os.environ["EDUMEM_LLM_FACT_CONSOLIDATION"] = "0"
     try:
         response = json.dumps({
@@ -2900,11 +2894,11 @@ def test_llm_extraction_happy_path_flag_on(tmp_path):
             "The dashboard API response time is 250ms. We never used flask.",
             message_idx=5
         )
-        assert counts["metric"] == 1
-        assert counts["entity"] == 1
-        assert counts["negation"] == 1
-        assert counts["date"] == 1
-        assert counts["timeline"] == 1
+        assert counts["metric"] >= 1  # regex + LLM both extract
+        assert counts["entity"] >= 1
+        assert counts["negation"] >= 1
+        assert counts["date"] >= 1
+        assert counts["timeline"] >= 1
         assert len(client.chat_calls) == 1
 
         row = beam.conn.execute(
@@ -2941,10 +2935,6 @@ def test_llm_extraction_happy_path_flag_on(tmp_path):
             os.environ.pop("EDUMEM_NO_EMBEDDINGS", None)
         else:
             os.environ["EDUMEM_NO_EMBEDDINGS"] = saved
-        if saved_flag is not None:
-            os.environ["EDUMEM_LLM_EXTRACTION"] = saved_flag
-        else:
-            os.environ.pop("EDUMEM_LLM_EXTRACTION", None)
         if saved_consol is None:
             os.environ.pop("EDUMEM_LLM_FACT_CONSOLIDATION", None)
         else:
@@ -2954,10 +2944,8 @@ def test_llm_extraction_happy_path_flag_on(tmp_path):
 def test_llm_extraction_version_chains_across_messages(tmp_path):
     """Flag ON: same key in two messages → version chain with previous_value."""
     saved = os.environ.get("EDUMEM_NO_EMBEDDINGS")
-    saved_flag = os.environ.get("EDUMEM_LLM_EXTRACTION")
     saved_consol = os.environ.get("EDUMEM_LLM_FACT_CONSOLIDATION")
     os.environ["EDUMEM_NO_EMBEDDINGS"] = "1"
-    os.environ["EDUMEM_LLM_EXTRACTION"] = "1"
     os.environ["EDUMEM_LLM_FACT_CONSOLIDATION"] = "0"
     try:
         v1 = json.dumps({
@@ -2990,10 +2978,42 @@ def test_llm_extraction_version_chains_across_messages(tmp_path):
             os.environ.pop("EDUMEM_NO_EMBEDDINGS", None)
         else:
             os.environ["EDUMEM_NO_EMBEDDINGS"] = saved
-        if saved_flag is not None:
-            os.environ["EDUMEM_LLM_EXTRACTION"] = saved_flag
+        if saved_consol is None:
+            os.environ.pop("EDUMEM_LLM_FACT_CONSOLIDATION", None)
         else:
-            os.environ.pop("EDUMEM_LLM_EXTRACTION", None)
+            os.environ["EDUMEM_LLM_FACT_CONSOLIDATION"] = saved_consol
+
+
+def test_regex_keys_appear_in_llm_prompt(tmp_path):
+    """Regex-extracted keys appear as structured categories (not flat list) in the LLM prompt."""
+    saved = os.environ.get("EDUMEM_NO_EMBEDDINGS")
+    saved_consol = os.environ.get("EDUMEM_LLM_FACT_CONSOLIDATION")
+    os.environ["EDUMEM_NO_EMBEDDINGS"] = "1"
+    os.environ["EDUMEM_LLM_FACT_CONSOLIDATION"] = "0"
+    try:
+        response = json.dumps({"facts": [], "entities": [], "relations": [], "dates": []})
+        beam, client = _make_beam_with_llm(tmp_path, response=response)
+        beam.extract_and_store_facts(
+            "The response time is 250ms. "
+            "I have never used Flask in production. "
+            "Always use UTC timestamps for logs.",
+            message_idx=0, source="user"
+        )
+        assert len(client.chat_calls) == 1
+        prompt = client.chat_calls[0]["messages"][0]["content"]
+        assert "=== ALREADY EXTRACTED (regex) ===" in prompt
+        assert "=== FOCUS ON COMPLEMENTARY EXTRACTION ===" in prompt
+        assert "METRICS:" in prompt
+        assert "response_time_ms" in prompt
+        assert "NEGATIONS:" in prompt
+        assert "INSTRUCTIONS:" in prompt
+        assert "DO NOT re-extract" not in prompt
+    finally:
+        beam.conn.close()
+        if saved is None:
+            os.environ.pop("EDUMEM_NO_EMBEDDINGS", None)
+        else:
+            os.environ["EDUMEM_NO_EMBEDDINGS"] = saved
         if saved_consol is None:
             os.environ.pop("EDUMEM_LLM_FACT_CONSOLIDATION", None)
         else:
@@ -3003,10 +3023,8 @@ def test_llm_extraction_version_chains_across_messages(tmp_path):
 def test_llm_extraction_empty_parse_falls_back_to_regex(tmp_path):
     """Flag ON but empty JSON response → falls through to regex path."""
     saved = os.environ.get("EDUMEM_NO_EMBEDDINGS")
-    saved_flag = os.environ.get("EDUMEM_LLM_EXTRACTION")
     saved_consol = os.environ.get("EDUMEM_LLM_FACT_CONSOLIDATION")
     os.environ["EDUMEM_NO_EMBEDDINGS"] = "1"
-    os.environ["EDUMEM_LLM_EXTRACTION"] = "1"
     os.environ["EDUMEM_LLM_FACT_CONSOLIDATION"] = "0"
     try:
         response = json.dumps({"facts": [], "entities": [], "relations": [], "dates": []})
@@ -3022,10 +3040,6 @@ def test_llm_extraction_empty_parse_falls_back_to_regex(tmp_path):
             os.environ.pop("EDUMEM_NO_EMBEDDINGS", None)
         else:
             os.environ["EDUMEM_NO_EMBEDDINGS"] = saved
-        if saved_flag is not None:
-            os.environ["EDUMEM_LLM_EXTRACTION"] = saved_flag
-        else:
-            os.environ.pop("EDUMEM_LLM_EXTRACTION", None)
         if saved_consol is None:
             os.environ.pop("EDUMEM_LLM_FACT_CONSOLIDATION", None)
         else:
@@ -3035,10 +3049,8 @@ def test_llm_extraction_empty_parse_falls_back_to_regex(tmp_path):
 def test_llm_extraction_client_exception_falls_back_to_regex(tmp_path):
     """Flag ON but client raises → falls through to regex path."""
     saved = os.environ.get("EDUMEM_NO_EMBEDDINGS")
-    saved_flag = os.environ.get("EDUMEM_LLM_EXTRACTION")
     saved_consol = os.environ.get("EDUMEM_LLM_FACT_CONSOLIDATION")
     os.environ["EDUMEM_NO_EMBEDDINGS"] = "1"
-    os.environ["EDUMEM_LLM_EXTRACTION"] = "1"
     os.environ["EDUMEM_LLM_FACT_CONSOLIDATION"] = "0"
     try:
 
@@ -3064,10 +3076,130 @@ def test_llm_extraction_client_exception_falls_back_to_regex(tmp_path):
             os.environ.pop("EDUMEM_NO_EMBEDDINGS", None)
         else:
             os.environ["EDUMEM_NO_EMBEDDINGS"] = saved
-        if saved_flag is not None:
-            os.environ["EDUMEM_LLM_EXTRACTION"] = saved_flag
+        if saved_consol is None:
+            os.environ.pop("EDUMEM_LLM_FACT_CONSOLIDATION", None)
         else:
-            os.environ.pop("EDUMEM_LLM_EXTRACTION", None)
+            os.environ["EDUMEM_LLM_FACT_CONSOLIDATION"] = saved_consol
+
+
+def test_regex_and_llm_dedup_same_key(tmp_path):
+    """Same fact from regex + LLM should dedup, not duplicate."""
+    import json
+    saved = os.environ.get("EDUMEM_NO_EMBEDDINGS")
+    os.environ["EDUMEM_NO_EMBEDDINGS"] = "1"
+    try:
+        response = json.dumps({
+            "facts": [{"key": "response_time_ms", "value": "250ms", "type": "metric"}],
+            "entities": [], "relations": [], "dates": [],
+        })
+        beam, client = _make_beam_with_llm(tmp_path, response=response)
+        counts = beam.extract_and_store_facts(
+            "The API response time was 250ms.", message_idx=5
+        )
+        assert counts.get("metric", 0) >= 1, "regex should extract metric"
+
+        rows = beam.conn.execute(
+            "SELECT COUNT(*) FROM memoria_facts WHERE session_id=? AND key='response_time_ms' AND value='250ms'",
+            (beam.session_id,),
+        ).fetchone()
+        assert rows[0] == 1, f"Expected 1 row, got {rows[0]}"
+
+        row = beam.conn.execute(
+            "SELECT value FROM memoria_facts WHERE session_id=? AND key='response_time_ms'",
+            (beam.session_id,),
+        ).fetchone()
+        assert row is not None
+        assert row[0] == "250ms"
+    finally:
+        beam.conn.close()
+        if saved is None:
+            os.environ.pop("EDUMEM_NO_EMBEDDINGS", None)
+        else:
+            os.environ["EDUMEM_NO_EMBEDDINGS"] = saved
+
+
+def test_derive_durations_in_pipeline(tmp_path):
+    """Duration facts should be created from timeline entries during extraction."""
+    import os
+    saved = os.environ.get("EDUMEM_NO_EMBEDDINGS")
+    os.environ["EDUMEM_NO_EMBEDDINGS"] = "1"
+    try:
+        from edumem.core.beam import BeamMemory
+        beam = BeamMemory(db_path=str(tmp_path / "test.db"), session_id="dur-test", llm_client=None)
+
+        beam._insert_timeline(beam.session_id, "2024-01-15", 3, "started project planning", "test")
+        beam._insert_timeline(beam.session_id, "2024-03-20", 5, "completed project planning phase", "test")
+        beam.conn.commit()
+
+        counts = beam.extract_and_store_facts(
+            "We started project planning on 2024-01-15 and completed the project planning phase on 2024-03-20.",
+            message_idx=10
+        )
+
+        rows = beam.conn.execute(
+            "SELECT COUNT(*) FROM memoria_facts WHERE session_id=? AND fact_type='duration'",
+            (beam.session_id,),
+        ).fetchone()
+        assert rows[0] > 0, f"Expected duration facts, got {rows[0]}"
+        assert counts.get("duration", 0) > 0, "counts should include duration"
+
+        dur = beam.conn.execute(
+            "SELECT key, value FROM memoria_facts WHERE session_id=? AND fact_type='duration' LIMIT 1",
+            (beam.session_id,),
+        ).fetchone()
+        assert dur is not None
+        assert "week" in dur[1].lower() or "day" in dur[1].lower(), f"Expected duration text in: {dur[1]}"
+    finally:
+        beam.conn.close()
+        if saved is None:
+            os.environ.pop("EDUMEM_NO_EMBEDDINGS", None)
+        else:
+            os.environ["EDUMEM_NO_EMBEDDINGS"] = saved
+
+
+def test_full_pipeline_regex_then_llm_version_chain(tmp_path):
+    """Regex + LLM writing same key across messages should version-chain."""
+    import json, os
+    saved = os.environ.get("EDUMEM_NO_EMBEDDINGS")
+    saved_consol = os.environ.get("EDUMEM_LLM_FACT_CONSOLIDATION")
+    os.environ["EDUMEM_NO_EMBEDDINGS"] = "1"
+    os.environ["EDUMEM_LLM_FACT_CONSOLIDATION"] = "0"
+    try:
+        v1_response = json.dumps({
+            "facts": [{"key": "response_time_ms", "value": "250ms", "type": "metric"}],
+            "entities": [], "relations": [], "dates": [],
+        })
+        beam, client = _make_beam_with_llm(tmp_path, response=v1_response)
+        beam.extract_and_store_facts("Response is 250ms.", message_idx=5)
+
+        v2_response = json.dumps({
+            "facts": [{"key": "response_time_ms", "value": "180ms", "type": "metric"}],
+            "entities": [], "relations": [], "dates": [],
+        })
+        client.response = v2_response
+        beam.extract_and_store_facts("After optimization: 180ms.", message_idx=10)
+        beam.conn.commit()
+
+        rows = beam.conn.execute(
+            "SELECT value, version_id, previous_value FROM memoria_facts "
+            "WHERE session_id=? AND key='response_time_ms' AND fact_type='metric' "
+            "ORDER BY version_id",
+            (beam.session_id,),
+        ).fetchall()
+        assert len(rows) >= 2, f"Expected version chain, got {len(rows)} rows"
+
+        values = [r[0] for r in rows]
+        assert "250ms" in values, "First value should be present"
+        assert "180ms" in values, "Second value should be present"
+
+        latest = rows[-1]
+        assert latest[2] == "250ms" or latest[2] is not None, "Should track previous value"
+    finally:
+        beam.conn.close()
+        if saved is None:
+            os.environ.pop("EDUMEM_NO_EMBEDDINGS", None)
+        else:
+            os.environ["EDUMEM_NO_EMBEDDINGS"] = saved
         if saved_consol is None:
             os.environ.pop("EDUMEM_LLM_FACT_CONSOLIDATION", None)
         else:
@@ -3397,3 +3529,272 @@ def test_insert_fact_dedups_duplicate_dates_keeps_distinct(tmp_path):
         beam.conn.close()
         if saved is None: os.environ.pop("EDUMEM_NO_EMBEDDINGS", None)
         else: os.environ["EDUMEM_NO_EMBEDDINGS"] = saved
+
+
+# ---------------------------------------------------------------------------
+# Context budget enforcement
+# ---------------------------------------------------------------------------
+
+
+def test_assemble_memory_context_enforces_char_budget(tmp_path):
+    """_assemble_memory_context must respect max_chars and truncate oversized content."""
+    from tools.evaluate_beam_end_to_end import _assemble_memory_context
+
+    short = {"content": "A" * 100, "score": 0.9}
+    long = {"content": "B" * 5000, "score": 0.8}
+    tiny_budget = 200
+
+    ctx, mems = _assemble_memory_context([short, long], tiny_budget)
+    assert len(ctx) >= 100, "should include at least first item"
+    assert len(ctx) <= tiny_budget + 50, f"ctx {len(ctx)} exceeds budget {tiny_budget}"
+    assert len(ctx) < 5000, "long item should be truncated"
+
+
+def test_assemble_memory_context_skips_low_score_items(tmp_path):
+    """Items below 0.05 score should be excluded from context."""
+    from tools.evaluate_beam_end_to_end import _assemble_memory_context
+
+    memories = [
+        {"content": "relevant data here", "score": 0.9},
+        {"content": "noise to skip", "score": 0.01},
+        {"content": "more noise", "score": 0.0},
+    ]
+    ctx, mems = _assemble_memory_context(memories, 10000)
+    assert "relevant data" in ctx
+    assert "noise to skip" not in ctx
+    assert "more noise" not in ctx
+
+
+def test_overflow_signaling_in_context(tmp_path):
+    """When budget truncation occurs, context should signal omitted items."""
+    from tools.evaluate_beam_end_to_end import _assemble_memory_context
+
+    items = [
+        {"content": "important info here", "score": 0.9, "source_memory_id": "mem1"},
+        {"content": "also relevant content", "score": 0.8, "source_memory_id": "mem2"},
+        {"content": "somewhat relevant", "score": 0.6, "source_memory_id": "mem3"},
+        {"content": "less relevant data", "score": 0.3, "source_memory_id": "mem4"},
+        {"content": "barely relevant stuff", "score": 0.1, "source_memory_id": "mem5"},
+    ]
+    tiny_budget = 50
+    ctx, mems = _assemble_memory_context(items, tiny_budget)
+
+    assert "omitted" in ctx.lower(), "Should signal omitted items"
+    assert "important info" in ctx
+    assert len(mems) <= len(items)
+    import re
+    omitted_nums = re.findall(r'(\d+)\s+additional', ctx)
+    assert not omitted_nums or int(omitted_nums[0]) > 0
+
+
+def test_budget_enforcement_preserves_highest_scores(tmp_path):
+    """Budget should keep highest-score items, not just greedy fill."""
+    from tools.evaluate_beam_end_to_end import _assemble_memory_context
+
+    items = [
+        {"content": "HIGH very important", "score": 0.95, "source_memory_id": "h1"},
+        {"content": "MEDIUM moderately relevant detail here", "score": 0.65, "source_memory_id": "m1"},
+        {"content": "LOW less relevant information here", "score": 0.35, "source_memory_id": "l1"},
+    ]
+    budget = 120
+    ctx, mems = _assemble_memory_context(items, budget)
+    assert "HIGH" in ctx
+    assert "MEDIUM" in ctx
+    assert "LOW" in ctx
+    assert len(mems) == 3
+
+    tight = 30
+    ctx2, mems2 = _assemble_memory_context(items, tight)
+    assert "HIGH" in ctx2, "Highest score item should survive"
+    assert "MEDIUM" not in ctx2, "Lower-score item should be omitted under tight budget"
+
+
+def test_sub_budgets_prevent_one_type_dominating(tmp_path):
+    """Sub-budgets ensure both fact and timeline types survive even when
+    one type would overwhelm the other under a global budget alone.
+    WITHOUT sub-budgets, 10 high-score fact items (~3000 chars) fill the
+    2000 char budget entirely and crowd out timeline items.
+    
+    Each item MUST have unique content to survive the dedup filter."""
+    fact_items = [
+        {"content": "FACT_{:04d}_".format(i) + "X" * 270, "score": 0.95,
+         "type": "fact", "source_memory_id": f"f{i}"}
+        for i in range(10)
+    ]
+    timeline_items = [
+        {"content": "TIME_{:04d}_".format(i) + "Y" * 170, "score": 0.80,
+         "type": "timeline", "source_memory_id": f"t{i}"}
+        for i in range(3)
+    ]
+    items = fact_items + timeline_items
+
+    fact_saved = os.environ.get("EDUMEM_SUB_BUDGET_FACT")
+    tl_saved = os.environ.get("EDUMEM_SUB_BUDGET_TIMELINE")
+    os.environ["EDUMEM_SUB_BUDGET_FACT"] = "400"
+    os.environ["EDUMEM_SUB_BUDGET_TIMELINE"] = "500"
+    try:
+        ctx, mems = _assemble_memory_context(items, 2000)
+        assert "FACT" in ctx, "Fact items should be present"
+        assert "TIME" in ctx, "Timeline items should be present (sub-budget saves them)"
+        total_len = len(ctx)
+        assert total_len <= 2000, f"Total context {total_len} exceeds global budget 2000"
+        # Verify the test is non-vacuous: count of unique items in selected lane
+        # With 400 char fact budget, at most 1 fact (280 chars) fits
+        # With 500 char timeline budget, at most 2 timelines (172 chars each) fit
+        included = [m for m in mems if m.get("final_context_included")]
+        has_time = any("TIME" in m.get("content", "") for m in included)
+        assert has_time, "TIME should appear — sub-budgets protect timeline items"
+    finally:
+        if fact_saved is None:
+            os.environ.pop("EDUMEM_SUB_BUDGET_FACT", None)
+        else:
+            os.environ["EDUMEM_SUB_BUDGET_FACT"] = fact_saved
+        if tl_saved is None:
+            os.environ.pop("EDUMEM_SUB_BUDGET_TIMELINE", None)
+        else:
+            os.environ["EDUMEM_SUB_BUDGET_TIMELINE"] = tl_saved
+
+
+def test_sub_budgets_global_override(tmp_path):
+    """When per-type sub-budgets sum to more than the global budget, the
+    global budget still prunes items across types after per-type fill.
+    Without the final global pass, all items would fit within their
+    per-type lanes; the global budget enforces the hard ceiling."""
+    items = [
+        {"content": "A" * 800, "score": 0.95, "type": "fact", "source_memory_id": "f1"},
+        {"content": "B" * 800, "score": 0.90, "type": "fact", "source_memory_id": "f2"},
+        {"content": "C" * 800, "score": 0.50, "type": "timeline", "source_memory_id": "t1"},
+    ]
+
+    fact_saved = os.environ.get("EDUMEM_SUB_BUDGET_FACT")
+    tl_saved = os.environ.get("EDUMEM_SUB_BUDGET_TIMELINE")
+    os.environ["EDUMEM_SUB_BUDGET_FACT"] = "12000"
+    os.environ["EDUMEM_SUB_BUDGET_TIMELINE"] = "6000"
+    try:
+        ctx, mems = _assemble_memory_context(items, 1000)
+        assert "omitted" in ctx.lower(), "Overflow signaling should be present"
+        assert "A" in ctx, "Highest-score item should be included"
+        assert "C" not in ctx, "Lowest-score item should be pruned by global budget"
+        included_count = sum(1 for m in mems if m.get("final_context_included"))
+        assert included_count < len(items), "Some items should be pruned by global budget"
+    finally:
+        if fact_saved is None:
+            os.environ.pop("EDUMEM_SUB_BUDGET_FACT", None)
+        else:
+            os.environ["EDUMEM_SUB_BUDGET_FACT"] = fact_saved
+        if tl_saved is None:
+            os.environ.pop("EDUMEM_SUB_BUDGET_TIMELINE", None)
+        else:
+            os.environ["EDUMEM_SUB_BUDGET_TIMELINE"] = tl_saved
+
+
+# ---------------------------------------------------------------------------
+# Duration derivation (TR coverage gap)
+# ---------------------------------------------------------------------------
+
+
+def test_interval_derivation_computes_weeks(tmp_path):
+    """Related timeline entries produce a duration fact with weeks."""
+    saved = os.environ.get("EDUMEM_NO_EMBEDDINGS")
+    os.environ["EDUMEM_NO_EMBEDDINGS"] = "1"
+    try:
+        beam = _make_beam(tmp_path)
+        session = beam.session_id
+        beam._insert_timeline(session, "2024-01-15", 1, "transaction management module dev", "test")
+        beam._insert_timeline(session, "2024-03-15", 2, "final deployment of transaction module", "test")
+        beam.conn.commit()
+        n = beam._derive_durations(session, max_pairs=15)
+        assert n >= 1
+        rows = beam.conn.execute(
+            "SELECT key, value FROM memoria_facts "
+            "WHERE session_id=? AND fact_type='duration'",
+            (session,),
+        ).fetchall()
+        assert len(rows) >= 1
+        key, val = rows[0]
+        assert "transaction" in key or "deployment" in key or "module" in key
+        assert "8 weeks" in val or "weeks" in val
+        assert "2024-01-15" in val and "2024-03-15" in val
+    finally:
+        beam.conn.close()
+        if saved is None:
+            os.environ.pop("EDUMEM_NO_EMBEDDINGS", None)
+        else:
+            os.environ["EDUMEM_NO_EMBEDDINGS"] = saved
+
+
+def test_interval_derivation_is_bounded_and_related(tmp_path):
+    """Unrelated dates do not produce duration facts; total capped."""
+    saved = os.environ.get("EDUMEM_NO_EMBEDDINGS")
+    os.environ["EDUMEM_NO_EMBEDDINGS"] = "1"
+    try:
+        beam = _make_beam(tmp_path)
+        session = beam.session_id
+        beam._insert_timeline(session, "2024-01-15", 1, "transaction management module dev", "test")
+        beam._insert_timeline(session, "2024-03-15", 2, "final deployment of transaction module", "test")
+        beam._insert_timeline(session, "2024-06-01", 3, "pizza party team building", "test")
+        beam._insert_timeline(session, "2024-07-01", 4, "office renovation project", "test")
+        beam.conn.commit()
+        n = beam._derive_durations(session, max_pairs=1)
+        assert n <= 1
+        rows = beam.conn.execute(
+            "SELECT key, value FROM memoria_facts "
+            "WHERE session_id=? AND fact_type='duration'",
+            (session,),
+        ).fetchall()
+        keys = " ".join(r[0] for r in rows)
+        assert "transaction" in keys or "deployment" in keys or "module" in keys
+        assert "pizza" not in keys and "office" not in keys
+    finally:
+        beam.conn.close()
+        if saved is None:
+            os.environ.pop("EDUMEM_NO_EMBEDDINGS", None)
+        else:
+            os.environ["EDUMEM_NO_EMBEDDINGS"] = saved
+
+
+# ---------------------------------------------------------------------------
+# Instruction retrieval (IF coverage gap)
+# ---------------------------------------------------------------------------
+
+
+def test_user_instruction_is_retrieved(tmp_path):
+    """Stored instruction appears in memora_retrieve context for a relevant query."""
+    saved = os.environ.get("EDUMEM_NO_EMBEDDINGS")
+    os.environ["EDUMEM_NO_EMBEDDINGS"] = "1"
+    try:
+        beam = _make_beam(tmp_path)
+        session = beam.session_id
+        beam._insert_instruction(session, 5, "Always explain step by step.",
+                                 "formatting", "User wants step by step")
+        beam.conn.commit()
+        result = beam.memoria_retrieve("explain step by step to me", top_k=10)
+        ctx = result.get("context", "")
+        assert "step by step" in ctx or "Step by step" in ctx
+    finally:
+        beam.conn.close()
+        if saved is None:
+            os.environ.pop("EDUMEM_NO_EMBEDDINGS", None)
+        else:
+            os.environ["EDUMEM_NO_EMBEDDINGS"] = saved
+
+
+def test_user_preference_is_retrieved(tmp_path):
+    """Stored preference appears in memora_retrieve context for a relevant query."""
+    saved = os.environ.get("EDUMEM_NO_EMBEDDINGS")
+    os.environ["EDUMEM_NO_EMBEDDINGS"] = "1"
+    try:
+        beam = _make_beam(tmp_path)
+        session = beam.session_id
+        beam._insert_preference(session, 7, "I prefer dark mode themes.",
+                                "theme", None, "User likes dark mode")
+        beam.conn.commit()
+        result = beam.memoria_retrieve("what theme do I prefer", top_k=10)
+        ctx = result.get("context", "")
+        assert "dark" in ctx.lower()
+    finally:
+        beam.conn.close()
+        if saved is None:
+            os.environ.pop("EDUMEM_NO_EMBEDDINGS", None)
+        else:
+            os.environ["EDUMEM_NO_EMBEDDINGS"] = saved
