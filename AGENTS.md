@@ -162,7 +162,7 @@ signal.
   keywords), never whole rubric sentences — the answer LLM paraphrases, so literal
   multi-word phrase matching is brittle.
 
-## Known gaps / root causes (as of 2026-06-20, evidence-backed)
+## Known gaps / root causes (as of 2026-06-26, evidence-backed)
 
 These are diagnosed from the captured real run
 (`results/beam_results_20260620_104723/`) plus source-conversation verification —
@@ -202,23 +202,46 @@ deterministic, not n=1 speculation.
 4. **EO orders by latest-state, not first-mention.** q4/q5 (~13%): the model labels
    topics by their optimized form and the first-appearance ordering drifts.
 
+5. **TR context is anomalously short (6014 chars vs 16K budget).** In the
+   3-conversation recall test, TR's mean context length was only 6014 chars —
+   roughly 1/3 of the 16K sub-budget. The timeline/chrono specialists gate
+   on `is_temporal`, which should fire for "how many weeks" / "between which
+   dates" queries, but the actual populated rows in `memoria_timelines` may
+   be filtering too aggressively. Possibly the anchor-date matching logic
+   (`date LIKE ?` with month prefix) returns too few rows, or the question
+   terms don't overlap with stored timeline descriptions. The short context
+   suggests timeline/chrono are hitting empty fallback more often than expected.
+
+6. **Multi-conversation cross-talk despite isolated session_ids.** With 3
+   conversations (582 messages, 60 questions), overall recall dropped from
+   0.415 (1-conv) to 0.334. Some of this is harder questions (each
+   conversation has different difficulty), but PF/EO/MR/SUM all regressed
+   meaningfully. The ABS/PF floor (0.000) persists even with the semantic
+   specialist enabled — embeddings are populated in vec_facts but KNN doesn't
+   bridge the paraphrase gap for these abilities.
+
 CAVEATS for whoever continues:
 - `recall_provenance.memories[].final_context_included` is UNRELIABLE — it showed
   `False` for messages the model demonstrably used. Do not trust it to decide what
   reached the prompt; instrument the actual assembled context instead.
 - Do not claim versioning "fixed" CR/EO/TR from storage metrics alone — and note
   it can't help at all until gap #1 is addressed.
+- The `server_nvidia.py` GPU memory limit (`NVIDIA_GPU_MEM_LIMIT`, default 4GB
+  per session with `arena_extend_strategy: kSameAsRequested`) is critical — the
+  ONNX Runtime CUDA EP pre-allocates a huge arena by default, consuming 23.7/24.5GB
+  for two small models. Restart the container if GPU memory is exhausted.
 
 ## Retrieval-recall benchmark analysis (2026-06-24)
 
 ### What was done
 
-Added **cached DB** (`tests/.beam_recall_cache/beam_100K_conv0.db`) to avoid
-re-ingesting the BEAM 100K conversation. The test fixture
-`get_cached_beam_and_conv()` builds once **with `use_cloud=True`** (so the cache
-reflects the real qwen3.6 facts+conclusions pipeline, not regex), reuses on
-subsequent runs. Delete `tests/.beam_recall_cache/` to force a rebuild. Also
-monkey-patched `_embed_api` with `requests.Session` connection pooling. The
+Added **cached DB** (`tests/.beam_recall_cache/beam_100K_conv0.db`, later
+`beam_100K_x3.db` for 3 conversations with isolated session_ids) to avoid
+re-ingesting. The test fixture builds once **with `use_cloud=True`** (real
+qwen3.6 facts+conclusions), reuses on subsequent runs. Delete
+`tests/.beam_recall_cache/` to force a rebuild. Each conversation gets its own
+session_id (e.g. `retrieval-recall-cache-conv0`) to prevent fact cross-contamination.
+Also monkey-patched `_embed_api` with `requests.Session` connection pooling. The
 Hindsight-style cross-encoder reranker was then **wired into the real
 pipeline** — `_fusion_rerank` in `_memoria_fused_retrieve` reorders fused
 facts by query relevance after RRF (default ON, gated
@@ -236,7 +259,9 @@ harness `_rerank` (which re-ranked the wrong object) were removed.
 | + Container down (embedding timeout) | ~33s/question | 30s timeout each |
 
 Container warm: **103s** for 20 questions (~5s/question). Full benchmark:
-**0.347 overall recall** (passes 0.30 gate).
+**0.347 overall recall** (passes 0.30 gate). The 3-conversation cache (vs 1)
+produced **0.334 overall** across 60 questions. Per-ability: KU 0.833, TR 0.750,
+IE 0.500, EO 0.289, SUM 0.261, CR 0.250, IF 0.250, MR 0.125, PF 0.083, ABS 0.000.
 
 ### The 67% waste
 

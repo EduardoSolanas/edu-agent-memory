@@ -207,7 +207,8 @@ class ExtractionClient:
             "HTTP-Referer": "https://edumem.site",
             "X-Title": "edumem Extraction",
         }
-        resp = _requests.post(url, json=payload, headers=headers, timeout=60)
+        timeout = int(os.environ.get("EDUMEM_EXTRACTION_TIMEOUT", "60"))
+        resp = _requests.post(url, json=payload, headers=headers, timeout=timeout)
         resp.raise_for_status()
         data = resp.json()
         self.call_count += 1

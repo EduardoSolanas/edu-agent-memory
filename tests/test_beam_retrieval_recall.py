@@ -48,7 +48,9 @@ def _setup_write_llm_env():
     """Cache BUILD uses the LLM (use_cloud extraction: facts + conclusions via
     qwen3.6). Point the canonical EDUMEM_LLM_* vars at NAN/qwen3.6, loading the
     key from .env if not already in the environment. Only the one-time build
-    needs this; the recall test reads the cached output with NO LLM."""
+    needs this; the recall test reads the cached output with NO LLM.
+
+    Also sets EDUMEM_EXTRACTION_TIMEOUT=300 (large prompts need >60s for qwen3.6)"""
     if not os.environ.get("EDUMEM_LLM_API_KEY"):
         env_path = PROJECT_ROOT / ".env"
         if env_path.exists():
@@ -61,6 +63,7 @@ def _setup_write_llm_env():
                     break
     os.environ.setdefault("EDUMEM_LLM_BASE_URL", "https://api.nan.builders/v1")
     os.environ.setdefault("EDUMEM_LLM_MODEL", "qwen3.6")
+    os.environ.setdefault("EDUMEM_EXTRACTION_TIMEOUT", "300")
 
 
 from tools.evaluate_beam_end_to_end import (
@@ -186,75 +189,81 @@ def nugget_recall(nuggets: list[str], context: str) -> float:
 # ============================================================
 
 RECALL_GATE = 0.30  # Minimum acceptable overall recall
-CACHE_DB = PROJECT_ROOT / "tests" / ".beam_recall_cache" / "beam_100K_conv0.db"
+CACHE_DB = PROJECT_ROOT / "tests" / ".beam_recall_cache" / "beam_100K_x3.db"
 
 
-def get_cached_beam_and_conv():
-    """Return (beam, conv) for BEAM 100K conv 0, reusing a cached ingested DB.
+def get_cached_beams():
+    """Return (db_path, convs_meta) for BEAM 100K convs 0-2.
 
-    Builds the DB once (ingest with LLM extraction: use_cloud + llm_client)
-    if missing; otherwise just opens it.
-    - Always loads conversation metadata (cheap, needed for questions).
-    - If CACHE_DB exists: open BeamMemory and return (beam, conv) WITHOUT re-ingesting.
-    - If it does NOT exist: create parent dir, ingest conversation, then return (beam, conv).
-    - Uses same session_id whether building or reusing, so retrieval queries ingested rows.
-    """
-    # Always load conversation metadata (cheap)
-    print("[cache] Loading BEAM 100K (max_conversations=1)...", flush=True)
-    data = load_beam_dataset(["100K"], max_conversations=1)
+    convs_meta is [(session_id, [questions]), ...] — one entry per conversation
+    with its own isolated session_id. Builds the DB once if missing, reuses
+    otherwise. Uses separate BeamMemory per conversation during build and
+    returns the DB path plus metadata so the test can create per-session
+    BeamMemory instances at query time."""
+    N_CONVS = 3
+    print(f"[cache] Loading BEAM 100K (max_conversations={N_CONVS})...", flush=True)
+    data = load_beam_dataset(["100K"], max_conversations=N_CONVS)
     convs = data.get("100K", [])
     assert convs, "No 100K conversations loaded"
-    conv = convs[0]
 
-    session_id = "retrieval-recall-cache"
+    convs_meta = []
 
     if CACHE_DB.exists():
-        # Reuse existing cache
         print(f"[cache] reusing existing DB at {CACHE_DB}", flush=True)
-        beam = BeamMemory(db_path=CACHE_DB, session_id=session_id)
+        # Build metadata from conversation data (questions are cheap, no LLM)
+        for ci, conv in enumerate(convs):
+            sid = f"retrieval-recall-cache-conv{ci}"
+            convs_meta.append((sid, conv.get("questions", [])))
     else:
-        # Build cache WITH both LLM extraction paths:
-        #   - use_cloud=True: ExtractionClient for SPO facts + conclusions
-        #   - llm_client: new bounded JSON schema
-        # The recall test then reads this cached output with NO LLM.
         print(f"[cache] building with LLM extraction (use_cloud=True + llm_client)...", flush=True)
         _setup_write_llm_env()
         llm = LLMClient(model=os.environ.get("EDUMEM_LLM_MODEL", "qwen3.6"))
         CACHE_DB.parent.mkdir(parents=True, exist_ok=True)
-        beam = BeamMemory(db_path=CACHE_DB, session_id=session_id,
-                          use_cloud=True, llm_client=llm)
-        print(f"[cache] Ingesting conversation {conv['id']} ({len(conv['messages'])} messages)...", flush=True)
-        ingest_conversation(beam, conv["messages"], llm=llm)
-        # Consolidate once after ingest (force=True: benchmark data is fresh "now",
-        # so an age-gated sleep would no-op). Populates the episodic layer.
-        try:
-            while beam.sleep(force=True).get("status") not in ("no_op", "error"):
+        for ci, conv in enumerate(convs):
+            sid = f"retrieval-recall-cache-conv{ci}"
+            print(f"[cache] Ingesting conversation {ci} ({conv['id']}) into session '{sid}' with {len(conv['messages'])} messages...", flush=True)
+            beam = BeamMemory(db_path=CACHE_DB, session_id=sid,
+                              use_cloud=True, llm_client=llm)
+            ingest_conversation(beam, conv["messages"], llm=llm)
+            try:
+                while beam.sleep(force=True).get("status") not in ("no_op", "error"):
+                    pass
+            except Exception:
                 pass
-        except Exception:
-            pass
-        print(f"[cache] Ingestion complete.", flush=True)
+            beam.conn.close()
+            convs_meta.append((sid, conv.get("questions", [])))
+        print(f"[cache] All conversations ingested.", flush=True)
 
-    return beam, conv
+    return str(CACHE_DB), convs_meta
 
 
 @pytest.fixture(scope="module")
-def beam_with_conv(tmp_path_factory):
-    """Return cached BEAM 100K conversation (module-scoped)."""
-    return get_cached_beam_and_conv()
+def beam_with_convs(tmp_path_factory):
+    """Return (db_path, convs_meta) for BEAM 100K convs 0-2 (module-scoped)."""
+    return get_cached_beams()
 
 
-def test_retrieval_recall_per_ability(beam_with_conv):
+def test_retrieval_recall_per_ability(beam_with_convs):
     """Check that rubric nuggets appear in the retrieved context for each question."""
-    beam, conv = beam_with_conv
+    db_path, convs_meta = beam_with_convs
 
-    questions = conv.get("questions", [])
-    assert questions, "No questions in conversation"
+    # Collect all questions with their session_id
+    questions_with_sid = []
+    for sid, qs in convs_meta:
+        for q in qs:
+            q["_session_id"] = sid
+            questions_with_sid.append(q)
+
+    assert questions_with_sid, "No questions loaded"
+
+    # Cache one BeamMemory per session_id
+    beam_cache: dict[str, BeamMemory] = {}
 
     ability_recalls: dict[str, list[float]] = {}
     ability_ctx_chars: dict[str, list[int]] = {}
 
     skipped = 0
-    for q in questions:
+    for q in questions_with_sid:
         rubric = q.get("rubric", [])
         if not rubric:
             skipped += 1
@@ -266,6 +275,11 @@ def test_retrieval_recall_per_ability(beam_with_conv):
         if not nuggets:
             skipped += 1
             continue
+
+        sid = q["_session_id"]
+        if sid not in beam_cache:
+            beam_cache[sid] = BeamMemory(db_path=db_path, session_id=sid)
+        beam = beam_cache[sid]
 
         ctx = answer_with_memory(
             None,

@@ -225,11 +225,16 @@ def test_tr_timeline_anchors_dates_to_the_queried_schedule_events(
         context = result["context"].lower()
         assert "january 15, 2024" in context
         assert "march 15, 2024" in context
+        # With fused retrieval, multiple lines may contain a date (duration
+        # facts, timeline entries). Find the line where the date AND the
+        # matching event co-occur, not just the first line with the date.
         january_line = next(
-            line for line in context.splitlines() if "january 15, 2024" in line
+            line for line in context.splitlines()
+            if "january 15, 2024" in line and "transaction management" in line
         )
         march_line = next(
-            line for line in context.splitlines() if "march 15, 2024" in line
+            line for line in context.splitlines()
+            if "march 15, 2024" in line and "deployment" in line
         )
         assert "transaction management" in january_line
         assert "deployment" in march_line

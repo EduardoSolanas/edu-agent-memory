@@ -123,10 +123,15 @@ def _load_session(ort, model_path: Path):
         )
     options = ort.SessionOptions()
     options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    gpu_mem_limit = int(os.getenv("NVIDIA_GPU_MEM_LIMIT", str(4 * 1024 ** 3)))  # 4GB default
+    cuda_options = {
+        "arena_extend_strategy": "kSameAsRequested",
+        "gpu_mem_limit": gpu_mem_limit,
+    }
     return ort.InferenceSession(
         str(onnx_path),
         sess_options=options,
-        providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+        providers=[("CUDAExecutionProvider", cuda_options), "CPUExecutionProvider"],
     )
 
 
