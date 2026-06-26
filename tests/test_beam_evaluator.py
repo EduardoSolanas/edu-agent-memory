@@ -2543,12 +2543,12 @@ def test_fused_recall_emits_msgidx_anchors(tmp_path):
         beam.conn.execute(
             "INSERT INTO memoria_facts (session_id, message_idx, fact_type, key, value, context_snippet) "
             "VALUES (?, ?, ?, ?, ?, ?)",
-            ("eo_anchors", 3, "product", "login_flow", "implemented login flow", "I built the login flow"),
+            ("eo_anchors", 3, "product", "login_flow", "auth flow component", "I worked on the auth flow"),
         )
         beam.conn.execute(
             "INSERT INTO memoria_facts (session_id, message_idx, fact_type, key, value, context_snippet) "
             "VALUES (?, ?, ?, ?, ?, ?)",
-            ("eo_anchors", 7, "sequence", "step", "set up the database schema", "Then database schema"),
+            ("eo_anchors", 7, "sequence", "step", "worked on database schema", "Then database schema"),
         )
         beam.conn.commit()
 
@@ -2572,9 +2572,9 @@ def test_fused_recall_orders_by_msgidx_for_ordering_queries(tmp_path):
     beam = _make_eo_beam(tmp_path, "eo_order")
     try:
         for idx, val in (
-            (30, "deployed the service"),
-            (5, "designed the api"),
-            (18, "wrote the tests"),
+            (30, "work deployed the service"),
+            (5, "work designed the api"),
+            (18, "work wrote the tests"),
         ):
             beam.conn.execute(
                 "INSERT INTO memoria_facts (session_id, message_idx, fact_type, key, value, context_snippet) "
@@ -2898,7 +2898,7 @@ def test_llm_extraction_happy_path_flag_on(tmp_path):
         assert counts["entity"] >= 1
         assert counts["negation"] >= 1
         assert counts["date"] >= 1
-        assert counts["timeline"] >= 1
+        assert counts["timeline"] == 0  # LLM dates are NOT counted as timeline entries
         assert len(client.chat_calls) == 1
 
         row = beam.conn.execute(
@@ -3798,3 +3798,330 @@ def test_user_preference_is_retrieved(tmp_path):
             os.environ.pop("EDUMEM_NO_EMBEDDINGS", None)
         else:
             os.environ["EDUMEM_NO_EMBEDDINGS"] = saved
+
+
+# ---------------------------------------------------------------------------
+# Fix 7: LLM compliance signal
+# ---------------------------------------------------------------------------
+
+
+def test_llm_extraction_compliance_signal(tmp_path):
+    """LLM returning empty JSON for a non-trivial message increments _llm_empty_parse."""
+    import json
+    saved = os.environ.get("EDUMEM_NO_EMBEDDINGS")
+    os.environ["EDUMEM_NO_EMBEDDINGS"] = "1"
+    try:
+        empty_json = json.dumps({"facts": [], "entities": [], "relations": [], "dates": []})
+        beam, _ = _make_beam_with_llm(tmp_path, response=empty_json)
+        counts = beam.extract_and_store_facts("The dashboard API response time is 250ms.", message_idx=0)
+        assert counts.get("_llm_empty_parse", 0) > 0, (
+            f"Expected _llm_empty_parse > 0, got {counts.get('_llm_empty_parse')}"
+        )
+    finally:
+        beam.conn.close()
+        if saved is None:
+            os.environ.pop("EDUMEM_NO_EMBEDDINGS", None)
+        else:
+            os.environ["EDUMEM_NO_EMBEDDINGS"] = saved
+
+
+# ---------------------------------------------------------------------------
+# Fix 8: ExtractionCounts dataclass
+# ---------------------------------------------------------------------------
+
+
+def test_extraction_counts_dataclass_fields():
+    """ExtractionCounts dataclass exists with all expected fields."""
+    from edumem.core.beam import ExtractionCounts
+    import dataclasses
+    assert dataclasses.is_dataclass(ExtractionCounts)
+    fields = {f.name for f in dataclasses.fields(ExtractionCounts)}
+    expected = {"metric", "date", "version", "entity", "sequence", "timeline",
+                "negation", "decision", "change", "instruction", "preference",
+                "_lang", "_regex_keys", "llm_facts", "duration", "_llm_failures",
+                "_llm_empty_parse"}
+    for name in expected:
+        assert name in fields, f"Field {name!r} missing from ExtractionCounts"
+
+
+def test_extract_and_store_returns_dataclass_when_requested(tmp_path):
+    """extract_and_store_facts(..., return_dataclass=True) returns ExtractionCounts instance."""
+    from edumem.core.beam import ExtractionCounts
+    saved = os.environ.get("EDUMEM_NO_EMBEDDINGS")
+    os.environ["EDUMEM_NO_EMBEDDINGS"] = "1"
+    beam = _make_beam(tmp_path)
+    try:
+        result = beam.extract_and_store_facts("Test content", return_dataclass=True)
+        assert isinstance(result, ExtractionCounts), f"Expected ExtractionCounts, got {type(result)}"
+    finally:
+        beam.conn.close()
+        if saved is None:
+            os.environ.pop("EDUMEM_NO_EMBEDDINGS", None)
+        else:
+            os.environ["EDUMEM_NO_EMBEDDINGS"] = saved
+
+
+# ---------------------------------------------------------------------------
+# Fix 9: Separate methods for LLM block and duration block
+# ---------------------------------------------------------------------------
+
+
+def test_llm_extraction_block_separate_method():
+    """BeamMemory has _run_llm_extraction method."""
+    from edumem.core.beam import BeamMemory
+    assert hasattr(BeamMemory, "_run_llm_extraction"), "BeamMemory missing _run_llm_extraction"
+    assert callable(getattr(BeamMemory, "_run_llm_extraction"))
+
+
+def test_duration_derivation_separate_method():
+    """BeamMemory has _run_duration_derivation method."""
+    from edumem.core.beam import BeamMemory
+    assert hasattr(BeamMemory, "_run_duration_derivation"), "BeamMemory missing _run_duration_derivation"
+    assert callable(getattr(BeamMemory, "_run_duration_derivation"))
+
+
+# ---------------------------------------------------------------------------
+# Fix 10: Prompt → string.Template
+# ---------------------------------------------------------------------------
+
+
+def test_llm_extraction_prompt_is_template(tmp_path):
+    """BeamMemory has LLM_EXTRACTION_TEMPLATE as string.Template;
+    _build_llm_extraction_prompt still produces output containing required keys."""
+    import string as _string
+    from edumem.core.beam import BeamMemory
+    tmpl = BeamMemory.LLM_EXTRACTION_TEMPLATE
+    assert isinstance(tmpl, _string.Template), f"Expected string.Template, got {type(tmpl)}"
+    saved = os.environ.get("EDUMEM_NO_EMBEDDINGS")
+    os.environ["EDUMEM_NO_EMBEDDINGS"] = "1"
+    beam = _make_beam(tmp_path)
+    try:
+        prompt = beam._build_llm_extraction_prompt("Test content")
+        for token in ("facts", "entities", "relations", "dates"):
+            assert token in prompt, f"Token {token!r} missing from prompt output"
+    finally:
+        beam.conn.close()
+        if saved is None:
+            os.environ.pop("EDUMEM_NO_EMBEDDINGS", None)
+        else:
+            os.environ["EDUMEM_NO_EMBEDDINGS"] = saved
+
+
+# ---------------------------------------------------------------------------
+# Phase A — Stop the Noise (ability-independent gating + dedup)
+# ---------------------------------------------------------------------------
+
+
+def test_timeline_fallback_returns_empty_when_no_match(tmp_path):
+    """Timeline retrieve returns empty facts when no query terms match the
+    fallback else-branch (no date terms, no month names)."""
+    from edumem.core.beam import BeamMemory, init_beam
+
+    saved = os.environ.get("EDUMEM_NO_EMBEDDINGS")
+    os.environ["EDUMEM_NO_EMBEDDINGS"] = "1"
+    try:
+        db_path = str(tmp_path / "test_tl_empty.db")
+        init_beam(db_path)
+        beam = BeamMemory(db_path=db_path, session_id="test_tl_empty")
+
+        beam.conn.execute(
+            "INSERT INTO memoria_timelines (session_id, date, description, message_idx) "
+            "VALUES (?, ?, ?, ?)",
+            ("test_tl_empty", "2024-03-15", "installed docker on server", 1),
+        )
+        beam.conn.execute(
+            "INSERT INTO memoria_timelines (session_id, date, description, message_idx) "
+            "VALUES (?, ?, ?, ?)",
+            ("test_tl_empty", "2024-04-01", "configured python environment", 2),
+        )
+        beam.conn.commit()
+
+        result = beam._memoria_timeline_retrieve("what is my favorite color", top_k=10)
+        assert result["facts"] == [], f"Expected empty facts, got {len(result['facts'])} items"
+    finally:
+        beam.conn.close()
+        if saved is None:
+            os.environ.pop("EDUMEM_NO_EMBEDDINGS", None)
+        else:
+            os.environ["EDUMEM_NO_EMBEDDINGS"] = saved
+
+
+def test_ordering_query_gets_minimal_timeline_fallback(tmp_path):
+    """Ordering queries return top-5 recent timeline entries even when
+    query terms don't match description text (so EO has temporal anchors)."""
+    from edumem.core.beam import BeamMemory, init_beam
+
+    saved = os.environ.get("EDUMEM_NO_EMBEDDINGS")
+    os.environ["EDUMEM_NO_EMBEDDINGS"] = "1"
+    try:
+        db_path = str(tmp_path / "test_ord_fallback.db")
+        init_beam(db_path)
+        beam = BeamMemory(db_path=db_path, session_id="test_ord_fallback")
+
+        beam.conn.execute(
+            "INSERT INTO memoria_timelines (session_id, date, description, message_idx) "
+            "VALUES (?, ?, ?, ?)",
+            ("test_ord_fallback", "2024-01-15", "started project", 1),
+        )
+        beam.conn.execute(
+            "INSERT INTO memoria_timelines (session_id, date, description, message_idx) "
+            "VALUES (?, ?, ?, ?)",
+            ("test_ord_fallback", "2024-03-15", "deployed to production", 2),
+        )
+        beam.conn.commit()
+
+        result = beam._memoria_timeline_retrieve("in what order were topics discussed", top_k=10)
+        assert len(result["facts"]) == 2, (
+            f"Expected 2 timeline facts for ordering query, got {len(result['facts'])}: {result['facts']}"
+        )
+    finally:
+        beam.conn.close()
+        if saved is None:
+            os.environ.pop("EDUMEM_NO_EMBEDDINGS", None)
+        else:
+            os.environ["EDUMEM_NO_EMBEDDINGS"] = saved
+
+
+def test_chrono_fallback_returns_empty_when_no_match(tmp_path):
+    """Chrono retrieve returns empty facts when no query content words match
+    the sequence value column."""
+    from edumem.core.beam import BeamMemory, init_beam
+
+    saved = os.environ.get("EDUMEM_NO_EMBEDDINGS")
+    os.environ["EDUMEM_NO_EMBEDDINGS"] = "1"
+    try:
+        db_path = str(tmp_path / "test_ch_empty.db")
+        init_beam(db_path)
+        beam = BeamMemory(db_path=db_path, session_id="test_ch_empty")
+
+        beam.conn.execute(
+            "INSERT INTO memoria_facts (session_id, message_idx, fact_type, key, value) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("test_ch_empty", 1, "sequence", "first", "first step: install docker"),
+        )
+        beam.conn.commit()
+
+        result = beam._memoria_chrono_retrieve("what color do i like", top_k=10)
+        assert result["facts"] == [], f"Expected empty facts, got {len(result['facts'])} items"
+    finally:
+        beam.conn.close()
+        if saved is None:
+            os.environ.pop("EDUMEM_NO_EMBEDDINGS", None)
+        else:
+            os.environ["EDUMEM_NO_EMBEDDINGS"] = saved
+
+
+def test_non_temporal_query_skips_timeline_chrono(tmp_path):
+    """Non-temporal queries should not include timeline/chrono entries
+    in fused retrieval."""
+    from edumem.core.beam import BeamMemory, init_beam
+
+    saved = os.environ.get("EDUMEM_NO_EMBEDDINGS")
+    os.environ["EDUMEM_NO_EMBEDDINGS"] = "1"
+    try:
+        db_path = str(tmp_path / "test_nt.db")
+        init_beam(db_path)
+        beam = BeamMemory(db_path=db_path, session_id="test_nt")
+
+        beam.conn.execute(
+            "INSERT INTO memoria_timelines (session_id, date, description, message_idx) "
+            "VALUES (?, ?, ?, ?)",
+            ("test_nt", "2024-03-15", "installed docker on server", 1),
+        )
+        beam.conn.commit()
+
+        result = beam._memoria_fused_retrieve("what are my preferences", top_k=10)
+        assert "[2024-" not in result["context"], (
+            "Timeline entries should not appear for non-temporal query"
+        )
+    finally:
+        beam.conn.close()
+        if saved is None:
+            os.environ.pop("EDUMEM_NO_EMBEDDINGS", None)
+        else:
+            os.environ["EDUMEM_NO_EMBEDDINGS"] = saved
+
+
+def test_same_fact_from_two_specialists_deduped(tmp_path):
+    """Same rendered text from fact + chrono specialists is deduped to one."""
+    from edumem.core.beam import BeamMemory, init_beam
+
+    saved = os.environ.get("EDUMEM_NO_EMBEDDINGS")
+    os.environ["EDUMEM_NO_EMBEDDINGS"] = "1"
+    try:
+        db_path = str(tmp_path / "test_dedup.db")
+        init_beam(db_path)
+        beam = BeamMemory(db_path=db_path, session_id="test_dedup")
+
+        # Metric fact found by fact specialist via synonym "how many" → Pass 3
+        beam.conn.execute(
+            "INSERT INTO memoria_facts (session_id, message_idx, fact_type, key, value) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("test_dedup", 1, "metric", "team_size", "five"),
+        )
+        # Chrono entry whose _fact_render_text matches the fact's "team_size: five"
+        beam.conn.execute(
+            "INSERT INTO memoria_facts (session_id, message_idx, fact_type, key, value) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("test_dedup", 2, "sequence", "first", "team_size: five"),
+        )
+        beam.conn.commit()
+
+        # Temporal query keeps chrono active (A2) and triggers synonym match for fact
+        result = beam._memoria_fused_retrieve("how many days was team size five", top_k=10)
+        count = result["context"].count("team_size: five")
+        assert count == 1, f"Expected 1 occurrence of 'team_size: five', got {count} in:\n{result['context']}"
+    finally:
+        beam.conn.close()
+        if saved is None:
+            os.environ.pop("EDUMEM_NO_EMBEDDINGS", None)
+        else:
+            os.environ["EDUMEM_NO_EMBEDDINGS"] = saved
+
+
+def test_rrf_k_constant_is_15():
+    """_rrf_fuse default k is 15."""
+    import inspect
+    from edumem.core.beam import _rrf_fuse
+
+    sig = inspect.signature(_rrf_fuse)
+    default_k = sig.parameters["k"].default
+    assert default_k == 15, f"Expected k=15, got k={default_k}"
+
+
+def test_score_threshold_is_020():
+    """Context assembly score threshold is 0.20."""
+    import ast
+    import inspect
+    from edumem.core import context_assembly
+
+    source = inspect.getsource(context_assembly._assemble_memory_context)
+    tree = ast.parse(source)
+    thresholds = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Compare):
+            for op in node.ops:
+                if isinstance(op, ast.Lt):
+                    for c in node.comparators:
+                        if isinstance(c, ast.Constant) and isinstance(c.value, (int, float)):
+                            thresholds.append(c.value)
+    assert 0.20 in thresholds, (
+        f"Threshold 0.20 not found in _assemble_memory_context. Found: {thresholds}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Fix 11: Move _assemble_memory_context to core
+# ---------------------------------------------------------------------------
+
+
+def test_import_context_assembly_from_core():
+    """_assemble_memory_context can be imported from edumem.core.context_assembly."""
+    from edumem.core.context_assembly import _assemble_memory_context
+    assert callable(_assemble_memory_context)
+
+
+def test_context_assembly_still_works_from_tools():
+    """The re-export of _assemble_memory_context in evaluate_beam_end_to_end still works."""
+    from tools.evaluate_beam_end_to_end import _assemble_memory_context
+    assert callable(_assemble_memory_context)

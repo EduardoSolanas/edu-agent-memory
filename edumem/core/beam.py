@@ -16,11 +16,13 @@ Hybrid ranking: 50% vector + 30% FTS rank + 20% importance.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import logging
 import sqlite3
 import json
 import hashlib
 import logging
+import string
 import threading
 import math
 
@@ -30,7 +32,7 @@ logger = logging.getLogger(__name__)
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Optional, Any, Set, Union
 from pathlib import Path
-from edumem.core.query_mode import is_duration_query
+from edumem.core.query_mode import is_duration_query, is_ordering_query
 
 
 logger = logging.getLogger(__name__)
@@ -2294,7 +2296,7 @@ def _wm_vec_search(conn: sqlite3.Connection, query_embedding, k: int = 20) -> Li
     return results[:k]
 
 
-def _rrf_fuse(ranked_lists: list[list], k: int = 60) -> list:
+def _rrf_fuse(ranked_lists: list[list], k: int = 15) -> list:
     """Fuse multiple ranked lists using Reciprocal Rank Fusion (RRF).
 
     Args:
@@ -2398,6 +2400,27 @@ def _fusion_rerank(query: str, fact_texts: list) -> list | None:
         return None
 
 
+@dataclasses.dataclass
+class ExtractionCounts:
+    metric: int = 0
+    date: int = 0
+    version: int = 0
+    entity: int = 0
+    sequence: int = 0
+    timeline: int = 0
+    negation: int = 0
+    decision: int = 0
+    change: int = 0
+    instruction: int = 0
+    preference: int = 0
+    _lang: str = ""
+    _regex_keys: list = dataclasses.field(default_factory=list)
+    llm_facts: int = 0
+    duration: int = 0
+    _llm_failures: int = 0
+    _llm_empty_parse: int = 0
+
+
 class BeamMemory:
     """
     BEAM memory interface.
@@ -2433,6 +2456,7 @@ class BeamMemory:
         self._extraction_buffer = []  # Buffer for batch extraction
         self._event_emitter = event_emitter  # Streaming event callback
         self._llm_client = llm_client  # LLM client for write-time conflict resolution
+        self._llm_executor = None  # Lazy-created ThreadPoolExecutor for LLM extraction timeout
         self.conn = _get_connection(self.db_path)
         init_beam(self.db_path)
 
@@ -4293,7 +4317,9 @@ class BeamMemory:
 
     def extract_and_store_facts(self, content: str, message_idx: int = 0,
                                 source_memory_id: Optional[str] = None,
-                                source: str = "") -> dict:
+                                source: str = "",
+                                _existing_keys_cache: Optional[set] = None,
+                                return_dataclass: bool = False) -> dict:
         import re as _re
         msgidx_match = _re.search(r'\[MSGIDX:(\d+)\]', content)
         if msgidx_match:
@@ -4614,12 +4640,28 @@ class BeamMemory:
         self.conn.commit()
         counts["_lang"] = lang  # Tag extraction with detected language
 
-        # ------------------------------------------------------------------
-        # Step 2: LLM extraction — complementary, guided by regex output
-        # ------------------------------------------------------------------
-        if self._llm_client is not None:
-            try:
-                # Combine session-level existing keys with this message's regex output
+        self._run_llm_extraction(content, message_idx, source_memory_id, _regex_extracted_keys, _existing_keys_cache, counts)
+
+        counts["_regex_keys"] = _regex_extracted_keys
+
+        self._run_duration_derivation(session, counts)
+
+        if return_dataclass:
+            _dc = ExtractionCounts()
+            for _k, _v in counts.items():
+                if hasattr(_dc, _k):
+                    setattr(_dc, _k, _v)
+            return _dc
+        return counts
+
+    def _run_llm_extraction(self, content, message_idx, source_memory_id,
+                             _regex_extracted_keys, _existing_keys_cache, counts):
+        if self._llm_client is None:
+            return
+        try:
+            if _existing_keys_cache is not None:
+                existing_keys = list(_existing_keys_cache)
+            else:
                 existing_keys = [
                     r[0] for r in self.conn.execute(
                         "SELECT DISTINCT key FROM memoria_facts "
@@ -4627,36 +4669,38 @@ class BeamMemory:
                         (self.session_id,)
                     ).fetchall()
                 ]
-                prompt = self._build_llm_extraction_prompt(
-                    content, existing_keys=existing_keys or None,
-                    regex_extracted=_regex_extracted_keys
-                )
-                from concurrent.futures import ThreadPoolExecutor, TimeoutError as _TimeoutError
-                timeout = int(os.environ.get("EDUMEM_EXTRACTION_TIMEOUT", "20"))
-                with ThreadPoolExecutor(max_workers=1) as _executor:
-                    _future = _executor.submit(
-                        self._llm_client.chat,
-                        [{"role": "user", "content": prompt}],
-                        temperature=0.0, max_tokens=512,
-                    )
-                    raw = _future.result(timeout=timeout)
-                parsed = self._parse_llm_extraction(raw)
-                if parsed.get("facts") or parsed.get("entities") or parsed.get("relations") or parsed.get("dates"):
-                    ctx = self._context_snippet(content, 0)
-                    stored = self._store_llm_extraction(
-                        self.session_id, message_idx, parsed, ctx,
-                        source_memory_id=source_memory_id)
-                    counts["entity"] += stored["entities"]
-                    counts["negation"] += stored["relations"]
-                    counts["llm_facts"] = counts.get("llm_facts", 0) + stored["facts"]
-                    counts["date"] += stored["dates"]
-                    counts["timeline"] += stored["dates"]
-            except Exception:
-                pass  # LLM failure is best-effort, regex already ran
+            prompt = self._build_llm_extraction_prompt(
+                content, existing_keys=existing_keys or None,
+                regex_extracted=_regex_extracted_keys
+            )
+            from concurrent.futures import TimeoutError as _TimeoutError
+            timeout = int(os.environ.get("EDUMEM_EXTRACTION_TIMEOUT", "20"))
+            if not self._llm_executor:
+                from concurrent.futures import ThreadPoolExecutor
+                self._llm_executor = ThreadPoolExecutor(max_workers=1)
+            _future = self._llm_executor.submit(
+                self._llm_client.chat,
+                [{"role": "user", "content": prompt}],
+                temperature=0.0, max_tokens=512,
+            )
+            raw = _future.result(timeout=timeout)
+            parsed = self._parse_llm_extraction(raw)
+            if parsed.get("facts") or parsed.get("entities") or parsed.get("relations") or parsed.get("dates"):
+                ctx = self._context_snippet(content, 0)
+                stored = self._store_llm_extraction(
+                    self.session_id, message_idx, parsed, ctx,
+                    source_memory_id=source_memory_id)
+                counts["entity"] += stored["entities"]
+                counts["negation"] += stored["relations"]
+                counts["llm_facts"] = counts.get("llm_facts", 0) + stored["facts"]
+                counts["date"] += stored["dates"]
+            elif content.strip():
+                counts["_llm_empty_parse"] = counts.get("_llm_empty_parse", 0) + 1
+        except Exception as exc:
+            counts["_llm_failures"] = counts.get("_llm_failures", 0) + 1
+            logger.warning("LLM extraction failed for msg_idx=%d: %s: %s", message_idx, type(exc).__name__, exc)
 
-        counts["_regex_keys"] = _regex_extracted_keys
-
-        # Derive duration facts from accumulated timeline entries
+    def _run_duration_derivation(self, session, counts):
         if counts.get("timeline", 0) > 0:
             try:
                 dur_count = self._derive_durations(session, max_pairs=15)
@@ -4664,8 +4708,6 @@ class BeamMemory:
                     counts["duration"] = dur_count
             except Exception:
                 pass
-
-        return counts
 
     def _build_canonicalize_prompt(self, existing, candidates) -> str:
         """Build a prompt for LLM-assisted metric key canonicalization.
@@ -4928,36 +4970,10 @@ Now respond with ONLY the JSON array, no explanation."""
             regex_hint = "\n" + "\n".join(lines) + "\n"
         else:
             regex_hint = "\n(No regex-extracted keys for this message — extract all relevant facts.)\n"
-        return (
-            "You extract persistent, reusable memory from a single message.\n"
-            "Return ONLY a JSON object (no prose, no code fences) with exactly "
-            "these keys: \"facts\", \"entities\", \"relations\", \"dates\".\n"
-            "Cap each list at 5 items maximum.\n\n"
-            "Schema:\n"
-            '{"facts":[{"key":"response_time_ms","value":"250ms","type":"metric"}],'
-            '"entities":[{"name":"DashboardAPI","kind":"service"}],'
-            '"relations":[{"subject":"user","predicate":"uses","object":"PostgreSQL"}],'
-            '"dates":[{"key":"deployment_deadline","date":"2024-03-15","context":"deadline"}]}\n\n'
-            "Rules:\n"
-            "- Extract ONLY persistent facts worth remembering later; skip "
-            "transient chatter (weather, greetings, ephemeral status).\n"
-            "- Use canonical snake_case keys so the SAME concept mentioned in "
-            "different messages always maps to the SAME key.\n"
-            "- Keep an ACTUAL measured value distinct from a STATED target/goal "
-            "(use different keys, e.g. response_time_ms vs response_time_target_ms).\n"
-            "- Be language-agnostic: derive keys from meaning, do NOT rely on "
-            "English keywords; keys are always snake_case ASCII.\n"
-            "- \"type\" is a short category: metric, state, preference, instruction.\n"
-            "- \"kind\" is one of: service, project, person, tool, component.\n"
-            "- entities: named real-world things (people, services, tools, projects, components).\n"
-            "- relations: subject-predicate-object triples; for negations (never/not/no/did_not) "
-            "set predicate to \"never_used\".\n"
-            "- dates: ISO YYYY-MM-DD when an event is tied to a date; keep context short.\n"
-            "- If a category has nothing, return an empty list for it.\n"
-            f"{existing_hint}"
-            f"{regex_hint}"
-            "Message:\n"
-            f"{content}\n"
+        return self.LLM_EXTRACTION_TEMPLATE.substitute(
+            existing_hint=existing_hint,
+            regex_hint=regex_hint,
+            content=content,
         )
 
     def _parse_llm_extraction(self, raw) -> dict:
@@ -5015,7 +5031,9 @@ Now respond with ONLY the JSON array, no explanation."""
             value = fact.get("value")
             if not key or value is None:
                 continue
-            ftype = fact.get("type") or "fact"
+            _ALLOWED_FACT_TYPES = {"metric", "state", "preference", "instruction", "fact", "version", "decision"}
+            ftype_raw = fact.get("type") or "fact"
+            ftype = str(ftype_raw) if ftype_raw in _ALLOWED_FACT_TYPES else "fact"
             if self._insert_fact(session, msg_idx, str(ftype), str(key),
                                  str(value), ctx, 0.65,
                                  source_memory_id=source_memory_id):
@@ -5127,61 +5145,36 @@ Now respond with ONLY the JSON array, no explanation."""
     def _insert_fact(self, session: str, msg_idx: int, ftype: str,
                      key: str, value: str, ctx: str, importance: float,
                      source_memory_id: Optional[str] = None):
-        # Semantic dedup (Mem0-style): a fact is identified by (type, key, value),
-        # NOT by which message mentioned it. If a LIVE fact with the same
-        # type+key+value already exists, this is the same fact re-stated -- skip
-        # it (and its embedding) instead of accumulating duplicates. The old
-        # source/message-scoped check let the same value from different messages
-        # pile up (e.g. flask_version=2.3.1 stored 22x), flooding vec_facts with
-        # identical vectors. Scoped to live rows so a value that was superseded
-        # and later re-stated still re-chains over the current version below.
-        exists = self.conn.execute(
-            "SELECT 1 FROM memoria_facts "
-            "WHERE session_id = ? AND fact_type = ? AND key = ? AND value = ? "
-            "AND valid_to_msg_idx IS NULL "
-            "LIMIT 1",
-            (session, ftype, key, value),
-        ).fetchone()
-        if exists:
-            return False
-
-        # Dates all share generic keys (e.g. "named_date", "iso_date").
-        # Versioning would create false evolution chains when different
-        # events happen on different dates. Skip versioning for dates.
-        if ftype == 'date':
-            self.conn.execute(
-                "INSERT INTO memoria_facts (session_id, message_idx, fact_type, key, value, "
-                "context_snippet, importance, valid_from_msg_idx, source_memory_id) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (session, msg_idx, ftype, key, value, ctx, importance, msg_idx, source_memory_id))
-            return True
-
-        # Check if this key already has a fact with a different value
+        # Single combined query: fetch the live row for this (session, key, type)
+        # to check both dedup and versioning in one round-trip.
         existing = self.conn.execute(
-            "SELECT id, value FROM memoria_facts "
+            "SELECT id, value, COALESCE(version_id, 0) FROM memoria_facts "
             "WHERE session_id = ? AND key = ? AND fact_type = ? AND valid_to_msg_idx IS NULL "
             "ORDER BY version_id DESC LIMIT 1",
-            (session, key, ftype)
+            (session, key, ftype),
         ).fetchone()
-        if existing and existing[1] != value:
+
+        if existing:
+            if existing[1] == value:
+                return False  # Same value already live → dedup
+            if ftype == 'date':
+                # Different date on a generic key → insert without versioning
+                self.conn.execute(
+                    "INSERT INTO memoria_facts (session_id, message_idx, fact_type, key, value, "
+                    "context_snippet, importance, valid_from_msg_idx, source_memory_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (session, msg_idx, ftype, key, value, ctx, importance, msg_idx, source_memory_id))
+                return True
             # Mark old row as replaced
             self.conn.execute(
-                "UPDATE memoria_facts SET valid_to_msg_idx = ? "
-                "WHERE id = ?",
-                (msg_idx, existing[0])
+                "UPDATE memoria_facts SET valid_to_msg_idx = ? WHERE id = ?",
+                (msg_idx, existing[0]),
             )
-            # Cleanup hook: drop the superseded fact's vec row so the semantic
-            # index never surfaces a stale value (Spec Part C/D cleanup).
             try:
                 self.conn.execute("DELETE FROM vec_facts WHERE rowid = ?", (existing[0],))
             except Exception:
                 pass
-            # Insert new version with previous_value pointer
-            prev_version = self.conn.execute(
-                "SELECT version_id FROM memoria_facts WHERE id = ?",
-                (existing[0],)
-            ).fetchone()
-            new_version = (prev_version[0] + 1) if prev_version else 1
+            new_version = existing[2] + 1
             _cur = self.conn.execute(
                 "INSERT INTO memoria_facts (session_id, message_idx, fact_type, key, value, "
                 "context_snippet, importance, version_id, previous_value, updated_msg_idx, "
@@ -5189,8 +5182,7 @@ Now respond with ONLY the JSON array, no explanation."""
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (session, msg_idx, ftype, key, value, ctx, importance,
                  new_version, existing[1], msg_idx, msg_idx, source_memory_id))
-            if ftype != 'date':  # skip date branch by content-quality (generic keys)
-                self._embed_fact_enqueue(_cur.lastrowid, ctx, key, value)
+            self._embed_fact_enqueue(_cur.lastrowid, ctx, key, value)
         else:
             _cur = self.conn.execute(
                 "INSERT INTO memoria_facts (session_id, message_idx, fact_type, key, value, "
@@ -5200,6 +5192,38 @@ Now respond with ONLY the JSON array, no explanation."""
             if ftype != 'date':
                 self._embed_fact_enqueue(_cur.lastrowid, ctx, key, value)
         return True
+
+    LLM_EXTRACTION_TEMPLATE = string.Template(
+        "You extract persistent, reusable memory from a single message.\n"
+        "Return ONLY a JSON object (no prose, no code fences) with exactly "
+        'these keys: "facts", "entities", "relations", "dates".\n'
+        "Cap each list at 5 items maximum.\n\n"
+        "Schema:\n"
+        '{"facts":[{"key":"response_time_ms","value":"250ms","type":"metric"}],'
+        '"entities":[{"name":"DashboardAPI","kind":"service"}],'
+        '"relations":[{"subject":"user","predicate":"uses","object":"PostgreSQL"}],'
+        '"dates":[{"key":"deployment_deadline","date":"2024-03-15","context":"deadline"}]}\n\n'
+        "Rules:\n"
+        "- Extract ONLY persistent facts worth remembering later; skip "
+        "transient chatter (weather, greetings, ephemeral status).\n"
+        "- Use canonical snake_case keys so the SAME concept mentioned in "
+        "different messages always maps to the SAME key.\n"
+        "- Keep an ACTUAL measured value distinct from a STATED target/goal "
+        "(use different keys, e.g. response_time_ms vs response_time_target_ms).\n"
+        "- Be language-agnostic: derive keys from meaning, do NOT rely on "
+        "English keywords; keys are always snake_case ASCII.\n"
+        '- "type" is a short category: metric, state, preference, instruction.\n'
+        '- "kind" is one of: service, project, person, tool, component.\n'
+        "- entities: named real-world things (people, services, tools, projects, components).\n"
+        '- relations: subject-predicate-object triples; for negations (never/not/no/did_not) '
+        'set predicate to "never_used".\n'
+        "- dates: ISO YYYY-MM-DD when an event is tied to a date; keep context short.\n"
+        "- If a category has nothing, return an empty list for it.\n"
+        "${existing_hint}"
+        "${regex_hint}"
+        "Message:\n"
+        "${content}\n"
+    )
 
     _DATE_FORMATS: tuple = (
         "%Y-%m-%d", "%B %d, %Y", "%B %d %Y", "%b %d, %Y", "%b %d %Y",
@@ -5466,9 +5490,16 @@ Now respond with ONLY the JSON array, no explanation."""
                            source_memory_ids (list), and optional rrf_timing.
         """
         import time as _time
+        from . import query_mode as _query_mode
 
         timing = {}
         start_total = _time.perf_counter()
+
+        is_temporal = (
+            _query_mode.is_temporal_query(query)
+            or _query_mode.is_duration_query(query)
+            or _query_mode.is_ordering_query(query)
+        )
 
         # Run all four specialists, guarding against failures
         specialists = []
@@ -5483,15 +5514,19 @@ Now respond with ONLY the JSON array, no explanation."""
             timing['fact_ms'] = 0
             specialists.append(('fact', {"context": "", "facts": [], "source": "fallback"}))
 
-        # Specialist 2: Timeline retrieval
-        try:
-            start = _time.perf_counter()
-            timeline_result = self._memoria_timeline_retrieve(query, top_k=top_k)
-            timing['timeline_ms'] = (_time.perf_counter() - start) * 1000
-            specialists.append(('timeline', timeline_result))
-        except Exception:
+        # Specialist 2: Timeline retrieval (gated by temporal query)
+        if is_temporal:
+            try:
+                start = _time.perf_counter()
+                timeline_result = self._memoria_timeline_retrieve(query, top_k=top_k)
+                timing['timeline_ms'] = (_time.perf_counter() - start) * 1000
+                specialists.append(('timeline', timeline_result))
+            except Exception:
+                timing['timeline_ms'] = 0
+                specialists.append(('timeline', {"context": "", "facts": [], "source": "fallback"}))
+        else:
             timing['timeline_ms'] = 0
-            specialists.append(('timeline', {"context": "", "facts": [], "source": "fallback"}))
+            specialists.append(('timeline', {"context": "", "facts": [], "source": "gated"}))
 
         # Specialist 3: Negation retrieval
         try:
@@ -5503,15 +5538,19 @@ Now respond with ONLY the JSON array, no explanation."""
             timing['negation_ms'] = 0
             specialists.append(('negation', {"context": "", "facts": [], "source": "fallback"}))
 
-        # Specialist 4: Chrono retrieval
-        try:
-            start = _time.perf_counter()
-            chrono_result = self._memoria_chrono_retrieve(query, top_k=top_k)
-            timing['chrono_ms'] = (_time.perf_counter() - start) * 1000
-            specialists.append(('chrono', chrono_result))
-        except Exception:
+        # Specialist 4: Chrono retrieval (gated by temporal query)
+        if is_temporal:
+            try:
+                start = _time.perf_counter()
+                chrono_result = self._memoria_chrono_retrieve(query, top_k=top_k)
+                timing['chrono_ms'] = (_time.perf_counter() - start) * 1000
+                specialists.append(('chrono', chrono_result))
+            except Exception:
+                timing['chrono_ms'] = 0
+                specialists.append(('chrono', {"context": "", "facts": [], "source": "fallback"}))
+        else:
             timing['chrono_ms'] = 0
-            specialists.append(('chrono', {"context": "", "facts": [], "source": "fallback"}))
+            specialists.append(('chrono', {"context": "", "facts": [], "source": "gated"}))
 
         # Specialist 5: Knowledge graph (entity/relation) retrieval. Always on
         # -- the KG source is a default part of fusion (empty when memoria_kg
@@ -5586,9 +5625,25 @@ Now respond with ONLY the JSON array, no explanation."""
                 all_items[key] = (specialist_name, fact)
             ranked_lists.append(ranked_list)
 
+        # Deduplicate across ranked_lists by rendered text hash before RRF
+        seen_text_hashes: set = set()
+        for rl in ranked_lists:
+            deduped = []
+            for key in rl:
+                if key in all_items:
+                    _, fact = all_items[key]
+                    text_hash = hash(_fact_render_text(fact))
+                    if text_hash not in seen_text_hashes:
+                        seen_text_hashes.add(text_hash)
+                        deduped.append(key)
+                else:
+                    deduped.append(key)
+            rl.clear()
+            rl.extend(deduped)
+
         # Fuse the ranked lists
         start = _time.perf_counter()
-        fused_keys = _rrf_fuse(ranked_lists, k=60)
+        fused_keys = _rrf_fuse(ranked_lists, k=15)
         timing['fuse_ms'] = (_time.perf_counter() - start) * 1000
 
         # Reassemble result, respecting fused order. Keep the source specialist
@@ -5629,8 +5684,6 @@ Now respond with ONLY the JSON array, no explanation."""
             final_items = [item for _, item in _indexed]
             final_facts = [f for _, f in final_items]
             reranked = True
-
-        from . import query_mode as _query_mode
 
         # Message-index extraction is specialist-aware: facts expose `message_idx`
         # (with updated/valid_from fallbacks); timelines/negations/sequences expose
@@ -5865,33 +5918,33 @@ Now respond with ONLY the JSON array, no explanation."""
                     if facts:
                         break
 
-        # -- Pass 4: context_snippet fallback --
-        # Search the original surrounding text for meaningful query words.
-        # Catches "What is the latency?" where "latency" is in the snippet
-        # but not in the structured key/value fields.
-        if not facts:
-            q_stop = {'what', 'when', 'where', 'which', 'who', 'how', 'why',
-                      'is', 'are', 'was', 'were', 'do', 'does', 'did',
-                      'can', 'will', 'would', 'should', 'could', 'may',
-                      'the', 'a', 'an', 'in', 'on', 'at', 'to', 'for',
-                      'of', 'with', 'my', 'me', 'i', 'you', 'it', 'its',
-                      'this', 'that', 'these', 'those', 'tell', 'list',
-                      'describe', 'explain', 'walk', 'me', 'through'}
-            q_words = [w for w in _re.findall(r'\b[a-zA-Z]{3,}\b', q_lower)
-                       if w not in q_stop]
-            for word in q_words[:5]:
-                rows = cursor.execute(
-                    "SELECT fact_type, key, value, context_snippet, previous_value, updated_msg_idx, version_id, source_memory_id, message_idx, valid_from_msg_idx FROM memoria_facts "
-                    "WHERE context_snippet LIKE ? AND session_id = ? LIMIT ?",
-                    (f'%{word}%', self.session_id, top_k)
-                ).fetchall()
-                for row in rows:
-                    fk = (row[1], row[2])
-                    if fk not in seen:
-                        seen.add(fk)
-                        facts.append(dict(zip(['type', 'key', 'value', 'context', 'previous_value', 'updated_msg_idx', 'version_id', 'source_memory_id', 'message_idx', 'valid_from_msg_idx'], row)))
-                if facts:
-                    break
+        # -- Pass 4: Broad keyword search (always runs) --
+        # Search all text fields (key, value, context_snippet) for ANY non-stop
+        # query word. Catches lowercase content words like "authentication",
+        # "library", "budget" that Pass 2 (capitalized-only) and Pass 3
+        # (hardcoded synonyms) miss. Each word is tried independently so that
+        # different query terms find their own matching facts, not just the
+        # first matching word.
+        q_stop = {'what', 'when', 'where', 'which', 'who', 'how', 'why',
+                  'is', 'are', 'was', 'were', 'do', 'does', 'did',
+                  'can', 'will', 'would', 'should', 'could', 'may',
+                  'the', 'a', 'an', 'in', 'on', 'at', 'to', 'for',
+                  'of', 'with', 'my', 'me', 'i', 'you', 'it', 'its',
+                  'this', 'that', 'these', 'those', 'tell', 'list',
+                  'describe', 'explain', 'walk', 'me', 'through'}
+        q_words = [w for w in _re.findall(r'\b[a-zA-Z]{3,}\b', q_lower)
+                   if w not in q_stop]
+        for word in q_words[:5]:
+            rows = cursor.execute(
+                "SELECT fact_type, key, value, context_snippet, previous_value, updated_msg_idx, version_id, source_memory_id, message_idx, valid_from_msg_idx FROM memoria_facts "
+                "WHERE fact_type != 'sequence' AND (key LIKE ? OR value LIKE ? OR context_snippet LIKE ?) AND session_id = ? LIMIT ?",
+                (f'%{word}%', f'%{word}%', f'%{word}%', self.session_id, top_k)
+            ).fetchall()
+            for row in rows:
+                fk = (row[1], row[2])
+                if fk not in seen:
+                    seen.add(fk)
+                    facts.append(dict(zip(['type', 'key', 'value', 'context', 'previous_value', 'updated_msg_idx', 'version_id', 'source_memory_id', 'message_idx', 'valid_from_msg_idx'], row)))
 
         if facts:
             # Group by key, keep only the latest (highest version_id) per key.
@@ -6234,6 +6287,19 @@ Now respond with ONLY the JSON array, no explanation."""
             group_scores = {
                 idx: len(query_terms & terms) for idx, terms in group_terms.items()
             }
+            rows = [row for row in rows if group_scores.get(row[2], 0) > 0]
+            if not rows:
+                if is_ordering_query(query):
+                    fallback = cursor.execute(
+                        "SELECT date, description, message_idx FROM memoria_timelines "
+                        "WHERE session_id = ? ORDER BY date DESC LIMIT 5",
+                        (self.session_id,)
+                    ).fetchall()
+                    if fallback:
+                        facts = [dict(zip(['date', 'description', 'msg_idx'], r)) for r in fallback]
+                        ctx_lines = [f"[{r[0]}] {r[1][:200]}" for r in fallback]
+                        return {"context": "\n".join(ctx_lines), "facts": facts, "source": "fallback"}
+                return {"context": "", "facts": [], "source": "fallback"}
             rows = sorted(
                 rows,
                 key=lambda row: (
@@ -6477,13 +6543,32 @@ Now respond with ONLY the JSON array, no explanation."""
         return {"context": "", "facts": [], "source": "fallback"}
 
     def _memoria_chrono_retrieve(self, query: str, top_k: int = 10) -> dict:
-        """Query memoria_facts for sequence markers, ordered by message_idx."""
+        """Query memoria_facts for sequence markers, ordered by message_idx.
+        Filters by lexical overlap with query content words."""
+        import re as _re
         cursor = self.conn
+
+        stop = {'what', 'when', 'where', 'which', 'who', 'how', 'why',
+                'is', 'are', 'was', 'were', 'do', 'does', 'did',
+                'can', 'will', 'would', 'should', 'could', 'may',
+                'the', 'a', 'an', 'in', 'on', 'at', 'to', 'for',
+                'of', 'with', 'my', 'me', 'i', 'you', 'it', 'its',
+                'this', 'that', 'these', 'those', 'tell', 'list',
+                'describe', 'explain', 'have', 'has', 'had', 'am'}
+        q_words = [w for w in _re.findall(r'[a-z0-9]+', query.lower())
+                   if len(w) > 2 and w not in stop]
+
+        if not q_words:
+            return {"context": "", "facts": [], "source": "fallback"}
+
+        conditions = ' OR '.join('value LIKE ?' for _ in q_words)
+        params = [self.session_id] + [f'%{w}%' for w in q_words] + [top_k]
+
         rows = cursor.execute(
-            "SELECT value, message_idx FROM memoria_facts "
-            "WHERE fact_type='sequence' AND session_id = ? "
-            "ORDER BY message_idx ASC LIMIT ?",
-            (self.session_id, top_k)
+            f"SELECT value, message_idx FROM memoria_facts "
+            f"WHERE fact_type='sequence' AND session_id = ? AND ({conditions}) "
+            f"ORDER BY message_idx ASC LIMIT ?",
+            params
         ).fetchall()
         if rows:
             facts = [dict(zip(['sequence', 'msg_idx'], r)) for r in rows]
@@ -6492,7 +6577,10 @@ Now respond with ONLY the JSON array, no explanation."""
         return {"context": "", "facts": [], "source": "fallback"}
 
     def _memoria_instruction_retrieve(self, query: str, top_k: int = 10) -> dict:
-        """Query memoria_instructions for user constraints matching query terms."""
+        """Query memoria_instructions + memoria_facts for user constraints matching query terms.
+        Searches both the regex-populated instructions table and LLM-extracted
+        instruction/decision facts so IF questions surface tool and library
+        choices from both extraction paths."""
         import re as _re
         cursor = self.conn
         q_lower = query.lower()
@@ -6508,7 +6596,10 @@ Now respond with ONLY the JSON array, no explanation."""
         q_words = [w for w in _re.findall(r'\b[a-zA-Z]{3,}\b', q_lower)
                    if w not in stop_words]
 
-        rows = []
+        all_facts = []
+        seen_keys = set()
+
+        # Phase 1: Search memoria_instructions (regex-populated table)
         if q_words:
             for word in q_words[:5]:
                 rows = cursor.execute(
@@ -6517,24 +6608,89 @@ Now respond with ONLY the JSON array, no explanation."""
                     (f'%{word}%', f'%{word}%', self.session_id, top_k)
                 ).fetchall()
                 if rows:
+                    for r in rows:
+                        fk = ("instr", r[0])
+                        if fk not in seen_keys:
+                            seen_keys.add(fk)
+                            all_facts.append({
+                                "instruction": r[0], "topic": r[1], "msg_idx": r[2],
+                                "context": r[3],
+                                "source_memory_id": f"instr-{r[2]}",
+                            })
                     break
 
-        if not rows:
-            # Fallback: return all active instructions
-            rows = cursor.execute(
+        # Phase 2: Also search memoria_facts for LLM-extracted instructions/decisions
+        if q_words:
+            for word in q_words[:5]:
+                rows = cursor.execute(
+                    "SELECT fact_type, key, value, context_snippet, message_idx, source_memory_id "
+                    "FROM memoria_facts "
+                    "WHERE fact_type IN ('instruction', 'decision') "
+                    "AND (key LIKE ? OR value LIKE ? OR context_snippet LIKE ?) "
+                    "AND session_id = ? AND valid_to_msg_idx IS NULL LIMIT ?",
+                    (f'%{word}%', f'%{word}%', f'%{word}%', self.session_id, top_k)
+                ).fetchall()
+                if rows:
+                    for r in rows:
+                        fk = (r[0], r[2])
+                        if fk not in seen_keys:
+                            seen_keys.add(fk)
+                            all_facts.append({
+                                "instruction": f"{r[1]}: {r[2]}",
+                                "topic": r[0],
+                                "msg_idx": r[4],
+                                "context": r[3] or "",
+                                "source_memory_id": r[5] or f"{r[0]}-{r[4]}",
+                            })
+
+        if not all_facts:
+            # Fallback: return all active instructions from both tables
+            instr_rows = cursor.execute(
                 "SELECT instruction, topic, message_idx, context_snippet FROM memoria_instructions "
                 "WHERE session_id = ? AND active = 1 ORDER BY message_idx DESC LIMIT ?",
                 (self.session_id, top_k)
             ).fetchall()
+            for r in instr_rows:
+                fk = ("instr", r[0])
+                if fk not in seen_keys:
+                    seen_keys.add(fk)
+                    all_facts.append({
+                        "instruction": r[0], "topic": r[1], "msg_idx": r[2],
+                        "context": r[3],
+                        "source_memory_id": f"instr-{r[2]}",
+                    })
+            if len(all_facts) < top_k:
+                fact_rows = cursor.execute(
+                    "SELECT fact_type, key, value, context_snippet, message_idx, source_memory_id "
+                    "FROM memoria_facts "
+                    "WHERE fact_type IN ('instruction', 'decision') "
+                    "AND session_id = ? AND valid_to_msg_idx IS NULL "
+                    "ORDER BY message_idx DESC LIMIT ?",
+                    (self.session_id, top_k - len(all_facts))
+                ).fetchall()
+                for r in fact_rows:
+                    fk = (r[0], r[2])
+                    if fk not in seen_keys:
+                        seen_keys.add(fk)
+                        all_facts.append({
+                            "instruction": f"{r[1]}: {r[2]}",
+                            "topic": r[0],
+                            "msg_idx": r[4],
+                            "context": r[3] or "",
+                            "source_memory_id": r[5] or f"{r[0]}-{r[4]}",
+                        })
 
-        if rows:
-            facts = [dict(zip(['instruction', 'topic', 'msg_idx', 'context'], r)) for r in rows]
-            ctx_lines = [f"[Instruction] {r[0][:120]}" for r in rows]
-            return {"context": "\n".join(ctx_lines), "facts": facts, "source": "memoria_instructions"}
+        if all_facts:
+            all_facts = all_facts[:top_k]
+            ctx_lines = [f"[Instruction] {f['instruction'][:120]}" for f in all_facts]
+            return {"context": "\n".join(ctx_lines), "facts": all_facts, "source": "memoria_instructions"}
         return {"context": "", "facts": [], "source": "fallback"}
 
     def _memoria_preference_retrieve(self, query: str, top_k: int = 10) -> dict:
-        """Query memoria_preferences for evolving user tastes matching query terms."""
+        """Query memoria_preferences + memoria_facts for user preferences matching query terms.
+        Searches both the regex-populated preferences table and LLM-extracted
+        preference/instruction/decision facts so PF questions surface library
+        choices and tool preferences regardless of extraction path."""
         import re as _re
         cursor = self.conn
         q_lower = query.lower()
@@ -6549,7 +6705,10 @@ Now respond with ONLY the JSON array, no explanation."""
         q_words = [w for w in _re.findall(r'\b[a-zA-Z]{3,}\b', q_lower)
                    if w not in stop_words]
 
-        rows = []
+        all_facts = []
+        seen_keys = set()
+
+        # Phase 1: Search memoria_preferences (regex-populated table)
         if q_words:
             for word in q_words[:5]:
                 rows = cursor.execute(
@@ -6558,25 +6717,94 @@ Now respond with ONLY the JSON array, no explanation."""
                     (f'%{word}%', f'%{word}%', self.session_id, top_k)
                 ).fetchall()
                 if rows:
+                    for r in rows:
+                        fk = ("pref", r[0])
+                        if fk not in seen_keys:
+                            seen_keys.add(fk)
+                            all_facts.append({
+                                "preference": r[0], "topic": r[1], "msg_idx": r[2],
+                                "evolution": r[3], "context": r[4],
+                                "source_memory_id": f"pref-{r[2]}",
+                            })
                     break
 
-        if not rows:
-            # Fallback: return all preferences
-            rows = cursor.execute(
+        # Phase 2: Also search memoria_facts for LLM-extracted preferences/decisions
+        # (fact_type IN ('preference', 'instruction', 'decision')). These contain
+        # library choices, tool suggestions, and architectural decisions that the
+        # regex-only preference table misses.
+        if q_words:
+            for word in q_words[:5]:
+                rows = cursor.execute(
+                    "SELECT fact_type, key, value, context_snippet, message_idx, source_memory_id "
+                    "FROM memoria_facts "
+                    "WHERE fact_type IN ('preference', 'instruction', 'decision') "
+                    "AND (key LIKE ? OR value LIKE ? OR context_snippet LIKE ?) "
+                    "AND session_id = ? AND valid_to_msg_idx IS NULL LIMIT ?",
+                    (f'%{word}%', f'%{word}%', f'%{word}%', self.session_id, top_k)
+                ).fetchall()
+                if rows:
+                    for r in rows:
+                        fk = (r[0], r[2])
+                        if fk not in seen_keys:
+                            seen_keys.add(fk)
+                            all_facts.append({
+                                "preference": f"{r[1]}: {r[2]}",
+                                "topic": r[0],
+                                "msg_idx": r[4],
+                                "evolution": "",
+                                "context": r[3] or "",
+                                "source_memory_id": r[5] or f"{r[0]}-{r[4]}",
+                            })
+                    # Don't break — try more words to find additional preferences
+
+        if not all_facts:
+            # Fallback: return all preferences from both tables
+            pref_rows = cursor.execute(
                 "SELECT preference, topic, message_idx, evolution, context_snippet FROM memoria_preferences "
                 "WHERE session_id = ? ORDER BY message_idx DESC LIMIT ?",
                 (self.session_id, top_k)
             ).fetchall()
+            for r in pref_rows:
+                fk = ("pref", r[0])
+                if fk not in seen_keys:
+                    seen_keys.add(fk)
+                    all_facts.append({
+                        "preference": r[0], "topic": r[1], "msg_idx": r[2],
+                        "evolution": r[3], "context": r[4],
+                        "source_memory_id": f"pref-{r[2]}",
+                    })
+            # If still empty and top_k room, pull recent preference/decision facts
+            if len(all_facts) < top_k:
+                fact_rows = cursor.execute(
+                    "SELECT fact_type, key, value, context_snippet, message_idx, source_memory_id "
+                    "FROM memoria_facts "
+                    "WHERE fact_type IN ('preference', 'instruction', 'decision') "
+                    "AND session_id = ? AND valid_to_msg_idx IS NULL "
+                    "ORDER BY message_idx DESC LIMIT ?",
+                    (self.session_id, top_k - len(all_facts))
+                ).fetchall()
+                for r in fact_rows:
+                    fk = (r[0], r[2])
+                    if fk not in seen_keys:
+                        seen_keys.add(fk)
+                        all_facts.append({
+                            "preference": f"{r[1]}: {r[2]}",
+                            "topic": r[0],
+                            "msg_idx": r[4],
+                            "evolution": "",
+                            "context": r[3] or "",
+                            "source_memory_id": r[5] or f"{r[0]}-{r[4]}",
+                        })
 
-        if rows:
-            facts = [dict(zip(['preference', 'topic', 'msg_idx', 'evolution', 'context'], r)) for r in rows]
+        if all_facts:
+            all_facts = all_facts[:top_k]
             ctx_lines = []
-            for r in rows:
-                line = f"[Preference] {r[0][:120]}"
-                if r[3]:
-                    line += f" ({r[3]})"
+            for f in all_facts:
+                line = f"[Preference] {f['preference'][:120]}"
+                if f.get('evolution'):
+                    line += f" ({f['evolution']})"
                 ctx_lines.append(line)
-            return {"context": "\n".join(ctx_lines), "facts": facts, "source": "memoria_preferences"}
+            return {"context": "\n".join(ctx_lines), "facts": all_facts, "source": "memoria_preferences"}
         return {"context": "", "facts": [], "source": "fallback"}
 
     def recall(self, query: str, top_k: int = 40, *,
