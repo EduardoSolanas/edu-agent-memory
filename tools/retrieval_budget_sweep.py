@@ -21,7 +21,7 @@ from pathlib import Path
 #  Env setup (before importing edumem modules)
 # ============================================================
 
-os.environ.setdefault("EDUMEM_EMBEDDING_API_URL", "http://localhost:3002")
+os.environ.setdefault("EDUMEM_EMBEDDING_API_URL", "http://127.0.0.1:3002")
 os.environ.setdefault("EDUMEM_EMBEDDING_MODEL", "Alibaba-NLP/gte-modernbert-base")
 os.environ.setdefault("EDUMEM_EMBEDDINGS_VIA_API", "1")
 os.environ.setdefault("EDUMEM_BENCHMARK_PURE_RECALL", "1")

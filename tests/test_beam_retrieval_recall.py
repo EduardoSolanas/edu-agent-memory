@@ -24,7 +24,7 @@ import pytest
 # Gate: skip entire module unless explicitly enabled
 pytestmark = pytest.mark.skipif(
     os.environ.get("EDUMEM_RETRIEVAL_E2E") != "1",
-    reason="retrieval e2e; set EDUMEM_RETRIEVAL_E2E=1 and have embeddings container up at localhost:3002"
+    reason="retrieval e2e; set EDUMEM_RETRIEVAL_E2E=1 and have embeddings container up at 127.0.0.1:3002"
 )
 
 # ============================================================
@@ -33,7 +33,9 @@ pytestmark = pytest.mark.skipif(
 
 def _setup_retrieval_env():
     """Set env vars for retrieval-only mode (no answer/judge LLM)."""
-    os.environ.setdefault("EDUMEM_EMBEDDING_API_URL", "http://localhost:3002")
+    # 127.0.0.1, not localhost: on Windows/WSL localhost resolves to IPv6 ::1
+    # first and stalls ~2s per request before falling back to the IPv4 port.
+    os.environ.setdefault("EDUMEM_EMBEDDING_API_URL", "http://127.0.0.1:3002")
     os.environ.setdefault("EDUMEM_EMBEDDING_MODEL", "Alibaba-NLP/gte-modernbert-base")
     os.environ.setdefault("EDUMEM_EMBEDDINGS_VIA_API", "1")
     os.environ.setdefault("EDUMEM_BENCHMARK_PURE_RECALL", "1")

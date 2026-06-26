@@ -314,7 +314,7 @@ def e2e_answers():
     from edumem.core.beam import init_beam, BeamMemory
 
     # Preflight: check reranker
-    reranker_url = os.environ.get("EDUMEM_RERANKER_URL", "http://localhost:3002/rerank")
+    reranker_url = os.environ.get("EDUMEM_RERANKER_URL", "http://127.0.0.1:3002/rerank")
     reranker_health = _probe_reranker(reranker_url)
     if not reranker_health.get("ok"):
         pytest.skip(f"reranker endpoint unavailable: {reranker_health}")

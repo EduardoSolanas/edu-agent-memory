@@ -18,7 +18,7 @@ def _closed_local_port() -> int:
 
 def test_runner_helpers_build_expected_env_and_command():
     embedding_base_url, embedding_model, embedding_dim = runner._resolve_embedding_settings({})
-    assert embedding_base_url == "http://localhost:3002"
+    assert embedding_base_url == "http://127.0.0.1:3002"
     assert embedding_model == "Alibaba-NLP/gte-modernbert-base"
     assert embedding_dim == 768
 
@@ -28,7 +28,7 @@ def test_runner_helpers_build_expected_env_and_command():
         api_key="test-nan-key",
         model="deepseek-v4-flash",
         judge_model="deepseek-v4-flash",
-        reranker_url="http://localhost:3002/rerank",
+        reranker_url="http://127.0.0.1:3002/rerank",
         embedding_base_url=embedding_base_url,
         embedding_model=embedding_model,
         embedding_dim=embedding_dim,
@@ -36,7 +36,7 @@ def test_runner_helpers_build_expected_env_and_command():
     assert env["OPENROUTER_BASE_URL"] == "https://api.nan.builders/v1"
     assert env["EDUMEM_LLM_MODEL"] == "deepseek-v4-flash"
     assert env["EDUMEM_JUDGE_MODEL"] == "deepseek-v4-flash"
-    assert env["EDUMEM_RERANKER_URL"] == "http://localhost:3002/rerank"
+    assert env["EDUMEM_RERANKER_URL"] == "http://127.0.0.1:3002/rerank"
     assert env["EDUMEM_EMBEDDING_MODEL"] == "Alibaba-NLP/gte-modernbert-base"
     assert env["EDUMEM_EMBEDDING_DIM"] == "768"
 

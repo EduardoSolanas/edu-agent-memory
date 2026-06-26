@@ -332,7 +332,7 @@ def test_flush_fact_embeddings_populates_vec_facts_live(tmp_path):
     dimension error, which would leave vec_facts empty -> this test fails.
     """
     import urllib.request as _ur
-    base = os.environ.get("EDUMEM_EMBEDDING_API_URL", "http://localhost:3002")
+    base = os.environ.get("EDUMEM_EMBEDDING_API_URL", "http://127.0.0.1:3002")
     url = f"{base.rstrip('/')}/v1/embeddings"
     try:
         req = _ur.Request(url, data=b'{"model":"x","input":["hi"]}',
