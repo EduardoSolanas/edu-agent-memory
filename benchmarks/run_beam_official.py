@@ -17,8 +17,8 @@ from pathlib import Path
 from urllib import request
 
 WORKDIR = Path(__file__).resolve().parents[1]
-SHIPPED_RERANKER_URL = "http://localhost:3002/rerank"
-SHIPPED_EMBEDDING_BASE_URL = "http://localhost:3002"
+SHIPPED_RERANKER_URL = "http://127.0.0.1:3002/rerank"
+SHIPPED_EMBEDDING_BASE_URL = "http://127.0.0.1:3002"
 SHIPPED_EMBEDDING_MODEL = "Alibaba-NLP/gte-modernbert-base"
 SHIPPED_EMBEDDING_DIM = "768"
 

@@ -2377,13 +2377,15 @@ def _fusion_rerank(query: str, fact_texts: list) -> list | None:
 
     Gated by `EDUMEM_FUSION_RERANK` (default ON; set to `0`/`false`/`off` to
     disable). Endpoint from `EDUMEM_RERANKER_URL` (default
-    `http://localhost:3002/rerank`).
+    `http://127.0.0.1:3002/rerank`). Note: 127.0.0.1, not `localhost` — on
+    Windows/WSL `localhost` resolves to IPv6 `::1` first and stalls ~2s before
+    falling back to the IPv4-only published port.
     """
     if _env_disabled("EDUMEM_FUSION_RERANK"):
         return None
     if not fact_texts:
         return None
-    reranker_url = os.environ.get("EDUMEM_RERANKER_URL", "http://localhost:3002/rerank")
+    reranker_url = os.environ.get("EDUMEM_RERANKER_URL", "http://127.0.0.1:3002/rerank")
     try:
         resp = _FUSION_RERANK_SESSION.post(
             reranker_url,
@@ -5475,7 +5477,7 @@ Now respond with ONLY the JSON array, no explanation."""
     # ------------------------------------------------------------------
     # RRF Fusion: Reciprocal Rank Fusion for multi-specialist fusion
     # ------------------------------------------------------------------
-    def _memoria_fused_retrieve(self, query: str, top_k: int = 10) -> dict:
+    def _memoria_fused_retrieve(self, query: str, top_k: int = 10, intent: str = '') -> dict:
         """Fuse results from all MEMORIA specialists using RRF.
 
         Runs all four specialists in parallel (guarded), extracts their ranked results,
@@ -5484,6 +5486,8 @@ Now respond with ONLY the JSON array, no explanation."""
         Args:
             query: The query string.
             top_k: Number of final results to return.
+            intent: Generic intent for versioned-fact rendering ('', 'current',
+                    'change', 'timeline', 'ordered'). Passed to fact retrieve.
 
         Returns:
             Dict with keys: context (str), facts (list), source (str),
@@ -5507,7 +5511,7 @@ Now respond with ONLY the JSON array, no explanation."""
         # Specialist 1: Fact retrieval
         try:
             start = _time.perf_counter()
-            fact_result = self._memoria_fact_retrieve(query, top_k=top_k, intent='')
+            fact_result = self._memoria_fact_retrieve(query, top_k=top_k, intent=intent)
             timing['fact_ms'] = (_time.perf_counter() - start) * 1000
             specialists.append(('fact', fact_result))
         except Exception:
@@ -5713,11 +5717,16 @@ Now respond with ONLY the JSON array, no explanation."""
 
         # Render each item as readable text (never a raw dict repr), tagging it
         # with its [MSGIDX:N] anchor when a message index is available.
+        # Fact-specialist items use versioned-fact formatting (intent-based)
+        # so [Fact CURRENT/CHANGED/TIMELINE] markers reach the prompt.
         final_context_lines = []
         for specialist_name, fact in final_items:
-            idx = _item_msg_idx(fact) if isinstance(fact, dict) else None
-            tag = f"[MSGIDX:{idx}] " if idx is not None else ""
-            line = f"{tag}{_fact_render_text(fact)}".strip()
+            if specialist_name == 'fact' and isinstance(fact, dict) and 'key' in fact:
+                line = self._format_versioned_fact(fact, intent=intent).strip()
+            else:
+                idx = _item_msg_idx(fact) if isinstance(fact, dict) else None
+                tag = f"[MSGIDX:{idx}] " if idx is not None else ""
+                line = f"{tag}{_fact_render_text(fact)}".strip()
             if line:
                 final_context_lines.append(line)
 
@@ -5742,15 +5751,24 @@ Now respond with ONLY the JSON array, no explanation."""
         Returns dict with keys: context (str), facts (list), source (str).
         Falls back to {'context': '', 'facts': [], 'source': 'fallback'} when empty.
 
-        Args:
-            query: The query string.
-            ability: BEAM ability code (KU, CR, TR, EO, IE, MR, IF, PF). If None, auto-classified.
-            top_k: Number of results to return.
-            intent: Generic intent string ('current', 'change', 'timeline', 'ordered', or '').
-                    If None, derived from ability code via _ABILITY_TO_INTENT mapping.
-                    If provided explicitly, takes precedence."""
-        # RRF fusion over all MEMORIA specialists is the proven recall strategy (A/B: 2.6× answer-facts, zero regressions)
-        return self._memoria_fused_retrieve(query, top_k=top_k)
+        Derives intent from query text when not explicitly set (query_mode
+        classifiers), enabling versioned-fact rendering for CR/TR/EO without
+        needing the dataset's ability label."""
+        if intent is None:
+            from . import query_mode as _qm
+            if _qm.is_contradiction_query(query):
+                intent = 'change'
+            elif _qm.is_ordering_query(query):
+                intent = 'ordered'
+            elif _qm.is_temporal_query(query):
+                intent = 'timeline'
+            elif _qm.is_knowledge_update_query(query):
+                intent = 'current'
+            elif _qm.is_yesno_check_query(query):
+                intent = 'change'
+            else:
+                intent = ''
+        return self._memoria_fused_retrieve(query, top_k=top_k, intent=intent)
 
     @staticmethod
     def _classify_ability(query: str) -> str:

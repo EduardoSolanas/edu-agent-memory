@@ -57,6 +57,7 @@ _KU_KEYWORDS = (
     "now using", "most recent",
     "how many", "included", "do i have", "are there",
     "deadline",
+    "what is", "what was",
 )
 
 _MR_KEYWORDS = (

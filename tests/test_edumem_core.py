@@ -1059,7 +1059,6 @@ class TestQueryModePrompts:
         prompt = build_system_prompt("What is my favorite programming language?")
         assert "ORDERING" not in prompt
         assert "DURATION" not in prompt
-        assert "KNOWLEDGE UPDATE" not in prompt
         assert "MULTI-HOP" not in prompt
 
 

@@ -4538,7 +4538,7 @@ def main():
         for scale, convs in data.items():
             selected_conversation_ids[scale] = [conv["id"] for conv in convs]
 
-    reranker_url = os.environ.get("EDUMEM_RERANKER_URL", "http://localhost:3002/rerank")
+    reranker_url = os.environ.get("EDUMEM_RERANKER_URL", "http://127.0.0.1:3002/rerank")
     reranker_preflight = _probe_reranker(reranker_url)
     print(f"  Reranker preflight: {reranker_url} -> {'OK' if reranker_preflight.get('ok') else 'UNAVAILABLE'}")
     if not reranker_preflight.get("ok") and not args.allow_no_reranker:
