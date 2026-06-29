@@ -55,7 +55,7 @@ _OPENAI_API_KEY = os.environ.get("EDUMEM_EMBEDDING_API_KEY", os.environ.get("OPE
 _OPENAI_BASE_URL = os.environ.get("EDUMEM_EMBEDDING_API_URL", "https://openrouter.ai/api/v1")
 
 # --- Model selection ---
-_DEFAULT_MODEL = os.environ.get("EDUMEM_EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
+_DEFAULT_MODEL = os.environ.get("EDUMEM_EMBEDDING_MODEL", "Alibaba-NLP/gte-modernbert-base")
 _embedding_model = None
 _API_CALL_COUNT = 0
 
@@ -155,11 +155,15 @@ _EMBED_API_LOCK = threading.Lock()
 _EMBED_API_SESSION = _requests.Session() if _requests is not None else None
 
 
+_EMBED_API_BATCH_SIZE = int(os.environ.get("EDUMEM_EMBED_BATCH_SIZE", "256"))
+
+
 def _embed_api(texts: List[str]) -> Optional[np.ndarray]:
     """Embed texts via OpenAI-compatible API (OpenRouter or custom endpoint).
 
     Uses a pooled `requests.Session` for connection reuse (keep-alive); falls
     back to per-call `urllib.request.urlopen` when `requests` is unavailable.
+    Large inputs are chunked into batches to avoid timeout on the API.
     """
     global _API_CALL_COUNT
     # Require API key for OpenRouter; custom endpoints may not need one.
@@ -172,11 +176,6 @@ def _embed_api(texts: List[str]) -> Optional[np.ndarray]:
         url = f"{base_url.rstrip('/')}/v1/embeddings"
     else:
         url = f"{base_url.rstrip('/')}/embeddings"
-    payload_dict = {
-        "model": _DEFAULT_MODEL,
-        "input": texts,
-    }
-    payload = json.dumps(payload_dict).encode()  # bytes for the urllib fallback
 
     headers = {
         "Content-Type": "application/json",
@@ -191,13 +190,31 @@ def _embed_api(texts: List[str]) -> Optional[np.ndarray]:
     # the urllib fallback uses ssl.create_default_context().
     cert_file = os.environ.get("SSL_CERT_FILE") or os.environ.get("REQUESTS_CA_BUNDLE")
 
+    all_embeddings: List[list] = []
+    for i in range(0, len(texts), _EMBED_API_BATCH_SIZE):
+        batch = texts[i : i + _EMBED_API_BATCH_SIZE]
+        result = _embed_api_batch(batch, url, headers, cert_file)
+        if result is None:
+            return None
+        all_embeddings.extend(result)
+
+    return np.array(all_embeddings, dtype=np.float32)
+
+
+def _embed_api_batch(texts: List[str], url: str, headers: dict,
+                     cert_file: Optional[str]) -> Optional[List[list]]:
+    """Embed a single batch of texts. Returns list of embedding vectors or None."""
+    global _API_CALL_COUNT
+    payload_dict = {
+        "model": _DEFAULT_MODEL,
+        "input": texts,
+    }
+    payload = json.dumps(payload_dict).encode()
+
     with _EMBED_API_LOCK:
         for attempt in range(3):
             try:
                 if _EMBED_API_SESSION is not None:
-                    # Pooled path: one keep-alive Session reused across calls
-                    # (no per-call TCP/TLS handshake). requests honors
-                    # REQUESTS_CA_BUNDLE automatically; SSL_CERT_FILE via verify.
                     verify = cert_file if (cert_file and os.environ.get("SSL_CERT_FILE")) else True
                     resp = _EMBED_API_SESSION.post(
                         url, json=payload_dict, headers=headers, timeout=30, verify=verify,
@@ -205,16 +222,14 @@ def _embed_api(texts: List[str]) -> Optional[np.ndarray]:
                     resp.raise_for_status()
                     data = resp.json()
                 else:
-                    # Fallback: per-call urllib (no connection reuse).
                     req = urllib.request.Request(url, data=payload, headers=headers)
                     ctx = ssl.create_default_context()
                     if cert_file:
                         ctx.load_verify_locations(cert_file)
                     with urllib.request.urlopen(req, timeout=30, context=ctx) as resp:
                         data = json.loads(resp.read())
-                embeddings = [item["embedding"] for item in data["data"]]
                 _API_CALL_COUNT += 1
-                return np.array(embeddings, dtype=np.float32)
+                return [item["embedding"] for item in data["data"]]
             except Exception as e:
                 if "429" in str(e) or "rate" in str(e).lower():
                     import time
