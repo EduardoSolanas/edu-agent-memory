@@ -1187,6 +1187,120 @@ def test_cr_sum_mr_get_higher_max_tokens():
     assert "ability" in answer_with_memory.__code__.co_varnames
 
 
+@pytest.mark.parametrize(
+    "ability,question,seed_rows",
+    [
+        (
+            "SUM",
+            "Can you summarize the project work?",
+            [
+                "Security work covered password hashing and account lockout.",
+                "Database work covered migrations and query tuning.",
+                "Delivery work covered onboarding and deployment sequencing.",
+            ],
+        ),
+        (
+            "MR",
+            "How many security features did I mention across the project?",
+            [
+                "Security features included password hashing, RBAC, and account lockout.",
+                "Database work covered migrations and query tuning.",
+                "Delivery work covered onboarding and deployment sequencing.",
+            ],
+        ),
+    ],
+)
+def test_reflect_synthesis_runs_only_on_answer_path(tmp_path, ability, question, seed_rows):
+    """SUM/MR should run a reflect pass before the final answer, but only on the answer path."""
+    saved = os.environ.get("EDUMEM_NO_EMBEDDINGS")
+    os.environ["EDUMEM_NO_EMBEDDINGS"] = "1"
+    beam = _make_beam(tmp_path)
+    try:
+        for idx, content in enumerate(seed_rows):
+            beam.conn.execute(
+                "INSERT INTO working_memory (id, session_id, content, source, timestamp, importance, message_index) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    f"msg-{idx}",
+                    beam.session_id,
+                    content,
+                    "beam_user",
+                    f"2024-01-0{idx + 1}T00:00:00Z",
+                    0.5,
+                    idx,
+                ),
+            )
+        beam.conn.commit()
+
+        client = _RecordingLLMClient(responses=["REFLECTED SYNTHESIS", "FINAL ANSWER"])
+        answer = beam_eval.answer_with_memory(
+            client,
+            beam,
+            question,
+            conversation_messages=[],
+            ability=ability,
+        )
+
+        assert answer == "FINAL ANSWER"
+        assert len(client.chat_calls) == 2
+        reflect_call, final_call = client.chat_calls
+        assert reflect_call["temperature"] == 0.0
+        if ability == "SUM":
+            assert "summarization question" in reflect_call["messages"][0]["content"].lower()
+        else:
+            assert "multi-hop reasoning question" in reflect_call["messages"][0]["content"].lower()
+        assert "RETRIEVED MEMORIES:" in reflect_call["messages"][1]["content"]
+        assert "password hashing" in reflect_call["messages"][1]["content"]
+        assert "REFLECTED SYNTHESIS:\nREFLECTED SYNTHESIS" in final_call["messages"][1]["content"]
+    finally:
+        beam.conn.close()
+        if saved is None:
+            os.environ.pop("EDUMEM_NO_EMBEDDINGS", None)
+        else:
+            os.environ["EDUMEM_NO_EMBEDDINGS"] = saved
+
+
+def test_reflect_synthesis_is_disabled_for_context_only(tmp_path):
+    """The reflect pass must not run on retrieval-only/context-only calls."""
+    saved = os.environ.get("EDUMEM_NO_EMBEDDINGS")
+    os.environ["EDUMEM_NO_EMBEDDINGS"] = "1"
+    beam = _make_beam(tmp_path)
+    try:
+        beam.conn.execute(
+            "INSERT INTO working_memory (id, session_id, content, source, timestamp, importance, message_index) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                "msg-0",
+                beam.session_id,
+                "Security features included password hashing, RBAC, and account lockout.",
+                "beam_user",
+                "2024-01-01T00:00:00Z",
+                0.5,
+                0,
+            ),
+        )
+        beam.conn.commit()
+
+        client = _RecordingLLMClient(responses=["REFLECTED SYNTHESIS", "FINAL ANSWER"])
+        context = beam_eval.answer_with_memory(
+            client,
+            beam,
+            "How many security features did I mention across the project?",
+            conversation_messages=[],
+            ability="MR",
+            context_only=True,
+        )
+
+        assert "Security features" in context
+        assert client.chat_calls == []
+    finally:
+        beam.conn.close()
+        if saved is None:
+            os.environ.pop("EDUMEM_NO_EMBEDDINGS", None)
+        else:
+            os.environ["EDUMEM_NO_EMBEDDINGS"] = saved
+
+
 def test_ku_modifier_references_msgidx(tmp_path):
     """Verify that the KU modifier prompt mentions MSGIDX."""
     from edumem.core.query_mode import build_system_prompt
@@ -1458,6 +1572,21 @@ def test_mr_modifier_treats_described_features_as_real():
     prompt = build_system_prompt(q)
     assert "concrete detail" in prompt.lower()
     assert "not implemented" in prompt.lower()
+
+
+def test_mr_modifier_overrides_absence_rule():
+    """MR counting: model found 'category' and 'notes' columns but refused to count,
+    saying 'the total count is not explicitly stated'. The MR modifier must override
+    the ABSENCE rule so the model synthesizes a count from scattered facts."""
+    from edumem.core.query_mode import build_system_prompt, is_multi_hop_query
+
+    q = "How many new columns did I want to add to the transactions table across my requests?"
+    assert is_multi_hop_query(q) is True
+    prompt = build_system_prompt(q)
+    assert "absence" in prompt.lower() and "does not apply" in prompt.lower(), \
+        "MR modifier must explicitly override the ABSENCE rule"
+    assert "count them yourself" in prompt.lower(), \
+        "MR modifier must instruct model to count items itself"
 
 
 def test_sum_modifier_constrains_to_specific_domain():
@@ -2214,6 +2343,166 @@ def test_consolidation_falls_back_to_regex_without_llm(tmp_path):
         beam.conn.close()
 
 
+def test_store_memoria_fact_semantic_update_reuses_matched_key(tmp_path):
+    """Cloud consolidation should update the matched live fact, not a key collision victim."""
+    import numpy as np
+    import edumem.core.embeddings as _e
+    from edumem.core.embeddings import EMBEDDING_DIM
+    from edumem.core.beam import BeamMemory, _vec_available
+
+    class _StaticExtractionClient:
+        def __init__(self, matched_id: int):
+            self.matched_id = matched_id
+            self.chat_calls = []
+
+        def chat(self, messages, temperature=0.0, max_tokens=1024):
+            self.chat_calls.append({
+                "messages": messages,
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+            })
+            return json.dumps({
+                "action": "UPDATE",
+                "matched_id": self.matched_id,
+                "reason": "same underlying fact with a newer value",
+            })
+
+    beam = BeamMemory(
+        db_path=tmp_path / "beam.db",
+        session_id="semantic-update",
+        use_cloud=True,
+    )
+    if not _vec_available(beam.conn, table="vec_facts"):
+        beam.conn.close()
+        pytest.skip("sqlite-vec not available")
+
+    _orig_av, _orig_em, _orig_eq = _e.available, _e.embed, _e.embed_query
+    _e.available = lambda: True
+    _e.embed = lambda texts: np.array([[0.01] * EMBEDDING_DIM] * len(texts), dtype=np.float32)
+    _e.embed_query = lambda q: np.array([0.01] * EMBEDDING_DIM, dtype=np.float32)
+    try:
+        beam._insert_fact(
+            "semantic-update",
+            1,
+            "fact",
+            "deployment_window",
+            "Deployment window is February 1 through February 10.",
+            "Deployment window is February 1 through February 10.",
+            0.7,
+            source_memory_id="existing",
+        )
+        beam._flush_fact_embeddings()
+        matched_id = beam.conn.execute(
+            "SELECT id FROM memoria_facts WHERE session_id=? AND key=? AND valid_to_msg_idx IS NULL",
+            ("semantic-update", "deployment_window"),
+        ).fetchone()[0]
+        beam._extraction_client = _StaticExtractionClient(matched_id)
+
+        changed = beam._store_memoria_fact(
+            "semantic-update",
+            2,
+            "fact",
+            "release_schedule",
+            "Deployment window moved to February 5 through February 12.",
+            "Deployment window moved to February 5 through February 12.",
+            0.8,
+            source_memory_id="updated",
+        )
+
+        assert changed is True
+        live_rows = beam.conn.execute(
+            "SELECT key, value, previous_value, version_id FROM memoria_facts "
+            "WHERE session_id=? AND fact_type='fact' AND valid_to_msg_idx IS NULL",
+            ("semantic-update",),
+        ).fetchall()
+        assert [tuple(row) for row in live_rows] == [
+            (
+                "deployment_window",
+                "Deployment window moved to February 5 through February 12.",
+                "Deployment window is February 1 through February 10.",
+                1,
+            )
+        ]
+        assert beam._extraction_client.chat_calls, "semantic consolidation should invoke the extraction client"
+    finally:
+        _e.available, _e.embed, _e.embed_query = _orig_av, _orig_em, _orig_eq
+        beam.conn.close()
+
+
+def test_cloud_conclusions_use_unique_keys_and_refresh_aggregate(tmp_path):
+    """Same-theme cloud conclusions should coexist and surface as an aggregate count fact."""
+    saved_no_embeddings = os.environ.get("EDUMEM_NO_EMBEDDINGS")
+    os.environ["EDUMEM_NO_EMBEDDINGS"] = "1"
+    from edumem.core.beam import BeamMemory
+
+    class _StaticExtractionClient:
+        def extract_facts(self, messages):
+            return []
+
+        def extract_conclusions(self, messages):
+            return [
+                {
+                    "text": "Password hashing was added first to protect stored credentials.",
+                    "theme": "security",
+                    "source": [0, 0],
+                    "confidence": 0.82,
+                },
+                {
+                    "text": "A later account lockout flow slowed repeated login attempts.",
+                    "theme": "security",
+                    "source": [1, 1],
+                    "confidence": 0.87,
+                },
+            ]
+
+    beam = BeamMemory(
+        db_path=tmp_path / "beam.db",
+        session_id="cloud-conclusions",
+        use_cloud=True,
+    )
+    beam._extraction_client = _StaticExtractionClient()
+    try:
+        beam.remember_batch(
+            [
+                {"content": "We added password hashing.", "source": "user", "importance": 0.6},
+                {"content": "We later added account lockout.", "source": "user", "importance": 0.6},
+            ]
+        )
+
+        conclusion_rows = beam.conn.execute(
+            "SELECT key, value FROM memoria_facts "
+            "WHERE session_id=? AND fact_type='conclusion' AND valid_to_msg_idx IS NULL "
+            "ORDER BY key",
+            ("cloud-conclusions",),
+        ).fetchall()
+        assert len(conclusion_rows) == 2
+        assert conclusion_rows[0][0] != conclusion_rows[1][0]
+        assert all(row[0].startswith("security_") for row in conclusion_rows)
+
+        aggregate = beam.conn.execute(
+            "SELECT value, version_id FROM memoria_facts "
+            "WHERE session_id=? AND fact_type='aggregate' AND key='security_count' "
+            "AND valid_to_msg_idx IS NULL",
+            ("cloud-conclusions",),
+        ).fetchone()
+        assert aggregate is not None
+        assert "2 security items" in aggregate[0]
+        assert aggregate[1] >= 1
+
+        result = beam._memoria_fact_retrieve(
+            "How many security items did we discuss?",
+            top_k=5,
+            intent="",
+        )
+        assert "2 security items" in result["context"]
+    finally:
+        beam.conn.close()
+        if saved_no_embeddings is None:
+            os.environ.pop("EDUMEM_NO_EMBEDDINGS", None)
+        else:
+            os.environ["EDUMEM_NO_EMBEDDINGS"] = saved_no_embeddings
+
+
 # ============================================================================
 # NEW TESTS: Static Grading Thresholds (Loosen IE/IF/SUM, Keep Atomic Strict)
 # ============================================================================
@@ -2661,12 +2950,17 @@ def test_fused_recall_non_ordering_query_unaffected(tmp_path):
 class _RecordingLLMClient:
     """Real (non-mock) test double: records chat calls, returns canned text."""
 
-    def __init__(self, response: str = ""):
+    def __init__(self, response: str = "", responses: list[str] | None = None):
         self.response = response
+        self.responses = list(responses) if responses is not None else None
         self.chat_calls = []
 
     def chat(self, messages, temperature=0.0, max_tokens=1024):
         self.chat_calls.append({"messages": messages, "temperature": temperature})
+        if self.responses is not None:
+            if self.responses:
+                return self.responses.pop(0)
+            return self.response
         return self.response
 
 
@@ -3712,9 +4006,12 @@ def test_interval_derivation_computes_weeks(tmp_path):
         ).fetchall()
         assert len(rows) >= 1
         key, val = rows[0]
-        assert "transaction" in key or "deployment" in key or "module" in key
+        assert key == "duration_2024-01-15_to_2024-03-15"
         assert "8 weeks" in val or "weeks" in val
-        assert "2024-01-15" in val and "2024-03-15" in val
+        assert (
+            ("2024-01-15" in val and "2024-03-15" in val)
+            or ("January 15, 2024" in val and "March 15, 2024" in val)
+        )
     finally:
         beam.conn.close()
         if saved is None:
@@ -3743,8 +4040,9 @@ def test_interval_derivation_is_bounded_and_related(tmp_path):
             (session,),
         ).fetchall()
         keys = " ".join(r[0] for r in rows)
-        assert "transaction" in keys or "deployment" in keys or "module" in keys
-        assert "pizza" not in keys and "office" not in keys
+        values = " ".join(r[1] for r in rows)
+        assert "duration_2024-01-15_to_2024-03-15" in keys
+        assert "pizza" not in values and "office" not in values
     finally:
         beam.conn.close()
         if saved is None:

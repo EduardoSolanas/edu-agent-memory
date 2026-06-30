@@ -190,7 +190,15 @@ def is_temporal_query(question: str) -> bool:
 
 def needs_second_pass(question: str) -> bool:
     """Ordering/duration questions benefit from gap-analysis re-retrieval."""
-    return is_temporal_query(question)
+    q = question.lower()
+    strict_duration = any(
+        k in q for k in (
+            "how many days", "how many weeks", "how many months", "how many years",
+            "days between", "weeks between", "months between", "years between",
+            "time between", "duration",
+        )
+    )
+    return is_ordering_query(question) or is_date_interval_query(question) or strict_duration
 
 
 # --- always-on base prompt (covers CR / ABS / KU / PF generically) ---------
@@ -274,8 +282,16 @@ of the conversation. Look for connections between separate facts. If fact A says
 and fact B says "Y requires Z", then the answer to "what does X require?" is Z.
 Chain the facts step by step.
 
-When the question asks "how many" or requires counting across sessions, make sure to list
-ALL distinct items you found and then count them.
+CRITICAL OVERRIDE — ABSENCE rule does NOT apply here. Multi-hop questions ask you to
+SYNTHESIZE an answer from scattered facts. If you find the individual pieces (e.g. two
+column names mentioned in separate messages), combine them into a direct answer (e.g.
+"Two columns: category and notes"). Never say "the total count is not explicitly stated"
+when the individual items ARE in the context — count them yourself.
+
+When the question asks "how many" or requires counting across sessions:
+1. List every distinct item you found in the context.
+2. State the count.
+3. Name each item.
 
 Items introduced during design, schema definition, or initial planning count the same as
 items added later. If a field, column, or component was named in a schema or plan, it is
