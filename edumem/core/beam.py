@@ -266,7 +266,8 @@ def _default_db_path() -> Path:
 # Config
 # Priority: 1) EDUMEM_EMBEDDING_DIM env var (explicit override)
 #           2) Auto-derive from embedding model via _embeddings module
-#           3) 384 (bge-small-en-v1.5 default)
+#              (default model Alibaba-NLP/gte-modernbert-base -> 768)
+#           3) 384 only for a truly unknown model name
 _emb_dim_env = os.environ.get("EDUMEM_EMBEDDING_DIM")
 if _emb_dim_env is not None:
     try:
@@ -1115,6 +1116,118 @@ def init_beam(db_path: Path = None):
         "ON memoria_summaries(session_id, seg_end)"
     )
 
+    # --- Layer 1: Memory Cards (Phase 2) ---
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS memory_cards (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            card_type TEXT NOT NULL,
+            card_key TEXT NOT NULL,
+            title TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            state_json TEXT NOT NULL DEFAULT '{}',
+            confidence REAL NOT NULL DEFAULT 0.7,
+            source_start_msg_idx INTEGER,
+            source_end_msg_idx INTEGER,
+            version_id INTEGER NOT NULL DEFAULT 0,
+            previous_card_id INTEGER,
+            valid_to_msg_idx INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            CHECK (card_type IN ('entity', 'topic', 'change', 'belief', 'session'))
+        )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_cards_session ON memory_cards(session_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_cards_type ON memory_cards(card_type)")
+    cursor.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_cards_live_key
+        ON memory_cards(session_id, card_type, card_key)
+        WHERE valid_to_msg_idx IS NULL
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS memory_card_evidence (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            card_id INTEGER NOT NULL,
+            evidence_table TEXT NOT NULL,
+            evidence_row_id TEXT NOT NULL,
+            message_idx INTEGER,
+            snippet TEXT NOT NULL,
+            weight REAL NOT NULL DEFAULT 1.0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            CHECK (evidence_table IN (
+                'memoria_facts',
+                'memoria_timelines',
+                'memoria_kg',
+                'memoria_summaries',
+                'working_memory',
+                'episodic_memory',
+                'facts'
+            ))
+        )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_card_evidence_card ON memory_card_evidence(card_id)")
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS memory_card_queue (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            agenda_type TEXT NOT NULL,
+            agenda_key TEXT NOT NULL,
+            trigger_table TEXT NOT NULL,
+            trigger_row_id TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            CHECK (agenda_type IN ('entity', 'topic', 'change', 'belief', 'session')),
+            CHECK (status IN ('pending', 'running', 'done', 'error'))
+        )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_card_queue_status ON memory_card_queue(status, session_id)")
+    cursor.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_card_queue_dedupe
+        ON memory_card_queue(session_id, agenda_type, agenda_key, trigger_table, trigger_row_id)
+    """)
+
+    # vec_cards: embeddings for live cards (sqlite-vec)
+    try:
+        cursor.execute(f"""
+            CREATE VIRTUAL TABLE IF NOT EXISTS vec_cards USING vec0(
+                embedding {effective_vec_type}[{EMBEDDING_DIM}]
+            )
+        """)
+    except (sqlite3.OperationalError, RuntimeError):
+        pass  # sqlite-vec not available
+
+    # fts_cards: lexical lookup over card titles and summaries
+    cursor.execute("""
+        CREATE VIRTUAL TABLE IF NOT EXISTS fts_cards USING fts5(
+            title, summary, content='memory_cards', content_rowid='id'
+        )
+    """)
+    cursor.execute("""
+        CREATE TRIGGER IF NOT EXISTS cards_ai AFTER INSERT ON memory_cards BEGIN
+            INSERT INTO fts_cards(rowid, title, summary)
+            VALUES (new.id, new.title, new.summary);
+        END
+    """)
+    cursor.execute("""
+        CREATE TRIGGER IF NOT EXISTS cards_ad AFTER DELETE ON memory_cards BEGIN
+            INSERT INTO fts_cards(fts_cards, rowid, title, summary)
+            VALUES ('delete', old.id, old.title, old.summary);
+        END
+    """)
+    cursor.execute("""
+        CREATE TRIGGER IF NOT EXISTS cards_au AFTER UPDATE ON memory_cards BEGIN
+            INSERT INTO fts_cards(fts_cards, rowid, title, summary)
+            VALUES ('delete', old.id, old.title, old.summary);
+            INSERT INTO fts_cards(rowid, title, summary)
+            VALUES (new.id, new.title, new.summary);
+        END
+    """)
+
 
 class _BeamConnection(sqlite3.Connection):
     """sqlite3.Connection subclass that supports deferring commits.
@@ -1947,7 +2060,7 @@ def _vec_search(conn: sqlite3.Connection, embedding: List[float], k: int = 20, t
     else:
         rows = conn.execute(
             f"SELECT rowid, distance FROM {table} WHERE embedding MATCH ? ORDER BY distance LIMIT {k}",
-            (emb_json_)
+            (emb_json,)
         ).fetchall()
     return [{"rowid": r["rowid"], "distance": r["distance"]} for r in rows]
 
@@ -3333,24 +3446,55 @@ class BeamMemory:
                 # (embeds into vec_facts, surfaces via the semantic specialist)
                 try:
                     conclusions = self._extraction_client.extract_conclusions(batch_msgs)
-                except Exception:
+                except Exception as exc:
+                    logger.warning(
+                        "remember_batch: conclusion extraction failed: %s: %s",
+                        type(exc).__name__,
+                        exc,
+                    )
                     conclusions = []
                 for concl in conclusions:
                     _text = (concl or {}).get("text", "")
                     _theme = (concl or {}).get("theme", "general")
+                    _source = (concl or {}).get("source")
                     if _text:
-                        self._insert_fact(
-                            self.session_id, 0, "conclusion", _theme, _text, _text,
-                            float((concl or {}).get("confidence", 0.7)),
-                            source_memory_id=f"concl-{_theme}-{ids[0] if ids else ''}",
+                        _key = self._conclusion_fact_key(_theme, _text, _source)
+                        _source_id = (
+                            f"concl:{self._normalize_fact_key_component(_theme)}:"
+                            f"{hashlib.sha1(_text.encode('utf-8')).hexdigest()[:12]}"
                         )
+                        changed = self._store_memoria_fact(
+                            self.session_id,
+                            0,
+                            "conclusion",
+                            _key,
+                            _text,
+                            _text,
+                            float((concl or {}).get("confidence", 0.7)),
+                            source_memory_id=_source_id,
+                        )
+                        if changed:
+                            self._refresh_conclusion_aggregate(
+                                self.session_id,
+                                _theme,
+                                0,
+                                source_memory_id=f"agg:{self._normalize_fact_key_component(_theme)}",
+                            )
                 # Flush conclusion embeddings in the same batch
                 try:
                     self._flush_fact_embeddings()
-                except Exception:
-                    pass
-            except Exception:
-                pass  # Cloud extraction is best-effort
+                except Exception as exc:
+                    logger.warning(
+                        "remember_batch: conclusion embedding flush failed: %s: %s",
+                        type(exc).__name__,
+                        exc,
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "remember_batch: cloud extraction failed: %s: %s",
+                    type(exc).__name__,
+                    exc,
+                )
 
         return ids
 
@@ -4908,6 +5052,437 @@ Now respond with ONLY the JSON array, no explanation."""
             # Any error → fallback to raw keys
             return [c["raw_key"] for c in candidates]
 
+    @staticmethod
+    def _normalize_fact_key_component(value: str) -> str:
+        import re as _re
+
+        text = str(value or "").strip().lower()
+        if not text:
+            return "general"
+        text = _re.sub(r"[^a-z0-9]+", "_", text)
+        text = _re.sub(r"_+", "_", text).strip("_")
+        return text or "general"
+
+    def _conclusion_fact_key(self, theme: str, text: str,
+                             source: Optional[Any]) -> str:
+        theme_key = self._normalize_fact_key_component(theme)
+        start = end = 0
+        if isinstance(source, (list, tuple)) and len(source) >= 2:
+            try:
+                start = int(source[0])
+                end = int(source[1])
+            except (TypeError, ValueError):
+                start = end = 0
+        digest = hashlib.sha1(str(text or "").encode("utf-8")).hexdigest()[:12]
+        return f"{theme_key}_{start}_{end}_{digest}"
+
+    def _fact_consolidation_enabled(self) -> bool:
+        return bool(self.use_cloud) and not _env_disabled("EDUMEM_LLM_CONSOLIDATION")
+
+    def _ensure_extraction_client(self):
+        if self._extraction_client is None:
+            from edumem.extraction import ExtractionClient
+            self._extraction_client = ExtractionClient()
+        return self._extraction_client
+
+    def _find_similar_live_facts(self, session: str, ftype: str, key: str,
+                                 value: str, ctx: str, *,
+                                 top_k: int = 5) -> list[dict]:
+        rows: list[dict] = []
+        seen_ids: set[int] = set()
+
+        exact_rows = self.conn.execute(
+            "SELECT id, fact_type, key, value, context_snippet, version_id, "
+            "message_idx, valid_from_msg_idx, source_memory_id "
+            "FROM memoria_facts "
+            "WHERE session_id = ? AND fact_type = ? AND key = ? "
+            "AND valid_to_msg_idx IS NULL "
+            "ORDER BY version_id DESC, id DESC LIMIT ?",
+            (session, ftype, key, top_k),
+        ).fetchall()
+        for row in exact_rows:
+            seen_ids.add(int(row[0]))
+            rows.append({
+                "id": row[0],
+                "fact_type": row[1],
+                "key": row[2],
+                "value": row[3],
+                "context_snippet": row[4],
+                "version_id": row[5] or 0,
+                "message_idx": row[6],
+                "valid_from_msg_idx": row[7],
+                "source_memory_id": row[8],
+                "distance": 0.0,
+            })
+
+        from . import embeddings as _e
+
+        if not _e.available() or not _vec_available(self.conn, table="vec_facts"):
+            return rows
+
+        try:
+            query_text = (ctx or "").strip() or f"{key}: {value}".strip()
+            q_emb = _e.embed_query(query_text)
+            if q_emb is None:
+                return rows
+            raw_hits = _vec_search(
+                self.conn,
+                q_emb.tolist() if hasattr(q_emb, "tolist") else list(q_emb),
+                k=max(top_k * 2, top_k),
+                table="vec_facts",
+            )
+        except Exception as exc:
+            logger.warning(
+                "_find_similar_live_facts: semantic lookup failed for %s/%s: %s: %s",
+                ftype,
+                key,
+                type(exc).__name__,
+                exc,
+            )
+            return rows
+
+        max_distance = float(os.environ.get("EDUMEM_CONSOLIDATION_MAX_DISTANCE", "0.8"))
+        hit_ids = [
+            int(hit["rowid"])
+            for hit in raw_hits
+            if hit.get("rowid") is not None and float(hit.get("distance", 1.0)) <= max_distance
+        ]
+        if not hit_ids:
+            return rows
+
+        qmarks = ",".join("?" * len(hit_ids))
+        fact_rows = self.conn.execute(
+            f"SELECT id, fact_type, key, value, context_snippet, version_id, "
+            f"message_idx, valid_from_msg_idx, source_memory_id "
+            f"FROM memoria_facts WHERE id IN ({qmarks}) "
+            f"AND session_id = ? AND fact_type = ? AND valid_to_msg_idx IS NULL",
+            (*hit_ids, session, ftype),
+        ).fetchall()
+        by_id = {int(row[0]): row for row in fact_rows}
+        distance_by_id = {int(hit["rowid"]): float(hit.get("distance", 1.0)) for hit in raw_hits}
+        for rid in hit_ids:
+            if rid in seen_ids or rid not in by_id:
+                continue
+            row = by_id[rid]
+            seen_ids.add(rid)
+            rows.append({
+                "id": row[0],
+                "fact_type": row[1],
+                "key": row[2],
+                "value": row[3],
+                "context_snippet": row[4],
+                "version_id": row[5] or 0,
+                "message_idx": row[6],
+                "valid_from_msg_idx": row[7],
+                "source_memory_id": row[8],
+                "distance": distance_by_id.get(rid, 1.0),
+            })
+            if len(rows) >= top_k:
+                break
+        return rows
+
+    def _build_fact_consolidation_prompt(self, candidate: dict,
+                                         similar_facts: list[dict]) -> str:
+        similar_block = "(no similar live facts)"
+        if similar_facts:
+            similar_block = "\n".join(
+                f'- id={fact["id"]} key="{fact.get("key", "")}" '
+                f'value="{fact.get("value", "")}" '
+                f'context="{fact.get("context_snippet", "")}"'
+                for fact in similar_facts
+            )
+        return f"""You are a memory consolidation engine.
+
+Decide how to handle ONE candidate fact against similar LIVE facts from the same session.
+
+Candidate fact:
+{json.dumps(candidate, ensure_ascii=True)}
+
+Similar live facts:
+{similar_block}
+
+Return ONLY one JSON object with this schema:
+{{"action":"ADD|UPDATE|DELETE|NOOP","matched_id":123|null,"reason":"short explanation"}}
+
+Rules:
+- ADD: the candidate is genuinely new and should coexist with the live facts.
+- UPDATE: the candidate is the same underlying fact as exactly one live fact, but newer/corrected/better stated. Set matched_id to that live fact id.
+- DELETE: the candidate means exactly one live fact should no longer remain live without adding a replacement. Set matched_id.
+- NOOP: the candidate is a duplicate/restatement of an existing live fact.
+- Multiple distinct subtopics under the same broad theme MUST be ADD, not UPDATE.
+- Prefer NOOP over UPDATE when the candidate adds no materially new information.
+- Never invent ids. matched_id must be null or one of the listed live fact ids.
+"""
+
+    def _parse_fact_consolidation_response(self, raw: str,
+                                           similar_facts: list[dict]) -> dict:
+        valid_ids = {int(fact["id"]) for fact in similar_facts if fact.get("id") is not None}
+        fallback = {"action": "ADD", "matched_id": None, "reason": "fallback"}
+        if not raw or not isinstance(raw, str):
+            return fallback
+        import re as _re
+
+        text = raw.strip()
+        fence = _re.search(r"```(?:json)?\s*(.*?)```", text, _re.DOTALL | _re.IGNORECASE)
+        if fence:
+            text = fence.group(1).strip()
+        if not text.startswith("{"):
+            start = text.find("{")
+            end = text.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                text = text[start:end + 1]
+        try:
+            data = json.loads(text)
+        except Exception:
+            return fallback
+        if not isinstance(data, dict):
+            return fallback
+        action = str(data.get("action", "ADD")).strip().upper()
+        if action not in {"ADD", "UPDATE", "DELETE", "NOOP"}:
+            action = "ADD"
+        matched_id = data.get("matched_id")
+        try:
+            matched_id = int(matched_id) if matched_id is not None else None
+        except (TypeError, ValueError):
+            matched_id = None
+        if matched_id not in valid_ids:
+            matched_id = None
+        if action in {"UPDATE", "DELETE"} and matched_id is None:
+            action = "ADD"
+        return {
+            "action": action,
+            "matched_id": matched_id,
+            "reason": str(data.get("reason", ""))[:200],
+        }
+
+    def _invalidate_fact_row(self, row_id: int, msg_idx: int) -> None:
+        self.conn.execute(
+            "UPDATE memoria_facts SET valid_to_msg_idx = ? WHERE id = ?",
+            (msg_idx, row_id),
+        )
+        try:
+            self.conn.execute("DELETE FROM vec_facts WHERE rowid = ?", (row_id,))
+        except Exception:
+            logger.info("vec_facts cleanup skipped for row %s", row_id, exc_info=True)
+
+    def _insert_fact_version_from_row(self, session: str, msg_idx: int, ftype: str,
+                                      key: str, value: str, ctx: str, importance: float,
+                                      existing: dict,
+                                      source_memory_id: Optional[str] = None) -> bool:
+        if existing.get("value") == value:
+            return False
+        self._invalidate_fact_row(int(existing["id"]), msg_idx)
+        new_version = int(existing.get("version_id") or 0) + 1
+        _cur = self.conn.execute(
+            "INSERT INTO memoria_facts (session_id, message_idx, fact_type, key, value, "
+            "context_snippet, importance, version_id, previous_value, updated_msg_idx, "
+            "valid_from_msg_idx, source_memory_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                session,
+                msg_idx,
+                ftype,
+                key,
+                value,
+                ctx,
+                importance,
+                new_version,
+                existing.get("value"),
+                msg_idx,
+                msg_idx,
+                source_memory_id,
+            ),
+        )
+        if ftype != "date":
+            self._embed_fact_enqueue(_cur.lastrowid, ctx, key, value)
+        return True
+
+    def _apply_fact_consolidation_decision(self, session: str, msg_idx: int,
+                                           ftype: str, key: str, value: str,
+                                           ctx: str, importance: float,
+                                           decision: dict,
+                                           similar_facts: list[dict],
+                                           source_memory_id: Optional[str] = None) -> bool:
+        action = (decision or {}).get("action", "ADD")
+        matched_id = (decision or {}).get("matched_id")
+        matched = next(
+            (fact for fact in similar_facts if int(fact.get("id", -1)) == matched_id),
+            None,
+        )
+
+        if action == "NOOP":
+            return False
+        if action == "DELETE":
+            if matched is None:
+                return False
+            self._invalidate_fact_row(int(matched["id"]), msg_idx)
+            return True
+        if action == "UPDATE":
+            if matched is None:
+                return self._insert_fact(session, msg_idx, ftype, key, value, ctx, importance, source_memory_id=source_memory_id)
+            return self._insert_fact_version_from_row(
+                session,
+                msg_idx,
+                ftype,
+                str(matched.get("key") or key),
+                value,
+                ctx,
+                importance,
+                matched,
+                source_memory_id=source_memory_id,
+            )
+        return self._insert_fact(session, msg_idx, ftype, key, value, ctx, importance, source_memory_id=source_memory_id)
+
+    def _store_memoria_fact(self, session: str, msg_idx: int, ftype: str,
+                            key: str, value: str, ctx: str, importance: float,
+                            source_memory_id: Optional[str] = None) -> bool:
+        exact_live = self.conn.execute(
+            "SELECT 1 FROM memoria_facts "
+            "WHERE session_id = ? AND fact_type = ? AND key = ? AND value = ? "
+            "AND valid_to_msg_idx IS NULL LIMIT 1",
+            (session, ftype, key, value),
+        ).fetchone()
+        if exact_live:
+            return False
+
+        if source_memory_id:
+            existing_source = self.conn.execute(
+                "SELECT 1 FROM memoria_facts "
+                "WHERE session_id = ? AND source_memory_id = ? AND fact_type = ? "
+                "AND key = ? AND value = ? AND valid_to_msg_idx IS NULL LIMIT 1",
+                (session, source_memory_id, ftype, key, value),
+            ).fetchone()
+            if existing_source:
+                return False
+
+        if not self._fact_consolidation_enabled() or ftype == "date":
+            wrote = self._insert_fact(
+                session,
+                msg_idx,
+                ftype,
+                key,
+                value,
+                ctx,
+                importance,
+                source_memory_id=source_memory_id,
+            )
+            if wrote and self._card_layer_enabled():
+                row_id = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+                items = self._agenda_from_raw_write(ftype, key, value, msg_idx, row_id)
+                self._enqueue_card_updates(session, items)
+            return wrote
+
+        similar_facts = self._find_similar_live_facts(session, ftype, key, value, ctx)
+        if not similar_facts:
+            wrote = self._insert_fact(
+                session,
+                msg_idx,
+                ftype,
+                key,
+                value,
+                ctx,
+                importance,
+                source_memory_id=source_memory_id,
+            )
+            if wrote and self._card_layer_enabled():
+                row_id = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+                items = self._agenda_from_raw_write(ftype, key, value, msg_idx, row_id)
+                self._enqueue_card_updates(session, items)
+            return wrote
+
+        candidate = {
+            "fact_type": ftype,
+            "key": key,
+            "value": value,
+            "context": ctx,
+            "message_idx": msg_idx,
+        }
+        try:
+            client = self._ensure_extraction_client()
+            raw = client.chat(
+                [{"role": "user", "content": self._build_fact_consolidation_prompt(candidate, similar_facts)}],
+                temperature=0.0,
+                max_tokens=1024,
+            )
+        except Exception as exc:
+            logger.warning(
+                "_store_memoria_fact: consolidation LLM failed for %s/%s: %s: %s",
+                ftype,
+                key,
+                type(exc).__name__,
+                exc,
+            )
+            wrote = self._insert_fact(
+                session,
+                msg_idx,
+                ftype,
+                key,
+                value,
+                ctx,
+                importance,
+                source_memory_id=source_memory_id,
+            )
+            if wrote and self._card_layer_enabled():
+                row_id = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+                items = self._agenda_from_raw_write(ftype, key, value, msg_idx, row_id)
+                self._enqueue_card_updates(session, items)
+            return wrote
+
+        decision = self._parse_fact_consolidation_response(raw, similar_facts)
+        wrote = self._apply_fact_consolidation_decision(
+            session,
+            msg_idx,
+            ftype,
+            key,
+            value,
+            ctx,
+            importance,
+            decision,
+            similar_facts,
+            source_memory_id=source_memory_id,
+        )
+        if wrote and self._card_layer_enabled():
+            row_id = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            items = self._agenda_from_raw_write(ftype, key, value, msg_idx, row_id)
+            self._enqueue_card_updates(session, items)
+        return wrote
+
+    def _refresh_conclusion_aggregate(self, session: str, theme: str, msg_idx: int,
+                                      source_memory_id: Optional[str] = None) -> bool:
+        theme_key = self._normalize_fact_key_component(theme)
+        rows = self.conn.execute(
+            "SELECT value FROM memoria_facts "
+            "WHERE session_id = ? AND fact_type = 'conclusion' "
+            "AND valid_to_msg_idx IS NULL AND key LIKE ? "
+            "ORDER BY id",
+            (session, f"{theme_key}_%"),
+        ).fetchall()
+        if not rows:
+            return False
+
+        snippets = []
+        for row in rows[:4]:
+            text = str(row[0] or "").strip()
+            if len(text) > 120:
+                text = text[:117].rstrip() + "..."
+            if text:
+                snippets.append(text)
+        count = len(rows)
+        if snippets:
+            value = f"{count} {theme_key} items ({'; '.join(snippets)})"
+        else:
+            value = f"{count} {theme_key} items"
+        return self._insert_fact(
+            session,
+            msg_idx,
+            "aggregate",
+            f"{theme_key}_count",
+            value,
+            value,
+            0.6,
+            source_memory_id=source_memory_id,
+        )
+
     # ------------------------------------------------------------------
     # LLM-based write-time fact extraction (flag-gated, Mem0/Hindsight-style)
     # ------------------------------------------------------------------
@@ -5033,12 +5608,12 @@ Now respond with ONLY the JSON array, no explanation."""
             value = fact.get("value")
             if not key or value is None:
                 continue
-            _ALLOWED_FACT_TYPES = {"metric", "state", "preference", "instruction", "fact", "version", "decision"}
+            _ALLOWED_FACT_TYPES = {"metric", "state", "preference", "instruction", "fact", "version", "decision", "aggregate"}
             ftype_raw = fact.get("type") or "fact"
             ftype = str(ftype_raw) if ftype_raw in _ALLOWED_FACT_TYPES else "fact"
-            if self._insert_fact(session, msg_idx, str(ftype), str(key),
-                                 str(value), ctx, 0.65,
-                                 source_memory_id=source_memory_id):
+            if self._store_memoria_fact(session, msg_idx, str(ftype), str(key),
+                                        str(value), ctx, 0.65,
+                                        source_memory_id=source_memory_id):
                 counts["facts"] += 1
 
         for ent in parsed.get("entities", []):
@@ -5243,6 +5818,863 @@ Now respond with ONLY the JSON array, no explanation."""
                 continue
         return None
 
+    # --- Memory Card CRUD primitives (Phase 2) ---
+
+    def _get_live_card(self, session: str, card_type: str, card_key: str) -> dict | None:
+        """Return the single live card (valid_to_msg_idx IS NULL) for the given key, or None."""
+        row = self.conn.execute(
+            "SELECT id, session_id, card_type, card_key, title, summary, "
+            "state_json, confidence, source_start_msg_idx, source_end_msg_idx, "
+            "version_id, previous_card_id, valid_to_msg_idx, created_at, updated_at "
+            "FROM memory_cards "
+            "WHERE session_id = ? AND card_type = ? AND card_key = ? "
+            "AND valid_to_msg_idx IS NULL "
+            "LIMIT 1",
+            (session, card_type, card_key),
+        ).fetchone()
+        if row is None:
+            return None
+        keys = [
+            "id", "session_id", "card_type", "card_key", "title", "summary",
+            "state_json", "confidence", "source_start_msg_idx", "source_end_msg_idx",
+            "version_id", "previous_card_id", "valid_to_msg_idx", "created_at", "updated_at",
+        ]
+        d = dict(zip(keys, row))
+        try:
+            d["state"] = json.loads(d["state_json"] or "{}")
+        except (json.JSONDecodeError, TypeError):
+            d["state"] = {}
+        return d
+
+    def _list_live_cards(self, session: str, card_type: str | None = None) -> list[dict]:
+        """Return all live cards for a session, optionally filtered by card_type."""
+        if card_type is not None:
+            rows = self.conn.execute(
+                "SELECT id, session_id, card_type, card_key, title, summary, "
+                "state_json, confidence, source_start_msg_idx, source_end_msg_idx, "
+                "version_id, previous_card_id, valid_to_msg_idx, created_at, updated_at "
+                "FROM memory_cards "
+                "WHERE session_id = ? AND card_type = ? AND valid_to_msg_idx IS NULL "
+                "ORDER BY id",
+                (session, card_type),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT id, session_id, card_type, card_key, title, summary, "
+                "state_json, confidence, source_start_msg_idx, source_end_msg_idx, "
+                "version_id, previous_card_id, valid_to_msg_idx, created_at, updated_at "
+                "FROM memory_cards "
+                "WHERE session_id = ? AND valid_to_msg_idx IS NULL "
+                "ORDER BY id",
+                (session,),
+            ).fetchall()
+        keys = [
+            "id", "session_id", "card_type", "card_key", "title", "summary",
+            "state_json", "confidence", "source_start_msg_idx", "source_end_msg_idx",
+            "version_id", "previous_card_id", "valid_to_msg_idx", "created_at", "updated_at",
+        ]
+        result = []
+        for row in rows:
+            d = dict(zip(keys, row))
+            try:
+                d["state"] = json.loads(d["state_json"] or "{}")
+            except (json.JSONDecodeError, TypeError):
+                d["state"] = {}
+            result.append(d)
+        return result
+
+    def _upsert_card(
+        self,
+        session: str,
+        card_type: str,
+        card_key: str,
+        title: str,
+        summary: str,
+        state: dict,
+        confidence: float,
+        msg_idx: int,
+        source_start_msg_idx: int | None = None,
+        source_end_msg_idx: int | None = None,
+    ) -> int:
+        """Insert or version-chain a memory card.
+
+        If a live card already exists for (session, card_type, card_key):
+          - sets its valid_to_msg_idx = msg_idx (expires it)
+          - removes its vec_cards row
+          - inserts a new row with version_id = old.version_id + 1 and
+            previous_card_id = old.id
+
+        Otherwise inserts a fresh row with version_id = 0.
+
+        Does NOT embed — call _embed_card() separately after upsert.
+        Returns the new card id.
+        """
+        state_json = json.dumps(state or {})
+        existing = self.conn.execute(
+            "SELECT id, version_id FROM memory_cards "
+            "WHERE session_id = ? AND card_type = ? AND card_key = ? "
+            "AND valid_to_msg_idx IS NULL "
+            "LIMIT 1",
+            (session, card_type, card_key),
+        ).fetchone()
+
+        if existing:
+            old_id, old_version = int(existing[0]), int(existing[1] or 0)
+            # Expire the old card
+            self.conn.execute(
+                "UPDATE memory_cards SET valid_to_msg_idx = ?, updated_at = CURRENT_TIMESTAMP "
+                "WHERE id = ?",
+                (msg_idx, old_id),
+            )
+            # Remove old embedding (best-effort)
+            try:
+                self.conn.execute("DELETE FROM vec_cards WHERE rowid = ?", (old_id,))
+            except Exception:
+                pass
+            new_version = old_version + 1
+            cur = self.conn.execute(
+                "INSERT INTO memory_cards (session_id, card_type, card_key, title, summary, "
+                "state_json, confidence, source_start_msg_idx, source_end_msg_idx, "
+                "version_id, previous_card_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (session, card_type, card_key, title, summary, state_json,
+                 confidence, source_start_msg_idx, source_end_msg_idx,
+                 new_version, old_id),
+            )
+        else:
+            cur = self.conn.execute(
+                "INSERT INTO memory_cards (session_id, card_type, card_key, title, summary, "
+                "state_json, confidence, source_start_msg_idx, source_end_msg_idx, version_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
+                (session, card_type, card_key, title, summary, state_json,
+                 confidence, source_start_msg_idx, source_end_msg_idx),
+            )
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    def _invalidate_card(self, session: str, card_type: str, card_key: str, msg_idx: int) -> bool:
+        """Set valid_to_msg_idx on the live card and delete its vec_cards row.
+
+        Returns True if a live card was found and invalidated, False otherwise.
+        """
+        row = self.conn.execute(
+            "SELECT id FROM memory_cards "
+            "WHERE session_id = ? AND card_type = ? AND card_key = ? "
+            "AND valid_to_msg_idx IS NULL "
+            "LIMIT 1",
+            (session, card_type, card_key),
+        ).fetchone()
+        if row is None:
+            return False
+        card_id = int(row[0])
+        self.conn.execute(
+            "UPDATE memory_cards SET valid_to_msg_idx = ?, updated_at = CURRENT_TIMESTAMP "
+            "WHERE id = ?",
+            (msg_idx, card_id),
+        )
+        try:
+            self.conn.execute("DELETE FROM vec_cards WHERE rowid = ?", (card_id,))
+        except Exception:
+            pass
+        self.conn.commit()
+        return True
+
+    _VALID_EVIDENCE_TABLES = frozenset({
+        "memoria_facts", "memoria_timelines", "memoria_kg",
+        "memoria_summaries", "working_memory", "episodic_memory", "facts",
+    })
+
+    def _link_card_evidence(self, card_id: int, items: list[dict]) -> int:
+        """Replace all evidence links for card_id with the given items.
+
+        Each item dict must have keys: table, row_id, message_idx, snippet, weight.
+        Deletes existing rows first (replace semantics, not append).
+        Silently skips items with table names outside the CHECK constraint.
+        Returns count of inserted rows.
+        """
+        self.conn.execute(
+            "DELETE FROM memory_card_evidence WHERE card_id = ?",
+            (card_id,),
+        )
+        inserted = 0
+        for item in items:
+            if item["table"] not in self._VALID_EVIDENCE_TABLES:
+                continue
+            self.conn.execute(
+                "INSERT INTO memory_card_evidence "
+                "(card_id, evidence_table, evidence_row_id, message_idx, snippet, weight) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    card_id,
+                    item["table"],
+                    str(item["row_id"]),
+                    item.get("message_idx"),
+                    item.get("snippet", ""),
+                    item.get("weight", 1.0),
+                ),
+            )
+            inserted += 1
+        self.conn.commit()
+        return inserted
+
+    def _embed_card(self, card_id: int, text: str) -> bool:
+        """Embed text and insert into vec_cards. Best-effort: never raises.
+
+        Returns False when embeddings are unavailable (EDUMEM_NO_EMBEDDINGS set,
+        vec_cards table missing, or embed() returns None).
+        """
+        if os.environ.get("EDUMEM_NO_EMBEDDINGS"):
+            return False
+        if not _vec_available(self.conn, table="vec_cards"):
+            return False
+        try:
+            from . import embeddings as _e
+            if not _e.available():
+                return False
+            emb = _e.embed_query(text)
+            if emb is None:
+                return False
+            emb_list = emb.tolist() if hasattr(emb, "tolist") else list(emb)
+            _vec_insert(self.conn, card_id, emb_list, table="vec_cards")
+            return True
+        except Exception:
+            return False
+
+    def _card_recall_enabled(self) -> bool:
+        """Cards-first recall is the production default (memory-v2 spec §6).
+
+        Always on — recall searches live cards first, then hydrates raw
+        evidence, then falls back to raw retrievers. No env flag.
+        """
+        return True
+
+    def _card_retrieve(self, query: str, intent: str = '', top_k: int = 20) -> list[dict]:
+        """Search live memory cards by vec + fts, merge with RRF, rerank, apply intent boost.
+
+        Returns at most 6 cards (8 for summary/aggregate intents). Falls back to
+        fts-only when embeddings unavailable. Reranker failure keeps RRF order.
+        """
+        from . import embeddings as _e
+        from . import query_mode as _qm
+
+        # Intent → preferred card_types (soft boost, not hard filter)
+        _INTENT_PREFS = {
+            'summary':   ('session', 'topic'),
+            'aggregate': ('session', 'topic'),
+            'change':    ('topic', 'belief', 'change'),
+            'current':   ('change',),
+            'ordered':   ('change', 'belief'),
+            'fact':      ('topic', 'belief', 'entity'),
+            'timeline':  ('topic', 'belief', 'entity'),
+        }
+        # Derive intent from query if not provided
+        _intent = intent or ''
+        if not _intent:
+            if _qm.is_ordering_query(query):
+                _intent = 'ordered'
+            elif _qm.is_summarization_query(query) or _qm.is_aggregation_query(query):
+                _intent = 'summary'
+            elif _qm.is_contradiction_query(query):
+                _intent = 'change'
+            elif _qm.is_knowledge_update_query(query):
+                _intent = 'current'
+            elif _qm.is_duration_query(query):
+                _intent = 'timeline'
+
+        preferred_types = _INTENT_PREFS.get(_intent, ())
+        max_cards = 8 if _intent in ('summary', 'aggregate') else 6
+
+        # --- Vector search ---
+        vec_ids: list[int] = []
+        if _e.available() and _vec_available(self.conn, table='vec_cards'):
+            try:
+                q_emb = _e.embed_query(query)
+                if q_emb is not None:
+                    emb_list = q_emb.tolist() if hasattr(q_emb, 'tolist') else list(q_emb)
+                    hits = _vec_search(self.conn, emb_list, k=top_k, table='vec_cards')
+                    # hits are rowids into memory_cards (live only — vec_cards only has live rows)
+                    vec_ids = [int(h['rowid']) for h in hits]
+            except Exception:
+                vec_ids = []
+
+        # --- FTS search ---
+        fts_ids: list[int] = []
+        try:
+            # Sanitize query for FTS5 (remove special chars that break the parser)
+            import re as _re
+            fts_q = _re.sub(r'[^\w\s]', ' ', query).strip()
+            if fts_q:
+                rows = self.conn.execute(
+                    "SELECT rowid FROM fts_cards WHERE fts_cards MATCH ? LIMIT ?",
+                    (fts_q, top_k),
+                ).fetchall()
+                fts_ids = [int(r[0]) for r in rows]
+        except Exception:
+            fts_ids = []
+
+        if not vec_ids and not fts_ids:
+            return []
+
+        # --- RRF fusion ---
+        fused_ids = _rrf_fuse([vec_ids, fts_ids], k=15)[:top_k]
+
+        if not fused_ids:
+            return []
+
+        # --- Fetch live card rows for fused ids ---
+        qmarks = ','.join('?' * len(fused_ids))
+        rows = self.conn.execute(
+            f"SELECT id, session_id, card_type, card_key, title, summary, "
+            f"state_json, confidence, source_start_msg_idx, source_end_msg_idx, "
+            f"version_id, previous_card_id, valid_to_msg_idx, created_at, updated_at "
+            f"FROM memory_cards "
+            f"WHERE id IN ({qmarks}) AND session_id = ? AND valid_to_msg_idx IS NULL",
+            (*fused_ids, self.session_id),
+        ).fetchall()
+
+        keys = [
+            'id', 'session_id', 'card_type', 'card_key', 'title', 'summary',
+            'state_json', 'confidence', 'source_start_msg_idx', 'source_end_msg_idx',
+            'version_id', 'previous_card_id', 'valid_to_msg_idx', 'created_at', 'updated_at',
+        ]
+        by_id: dict[int, dict] = {}
+        for row in rows:
+            d = dict(zip(keys, row))
+            try:
+                d['state'] = json.loads(d['state_json'] or '{}')
+            except (json.JSONDecodeError, TypeError):
+                d['state'] = {}
+            # Preserve RRF order rank for boost calc
+            d['_rrf_rank'] = fused_ids.index(d['id']) if d['id'] in fused_ids else len(fused_ids)
+            by_id[int(d['id'])] = d
+
+        # Restore RRF order
+        cards = [by_id[cid] for cid in fused_ids if cid in by_id]
+
+        # --- Rerank via cross-encoder (same seam as _memoria_fused_retrieve) ---
+        card_texts = [f"{c['title']}. {c['summary']}" for c in cards]
+        scores = _fusion_rerank(query, card_texts)
+        if scores is not None:
+            score_map = {item['index']: item['score'] for item in scores}
+            for i, card in enumerate(cards):
+                card['_rerank_score'] = float(score_map.get(i, 0.0))
+            cards.sort(key=lambda c: -c.get('_rerank_score', 0.0))
+
+        # --- Intent-type soft boost (nudge preferred types up) ---
+        if preferred_types:
+            boost_set = set(preferred_types)
+            # Stable sort: boosted types first, preserving relative order within each group
+            cards = (
+                [c for c in cards if c['card_type'] in boost_set] +
+                [c for c in cards if c['card_type'] not in boost_set]
+            )
+
+        return cards[:max_cards]
+
+    def _hydrate_card_evidence(self, card_ids: list[int], per_card: int = 5) -> list[dict]:
+        """Fetch linked evidence rows for the given card_ids.
+
+        For each card (up to per_card rows, ordered by weight desc), returns
+        evidence dicts with message_idx preserved so MSGIDX anchors survive.
+        """
+        if not card_ids:
+            return []
+        evidence = []
+        for cid in card_ids:
+            rows = self.conn.execute(
+                "SELECT card_id, evidence_table, evidence_row_id, message_idx, snippet, weight "
+                "FROM memory_card_evidence WHERE card_id = ? "
+                "ORDER BY weight DESC LIMIT ?",
+                (cid, per_card),
+            ).fetchall()
+            for row in rows:
+                evidence.append({
+                    'card_id': int(row[0]),
+                    'evidence_table': row[1],
+                    'evidence_row_id': row[2],
+                    'message_idx': row[3],
+                    'snippet': row[4],
+                    'weight': float(row[5]),
+                })
+        return evidence
+
+    def _card_first_retrieve(self, query: str, intent: str = '', ability: str | None = None) -> dict | None:
+        """Cards-first retrieval orchestrator (spec §6.1).
+
+        Returns a result dict (same shape as _memoria_fused_retrieve) when cards
+        provide useful coverage, or None (signal to fall back to raw path) when:
+          - no live cards are found
+          - reranked card confidence is too low
+          - intent is 'ordered' and cards lack sufficient MSGIDX evidence
+
+        The caller falls back to the existing memoria_retrieve() path on None.
+        """
+        from . import query_mode as _qm
+
+        # Derive intent if not supplied
+        _intent = intent or ''
+        if not _intent:
+            if _qm.is_ordering_query(query):
+                _intent = 'ordered'
+            elif _qm.is_summarization_query(query) or _qm.is_aggregation_query(query):
+                _intent = 'summary'
+            elif _qm.is_contradiction_query(query):
+                _intent = 'change'
+            elif _qm.is_knowledge_update_query(query):
+                _intent = 'current'
+            elif _qm.is_duration_query(query):
+                _intent = 'timeline'
+
+        # Step 1: retrieve candidate cards
+        cards = self._card_retrieve(query, intent=_intent, top_k=20)
+
+        # Fallback condition 1: no live cards
+        if not cards:
+            return None
+
+        # Fallback condition 2: low rerank confidence on top card
+        # When reranker is up, _rerank_score is populated; threshold 0.3 guards
+        # against low-relevance cards masking a better raw result.
+        if cards and '_rerank_score' in cards[0]:
+            if cards[0]['_rerank_score'] < 0.3:
+                return None
+
+        # --- EO / ordered-query safeguard (spec §6.3) ---
+        # Cards must NOT turn EO into a topical summary. Check that we have enough
+        # evidence with MSGIDX anchors; if not, fall back to the raw ordered path.
+        if _intent == 'ordered':
+            top_card_ids = [c['id'] for c in cards[:5]]
+            evidence = self._hydrate_card_evidence(top_card_ids, per_card=5)
+            anchored = [e for e in evidence if e.get('message_idx') is not None]
+            if len(anchored) < 2:
+                # Insufficient ordering evidence — fall back to raw ordered retriever
+                return None
+            # Sort anchored evidence by message_idx ASC (ordering authority)
+            anchored.sort(key=lambda e: e['message_idx'])
+            # Build context with MSGIDX anchors preserved
+            from edumem.core.context_assembly import assemble_card_context
+            ctx = assemble_card_context(cards, anchored, max_chars=16000)
+            return {
+                'context': ctx,
+                'facts': cards,
+                'source': 'card_first_ordered',
+                'source_memory_ids': [str(c['id']) for c in cards],
+                'card_ids': [c['id'] for c in cards],
+            }
+
+        # Step 2: hydrate evidence for top 3-5 cards
+        top_card_ids = [c['id'] for c in cards[:5]]
+        evidence = self._hydrate_card_evidence(top_card_ids, per_card=5)
+
+        # Step 3: assemble context
+        from edumem.core.context_assembly import assemble_card_context
+        ctx = assemble_card_context(cards, evidence, max_chars=16000)
+
+        return {
+            'context': ctx,
+            'facts': cards,
+            'source': 'card_first',
+            'source_memory_ids': [str(c['id']) for c in cards],
+            'card_ids': [c['id'] for c in cards],
+        }
+
+    # --- Card layer write path (Phases D, E, F) ---
+
+    def _card_layer_enabled(self) -> bool:
+        """The card write path is the production default (memory-v2 spec §5).
+
+        Always on — every successful raw write emits card agenda items, and the
+        sleep/dream worker drains the queue when LLM extraction is active
+        (``use_cloud``). No env flag.
+        """
+        return True
+
+    def _enqueue_card_updates(self, session: str, agenda_items: list[dict]) -> int:
+        """INSERT OR IGNORE agenda items into memory_card_queue.
+
+        Each item: {agenda_type, agenda_key, trigger_table, trigger_row_id}.
+        The UNIQUE index idx_card_queue_dedupe coalesces duplicate (session,
+        agenda_type, agenda_key, trigger_table, trigger_row_id) inserts — we
+        rely on INSERT OR IGNORE, never pre-check. Returns rows actually inserted.
+        No-op returning 0 when card layer disabled.
+        """
+        if not self._card_layer_enabled():
+            return 0
+        inserted = 0
+        for item in agenda_items:
+            updated = self.conn.execute(
+                "UPDATE memory_card_queue "
+                "SET trigger_table = ?, trigger_row_id = ?, updated_at = CURRENT_TIMESTAMP "
+                "WHERE session_id = ? AND agenda_type = ? AND agenda_key = ? "
+                "AND status IN ('pending', 'running')",
+                (
+                    item["trigger_table"],
+                    str(item["trigger_row_id"]),
+                    session,
+                    item["agenda_type"],
+                    item["agenda_key"],
+                ),
+            ).rowcount
+            if updated:
+                continue
+            cur = self.conn.execute(
+                "INSERT OR IGNORE INTO memory_card_queue "
+                "(session_id, agenda_type, agenda_key, trigger_table, trigger_row_id, status) "
+                "VALUES (?, ?, ?, ?, ?, 'pending')",
+                (
+                    session,
+                    item["agenda_type"],
+                    item["agenda_key"],
+                    item["trigger_table"],
+                    str(item["trigger_row_id"]),
+                ),
+            )
+            inserted += cur.rowcount
+        if inserted or agenda_items:
+            self.conn.commit()
+        return inserted
+
+    def _agenda_from_raw_write(
+        self, fact_type: str, key: str, value: str, msg_idx: int, row_id
+    ) -> list[dict]:
+        """Map one raw fact write to 0+ card agenda items per spec §5.4.
+
+        Returns a list of item dicts each shaped:
+        {agenda_type, agenda_key, trigger_table, trigger_row_id}
+        """
+        ftype = (fact_type or "").lower().strip()
+        slug = self._normalize_fact_key_component(key)
+
+        _CHANGE_TYPES = {"version", "change", "update", "correction", "superseded", "decision"}
+        _BELIEF_TYPES = {"preference", "instruction"}
+
+        if ftype == "entity":
+            card_type = "entity"
+        elif ftype == "conclusion":
+            card_type = "topic"
+        elif ftype in _CHANGE_TYPES:
+            card_type = "change"
+        elif ftype in _BELIEF_TYPES:
+            card_type = "belief"
+        else:
+            card_type = "topic"
+
+        agenda_key = f"{card_type}:{slug}"
+        return [{
+            "agenda_type": card_type,
+            "agenda_key": agenda_key,
+            "trigger_table": "memoria_facts",
+            "trigger_row_id": row_id,
+        }]
+
+    def _apply_card_patch(self, session: str, patch: dict, msg_idx: int) -> int | None:
+        """Apply a card-patch dict (§5.5 shape) to the card store. PURE — no LLM.
+
+        Actions:
+        - NOOP or missing/malformed → return None
+        - DELETE → _invalidate_card; return None
+        - ADD / UPDATE → _upsert_card + _link_card_evidence + _embed_card; return card_id
+
+        Robust to missing/partial keys; treats them as NOOP.
+        """
+        if not isinstance(patch, dict):
+            return None
+        action = str(patch.get("action") or "NOOP").upper().strip()
+        if action == "NOOP":
+            return None
+
+        card_type = str(patch.get("card_type") or "").strip()
+        card_key = str(patch.get("card_key") or "").strip()
+
+        if not card_type or not card_key:
+            return None
+
+        if action == "DELETE":
+            self._invalidate_card(session, card_type, card_key, msg_idx)
+            return None
+
+        if action not in ("ADD", "UPDATE"):
+            return None
+
+        title = str(patch.get("title") or "").strip()
+        summary = str(patch.get("summary") or "").strip()
+        if not title or not summary:
+            return None
+
+        # Decode state: may be a dict or a JSON string
+        raw_state = patch.get("state")
+        if isinstance(raw_state, dict):
+            state = raw_state
+        elif isinstance(raw_state, str):
+            try:
+                import json as _json
+                state = _json.loads(raw_state)
+                if not isinstance(state, dict):
+                    state = {}
+            except Exception:
+                state = {}
+        else:
+            state = {}
+
+        confidence = float(patch.get("confidence") or 0.7)
+
+        card_id = self._upsert_card(
+            session=session,
+            card_type=card_type,
+            card_key=card_key,
+            title=title,
+            summary=summary,
+            state=state,
+            confidence=confidence,
+            msg_idx=msg_idx,
+        )
+
+        # Link evidence
+        evidence_items = patch.get("evidence") or []
+        if isinstance(evidence_items, list):
+            parsed_evidence = []
+            for ev in evidence_items:
+                if not isinstance(ev, dict):
+                    continue
+                tbl = ev.get("table") or ev.get("evidence_table")
+                row_id = ev.get("row_id") or ev.get("evidence_row_id")
+                if tbl and row_id:
+                    parsed_evidence.append({
+                        "table": str(tbl),
+                        "row_id": str(row_id),
+                        "message_idx": ev.get("message_idx"),
+                        "snippet": str(ev.get("snippet") or ""),
+                        "weight": float(ev.get("weight") or 1.0),
+                    })
+            if parsed_evidence:
+                self._link_card_evidence(card_id, parsed_evidence)
+
+        # Embed (best-effort: EDUMEM_NO_EMBEDDINGS guard is inside _embed_card)
+        self._embed_card(card_id, f"{title}. {summary}")
+
+        return card_id
+
+    def _card_queue_evidence(self, session: str, agenda_key: str, limit: int = 8) -> list[dict]:
+        """Load supporting raw evidence rows from memoria_facts for a card queue item.
+
+        Extracts content terms from agenda_key (skipping the type prefix), builds
+        OR conditions for terms with len >= 3, and searches across key/value columns.
+        Returns up to `limit` rows ordered by id DESC.
+        """
+        slug_terms = agenda_key.replace(":", " ").replace("_", " ").split()
+
+        content_terms = []
+        for term in slug_terms[1:]:
+            if len(term) >= 3:
+                content_terms.append(term)
+
+        evidence_rows: list[dict] = []
+        if content_terms:
+            placeholders = " OR ".join(["key LIKE ?" for _ in content_terms] + ["value LIKE ?" for _ in content_terms])
+            params = [session] + [f"%{t}%" for t in content_terms] + [f"%{t}%" for t in content_terms]
+
+            query = (
+                "SELECT id, fact_type, key, value, context_snippet, message_idx "
+                "FROM memoria_facts "
+                "WHERE session_id = ? AND valid_to_msg_idx IS NULL "
+                f"AND ({placeholders}) "
+                "ORDER BY id DESC LIMIT ?"
+            )
+            params.append(limit)
+
+            raw_rows = self.conn.execute(query, params).fetchall()
+            for r in raw_rows:
+                evidence_rows.append({
+                    "id": r[0],
+                    "fact_type": r[1],
+                    "key": r[2],
+                    "value": r[3],
+                    "context_snippet": r[4],
+                    "message_idx": r[5],
+                })
+
+        return evidence_rows
+
+    def _process_card_queue(self, session: str, limit: int = 5) -> dict:
+        """Drain pending memory_card_queue rows for the session (dream/sleep worker).
+
+        For each pending row:
+        1. Atomically claim it (status pending→running).
+        2. Load the live card via _get_live_card.
+        3. Load top supporting raw evidence rows from memoria_facts (~8 rows).
+        4. Load the live session:overview card.
+        5. Call extraction_client.update_card(...) for the card patch.
+        6. Apply via _apply_card_patch.
+        7. Mark row done (or error + last_error + attempt_count++ on exception).
+
+        Requires use_cloud + card layer enabled + an extraction client.
+        Otherwise returns a no-op status dict without touching the queue.
+
+        Returns {processed, applied, errors}.
+        """
+        result = {"processed": 0, "applied": 0, "errors": 0}
+        if not self._card_layer_enabled():
+            return result
+        if not self.use_cloud:
+            return result
+
+        # Get pending rows
+        pending = self.conn.execute(
+            "SELECT id, agenda_type, agenda_key, trigger_table, trigger_row_id, attempt_count "
+            "FROM memory_card_queue "
+            "WHERE session_id = ? AND status = 'pending' "
+            "ORDER BY id ASC LIMIT ?",
+            (session, limit),
+        ).fetchall()
+
+        if not pending:
+            return result
+
+        try:
+            client = self._ensure_extraction_client()
+        except Exception as exc:
+            logger.warning(
+                "_process_card_queue: could not get extraction client for session=%s: %s: %s",
+                session, type(exc).__name__, exc,
+            )
+            return result
+
+        for row in pending:
+            row_id = row[0]
+            agenda_type = row[1]
+            agenda_key = row[2]
+            trigger_table = row[3]
+            trigger_row_id = row[4]
+            attempt_count = int(row[5] or 0)
+
+            # Atomically claim: pending → running
+            claimed = self.conn.execute(
+                "UPDATE memory_card_queue SET status = 'running', "
+                "updated_at = CURRENT_TIMESTAMP "
+                "WHERE id = ? AND status = 'pending'",
+                (row_id,),
+            ).rowcount
+            self.conn.commit()
+            if not claimed:
+                continue  # Lost the race
+
+            result["processed"] += 1
+            try:
+                # Derive card_type from agenda_type
+                card_type = agenda_type  # agenda_type IS the card_type
+                # Strip the "type:" prefix from agenda_key if present to get the card_key
+                card_key = agenda_key
+
+                # Load live card
+                live_card = self._get_live_card(session, card_type, card_key)
+
+                # Load ~8 supporting raw evidence rows
+                evidence_rows = self._card_queue_evidence(session, agenda_key)
+
+                # Load session overview card
+                overview_card = self._get_live_card(session, "session", "session:overview")
+
+                # Build agenda dict for LLM
+                agenda = {
+                    "agenda_type": agenda_type,
+                    "agenda_key": agenda_key,
+                    "trigger_table": trigger_table,
+                    "trigger_row_id": trigger_row_id,
+                }
+
+                # Ask LLM for patch
+                patch = client.update_card(
+                    current_card=live_card,
+                    agenda=agenda,
+                    evidence_rows=evidence_rows,
+                    session_overview=overview_card,
+                )
+
+                # Apply patch
+                msg_idx_for_patch = max(
+                    (r.get("message_idx") or 0 for r in evidence_rows),
+                    default=0,
+                )
+                applied_id = self._apply_card_patch(session, patch, msg_idx_for_patch)
+                if applied_id is not None:
+                    result["applied"] += 1
+
+                # Mark done
+                self.conn.execute(
+                    "UPDATE memory_card_queue SET status = 'done', "
+                    "updated_at = CURRENT_TIMESTAMP "
+                    "WHERE id = ?",
+                    (row_id,),
+                )
+                self.conn.commit()
+
+            except Exception as exc:
+                import traceback
+                logger.error(
+                    "_process_card_queue: error processing row %d for session=%s: %s: %s\n%s",
+                    row_id, session, type(exc).__name__, exc,
+                    traceback.format_exc(),
+                )
+                result["errors"] += 1
+                self.conn.execute(
+                    "UPDATE memory_card_queue SET status = 'error', "
+                    "last_error = ?, attempt_count = ?, "
+                    "updated_at = CURRENT_TIMESTAMP "
+                    "WHERE id = ?",
+                    (str(exc)[:500], attempt_count + 1, row_id),
+                )
+                self.conn.commit()
+
+        return result
+
+    def _refresh_session_overview_card(self, session: str) -> int | None:
+        """Phase F: synthesize/refresh the session:overview card from live cards.
+
+        Gathers live topic/entity/change/belief cards, calls
+        refresh_session_overview(...), applies result via _apply_card_patch.
+        No-op when disabled or no extraction client. Returns card_id or None.
+        """
+        if not self._card_layer_enabled():
+            return None
+        if not self.use_cloud:
+            return None
+
+        try:
+            client = self._ensure_extraction_client()
+        except Exception as exc:
+            logger.warning(
+                "_refresh_session_overview_card: no extraction client for session=%s: %s: %s",
+                session, type(exc).__name__, exc,
+            )
+            return None
+
+        live_cards = self._list_live_cards(session)
+        if not live_cards:
+            return None
+
+        try:
+            patch = client.refresh_session_overview(live_cards)
+            # Force card_key to "session:overview"
+            if isinstance(patch, dict) and patch.get("action", "NOOP").upper() not in ("NOOP", "DELETE"):
+                patch = dict(patch)
+                patch["card_type"] = "session"
+                patch["card_key"] = "session:overview"
+            # Use max message idx from live cards as msg_idx
+            msg_idx = max(
+                (c.get("source_end_msg_idx") or c.get("source_start_msg_idx") or 0
+                 for c in live_cards),
+                default=0,
+            )
+            return self._apply_card_patch(session, patch, msg_idx)
+        except Exception as exc:
+            import traceback
+            logger.error(
+                "_refresh_session_overview_card: error for session=%s: %s: %s\n%s",
+                session, type(exc).__name__, exc,
+                traceback.format_exc(),
+            )
+            return None
+
     def _derive_durations(self, session: str, max_pairs: int = 15) -> int:
         """Derive interval facts from related timeline events.
 
@@ -5299,15 +6731,25 @@ Now respond with ONLY the JSON array, no explanation."""
 
                 weeks_str = f"{weeks:.1f} weeks" if weeks >= 1 else f"{days} days"
 
-                # Build a key from shared words + the date range
-                topic_key = '_'.join(sorted(shared))[:40]
-                fact_key = f"{topic_key}_duration"
+                # A duration fact's identity is the (calendar) date pair, NOT the
+                # shared topic words. Keying on topic words let many distinct pairs
+                # collide under one key (e.g. "march_duration") and let the same
+                # pair recur under slightly varying keys, so per-message
+                # re-derivation version-thrashed the rows (one key reached 143
+                # rows / 595 duplicate intervals across the store). Key and
+                # source_memory_id use the normalized ISO date pair so each pair
+                # maps to exactly one stable, self-deduplicating fact; the rendered
+                # value keeps the original readable dates so TR date-phrase nuggets
+                # ("January 15, 2024") still match.
+                iso_a = dt_a.strftime('%Y-%m-%d')
+                iso_b = dt_b.strftime('%Y-%m-%d')
+                fact_key = f"duration_{iso_a}_to_{iso_b}"
                 value = f"{weeks_str} ({date_a} -> {date_b})"
 
                 ctx = f"{desc_a} .. {desc_b}"
                 if self._insert_fact(session, mi_b, 'duration', fact_key,
                                      value, ctx, 0.7,
-                                     source_memory_id=f"dur:{date_a}:{date_b}"):
+                                     source_memory_id=f"dur:{iso_a}:{iso_b}"):
                     inserted += 1
 
         return inserted
@@ -5902,6 +7344,9 @@ Now respond with ONLY the JSON array, no explanation."""
             ('latency', 'metric', ['ms']),
             ('speed', 'metric', ['ms']),
             ('response time', 'metric', ['ms']),
+            ('how many', 'aggregate', None),
+            ('how much', 'aggregate', None),
+            ('total', 'aggregate', None),
             ('how many', 'metric', None),
             ('how much', 'metric', None),
             ('what date', 'date', None),
@@ -9543,6 +10988,29 @@ Now respond with ONLY the JSON array, no explanation."""
         # Run tiered degradation after consolidation
         degrade_result = self.degrade_episodic(dry_run=dry_run)
 
+        # Phase D/E/F card layer: spend a small deterministic dream-worker budget
+        # after each sleep. Cards are always part of the production path; bounded
+        # maintenance keeps benchmark cache builds from paying an unbounded LLM tax.
+        card_result: dict = {}
+        if not dry_run and self._card_layer_enabled():
+            try:
+                card_result = self._process_card_queue(self.session_id)
+                self._refresh_session_overview_card(self.session_id)
+                # Enqueue a session agenda item for the next cycle
+                self._enqueue_card_updates(self.session_id, [{
+                    "agenda_type": "session",
+                    "agenda_key": "session:overview",
+                    "trigger_table": "memoria_facts",
+                    "trigger_row_id": 0,
+                }])
+            except Exception as exc:
+                import traceback
+                logger.error(
+                    "sleep: card layer processing failed for session=%s: %s: %s\n%s",
+                    self.session_id, type(exc).__name__, exc,
+                    traceback.format_exc(),
+                )
+
         logger.info(
             "sleep: consolidated=%d summaries=%d conflicts=%d llm=%s method=%s",
             len(consolidated_ids), summaries_created, conflicts_resolved,
@@ -9557,7 +11025,8 @@ Now respond with ONLY the JSON array, no explanation."""
             "llm_used": llm_used_count,
             "method": method,
             "consolidated_ids": consolidated_ids,
-            "degradation": degrade_result
+            "degradation": degrade_result,
+            "card_layer": card_result,
         }
 
     def sleep_all_sessions(self, dry_run: bool = False, force: bool = False) -> Dict:
