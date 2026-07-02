@@ -156,6 +156,40 @@ _EMBED_API_SESSION = _requests.Session() if _requests is not None else None
 
 
 _EMBED_API_BATCH_SIZE = int(os.environ.get("EDUMEM_EMBED_BATCH_SIZE", "256"))
+_DEFAULT_EMBEDDING_INPUT_CHAR_LIMIT = 6000
+
+
+def _get_embedding_input_char_limit() -> int:
+    """Return the per-item character cap for API embedding requests.
+
+    Reuses the existing embedding batch char budget so a singleton long row
+    cannot bypass the guardrails that already split multi-row batches.
+    """
+    for env_name in (
+        "EDUMEM_EMBEDDING_BATCH_TOTAL_CHARS",
+        "EDUMEM_EMBEDDING_BATCH_CHAR_BUDGET",
+    ):
+        raw = os.environ.get(env_name)
+        if raw is None:
+            continue
+        try:
+            input_char_limit = int(str(raw).strip())
+        except (TypeError, ValueError):
+            return _DEFAULT_EMBEDDING_INPUT_CHAR_LIMIT
+        if input_char_limit < 1:
+            return _DEFAULT_EMBEDDING_INPUT_CHAR_LIMIT
+        return input_char_limit
+    return _DEFAULT_EMBEDDING_INPUT_CHAR_LIMIT
+
+
+def _cap_embedding_text(text: str, char_limit: Optional[int] = None) -> str:
+    """Truncate a single embedding input to the configured API-safe length."""
+    if not text:
+        return text
+    effective_limit = char_limit if char_limit is not None else _get_embedding_input_char_limit()
+    if effective_limit < 1 or len(text) <= effective_limit:
+        return text
+    return text[:effective_limit]
 
 
 def _embed_api(texts: List[str]) -> Optional[np.ndarray]:
@@ -190,15 +224,41 @@ def _embed_api(texts: List[str]) -> Optional[np.ndarray]:
     # the urllib fallback uses ssl.create_default_context().
     cert_file = os.environ.get("SSL_CERT_FILE") or os.environ.get("REQUESTS_CA_BUNDLE")
 
+    input_char_limit = _get_embedding_input_char_limit()
+    capped_texts = [_cap_embedding_text(text, input_char_limit) for text in texts]
+
     all_embeddings: List[list] = []
-    for i in range(0, len(texts), _EMBED_API_BATCH_SIZE):
-        batch = texts[i : i + _EMBED_API_BATCH_SIZE]
-        result = _embed_api_batch(batch, url, headers, cert_file)
+    for i in range(0, len(capped_texts), _EMBED_API_BATCH_SIZE):
+        batch = capped_texts[i : i + _EMBED_API_BATCH_SIZE]
+        result = _embed_api_batch_resilient(batch, url, headers, cert_file)
         if result is None:
             return None
         all_embeddings.extend(result)
 
     return np.array(all_embeddings, dtype=np.float32)
+
+
+def _embed_api_batch_resilient(texts: List[str], url: str, headers: dict,
+                               cert_file: Optional[str]) -> Optional[List[list]]:
+    """Embed one batch, recursively splitting it when the endpoint rejects it.
+
+    This keeps the default fast path for healthy batches, but avoids turning a
+    single oversize provider call into a total write-path outage. Order is
+    preserved by concatenating left then right halves.
+    """
+    result = _embed_api_batch(texts, url, headers, cert_file)
+    if result is not None:
+        return result
+    if len(texts) <= 1:
+        return None
+    mid = max(1, len(texts) // 2)
+    left = _embed_api_batch_resilient(texts[:mid], url, headers, cert_file)
+    if left is None:
+        return None
+    right = _embed_api_batch_resilient(texts[mid:], url, headers, cert_file)
+    if right is None:
+        return None
+    return left + right
 
 
 def _embed_api_batch(texts: List[str], url: str, headers: dict,

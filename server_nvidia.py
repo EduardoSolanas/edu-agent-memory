@@ -20,6 +20,8 @@ import numpy as np
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
+from server_text import sanitize_rerank_text
+
 app = FastAPI(title="NVIDIA Inference Server (ONNX)")
 
 EMBED_MODEL_ID = "Alibaba-NLP/gte-modernbert-base"
@@ -30,6 +32,9 @@ EMBED_MODEL_PATH = Path(os.getenv("EMBED_MODEL_PATH", str(MODEL_ROOT / "gte-mode
 RERANK_MODEL_PATH = Path(os.getenv("RERANK_MODEL_PATH", str(MODEL_ROOT / "ettin-reranker-17m-v1")))
 EMBED_MAX_LENGTH = int(os.getenv("NVIDIA_EMBED_MAX_LENGTH", "8192"))
 RERANK_MAX_LENGTH = int(os.getenv("NVIDIA_RERANK_MAX_LENGTH", "7999"))
+RERANK_QUERY_MAX_BYTES = int(os.getenv("RERANK_QUERY_MAX_BYTES", "128"))
+RERANK_TEXT_MAX_BYTES = int(os.getenv("RERANK_TEXT_MAX_BYTES", "352"))
+RERANK_BATCH_SIZE = 8
 
 embedder = None
 reranker = None
@@ -192,6 +197,34 @@ def _sigmoid(values: np.ndarray) -> np.ndarray:
     return 1.0 / (1.0 + np.exp(-values))
 
 
+def _sanitize_rerank_inputs(
+    query: str,
+    texts: Sequence[str],
+    *,
+    query_max_utf8_bytes: int = RERANK_QUERY_MAX_BYTES,
+    text_max_utf8_bytes: int = RERANK_TEXT_MAX_BYTES,
+) -> tuple[str, list[str]]:
+    safe_query = sanitize_rerank_text(query, max_utf8_bytes=query_max_utf8_bytes)
+    safe_texts = [
+        sanitize_rerank_text(text, max_utf8_bytes=text_max_utf8_bytes)
+        for text in texts
+    ]
+    return safe_query, safe_texts
+
+
+def _iter_rerank_batches(
+    texts: Sequence[str], *, batch_size: int = RERANK_BATCH_SIZE
+):
+    if batch_size < 1:
+        raise ValueError("batch_size must be >= 1")
+
+    indexed = list(enumerate(texts))
+    indexed.sort(key=lambda item: (-len(item[1].split()), -len(item[1]), item[0]))
+    for start in range(0, len(indexed), batch_size):
+        chunk = indexed[start:start + batch_size]
+        yield [idx for idx, _ in chunk], [text for _, text in chunk]
+
+
 class OnnxEmbedder:
     def __init__(self, model_path: Path, *, max_length: int = EMBED_MAX_LENGTH):
         self.model_path = model_path
@@ -228,22 +261,30 @@ class OnnxReranker:
         if not texts:
             return []
 
-        batch = self.tokenizer(
-            [query] * len(texts),
-            list(texts),
-            padding=True,
-            truncation=True,
-            max_length=self.max_length,
-            return_tensors="np",
-        )
-        hidden = self.session.run(None, _ort_inputs(self.session, batch))[0][:, 0, :].astype(np.float32)
-        hidden = _linear(hidden, self.head.dense_weight)
-        hidden = _gelu(hidden)
-        hidden = _layer_norm(hidden, self.head.norm_weight, self.head.norm_bias)
-        hidden = _linear(hidden, self.head.score_weight, self.head.score_bias).reshape(-1)
-        scores = hidden if raw_scores else _sigmoid(hidden)
+        query, safe_texts = _sanitize_rerank_inputs(query, texts)
+        ranked: list[dict[str, float]] = []
 
-        ranked = [{"index": idx, "score": float(score)} for idx, score in enumerate(scores)]
+        for batch_indices, batch_texts in _iter_rerank_batches(safe_texts):
+            batch = self.tokenizer(
+                [query] * len(batch_texts),
+                batch_texts,
+                padding=True,
+                truncation=True,
+                max_length=self.max_length,
+                return_tensors="np",
+            )
+            hidden = self.session.run(None, _ort_inputs(self.session, batch))[0][:, 0, :].astype(np.float32)
+            hidden = _linear(hidden, self.head.dense_weight)
+            hidden = _gelu(hidden)
+            hidden = _layer_norm(hidden, self.head.norm_weight, self.head.norm_bias)
+            hidden = _linear(hidden, self.head.score_weight, self.head.score_bias).reshape(-1)
+            scores = hidden if raw_scores else _sigmoid(hidden)
+
+            ranked.extend(
+                {"index": batch_indices[local_idx], "score": float(score)}
+                for local_idx, score in enumerate(scores)
+            )
+
         ranked.sort(key=lambda item: item["score"], reverse=True)
         return ranked
 

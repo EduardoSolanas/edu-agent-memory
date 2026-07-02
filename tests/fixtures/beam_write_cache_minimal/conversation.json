@@ -1,0 +1,10 @@
+[
+  {
+    "role": "user",
+    "content": "My budget tracker uses Flask 2.3.1 with PostgreSQL, and the deployment deadline is March 15, 2024."
+  },
+  {
+    "role": "assistant",
+    "content": "We can summarize the work as moving from stack setup into deployment planning."
+  }
+]

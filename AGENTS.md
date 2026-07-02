@@ -5,6 +5,39 @@ ABS, CR, EO, IE, IF, KU, MR, PF, SUM, TR). This file explains how the BEAM
 evaluation and tests fit together, how to run them, and what is currently
 known/unknown — so you don't rediscover it or draw wrong conclusions.
 
+## Before you build: check prior art, don't reinvent the wheel
+
+Memory is a solved-enough problem. **Before designing OR fixing ANY extraction,
+summarization, consolidation, dedup, recall, dream/sleep, card, or memory-routing
+mechanism, check how these three do it and copy the pattern that fits — do not
+hand-roll a clever new scheme first:**
+
+- **mem0** — extract→update pipeline: each candidate fact is matched against
+  vector-similar existing memories and an LLM decides `ADD` / `UPDATE` / `DELETE` /
+  `NOOP` (no brittle deterministic keys), plus a rolling summary feeding
+  extraction. The reference for dedup/consolidation.
+  ([docs](https://docs.mem0.ai/core-concepts/memory-operations/add), [paper arXiv 2504.19413](https://arxiv.org/html/2504.19413v1))
+- **Honcho** (Plastic Labs) — fast latent extraction at ingest + a background
+  "dream" that draws new inferences over time, exposed via a representation
+  endpoint. The reference for the extract-on-ingest + `sleep()` consolidation shape.
+  ([GitHub](https://github.com/plastic-labs/honcho), [Memory as Reasoning](https://plasticlabs.ai/blog/posts/Memory-as-Reasoning))
+- **Hindsight** — four separated networks (world facts / experiences /
+  **synthesized entity summaries** / evolving beliefs) and three ops: retain,
+  recall, **reflect** (LLM synthesis ACROSS memories at query time, not a ranked
+  list). The reference for SUM summaries and MR aggregation.
+  ([paper arXiv 2512.12818](https://arxiv.org/abs/2512.12818))
+
+This is not optional or "only for big redesigns". For any memory bug, proposal,
+benchmark regression, or architecture change touching the memory pipeline, first
+check which of **mem0**, **Honcho**, or **Hindsight** already solves the same
+shape of problem and use that as the default design reference.
+
+Hand-rolled cleverness here has repeatedly produced bugs these already solve: the
+deterministic-key dedup (`_insert_fact` on `(fact_type, key, value)`) caused a
+duration-fact explosion (595 duplicate rows, one key reaching 143 rows) and a
+latent one-conclusion-per-theme ceiling — both of which mem0's similarity+LLM
+update avoids by design. When in doubt, copy the proven approach.
+
 ## Environment & invocation reference (canonical — 2026-06-25)
 
 ### LLM provider (answer / judge / extraction / consolidation)
@@ -51,10 +84,10 @@ ExtractionClient outright.
 ### Embeddings / reranker
 | Var | Default |
 |---|---|
-| `EDUMEM_EMBEDDING_API_URL` | http://localhost:3002 |
+| `EDUMEM_EMBEDDING_API_URL` | http://127.0.0.1:3002 (NOT `localhost` — on Windows/WSL it resolves to IPv6 `::1` first and stalls ~2s/request before the IPv4 fallback) |
 | `EDUMEM_EMBEDDING_MODEL` | Alibaba-NLP/gte-modernbert-base (768-dim) |
 | `EDUMEM_EMBEDDINGS_VIA_API` | set `1` to use the API embedder |
-| `EDUMEM_RERANKER_URL` | http://localhost:3002/rerank |
+| `EDUMEM_RERANKER_URL` | http://127.0.0.1:3002/rerank (NOT `localhost` — see above) |
 | `EDUMEM_NO_EMBEDDINGS` | set `1` for offline (FTS/keyword only; no dense, no `vec_facts`) |
 
 ### Invocations

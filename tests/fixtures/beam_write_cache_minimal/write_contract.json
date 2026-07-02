@@ -1,0 +1,167 @@
+{
+  "session_id": "write-cache-session",
+  "facts": [
+    {
+      "subject": "BudgetTracker",
+      "predicate": "has_deadline",
+      "object": "2024-03-15",
+      "timestamp": "2024-03-15T00:00:00Z",
+      "source_msg_id": "msg-0",
+      "confidence": 0.8
+    },
+    {
+      "subject": "BudgetTracker",
+      "predicate": "uses",
+      "object": "Flask",
+      "timestamp": "2024-03-15T00:00:00Z",
+      "source_msg_id": "msg-0",
+      "confidence": 0.9
+    }
+  ],
+  "memoria_facts": [
+    {
+      "fact_type": "aggregate",
+      "key": "timeline_count",
+      "value": "1 timeline items (The project moved from stack definition into deployment planning.)",
+      "previous_value": "",
+      "version_id": 0,
+      "source_memory_id": "agg:timeline"
+    },
+    {
+      "fact_type": "conclusion",
+      "key": "timeline_0_1_6eaa409f649a",
+      "value": "The project moved from stack definition into deployment planning.",
+      "previous_value": "",
+      "version_id": 0,
+      "source_memory_id": "concl:timeline:6eaa409f649a"
+    },
+    {
+      "fact_type": "date",
+      "key": "iso_date",
+      "value": "2024-03-15",
+      "previous_value": "",
+      "version_id": 0,
+      "source_memory_id": "auto_source_1"
+    },
+    {
+      "fact_type": "date",
+      "key": "named_date",
+      "value": "March 15, 2024",
+      "previous_value": "",
+      "version_id": 0,
+      "source_memory_id": "auto_source_1"
+    },
+    {
+      "fact_type": "duration",
+      "key": "duration_2024-03-15_to_2024-03-15",
+      "value": "0 days (2024-03-15 -> March 15, 2024)",
+      "previous_value": "",
+      "version_id": 0,
+      "source_memory_id": "dur:2024-03-15:2024-03-15"
+    },
+    {
+      "fact_type": "version",
+      "key": "flask_version",
+      "value": "2.3.1",
+      "previous_value": "",
+      "version_id": 0,
+      "source_memory_id": "auto_source_1"
+    }
+  ],
+  "memoria_kg": [],
+  "memoria_timelines": [
+    {
+      "date": "2024-03-15",
+      "message_idx": 0,
+      "description": "...racker uses Flask 2.3.1 with PostgreSQL, and the deployment deadline is March 15, 2024. [ISO_DATES: 2024-03-15]",
+      "source": "iso_date"
+    },
+    {
+      "date": "March 15, 2024",
+      "message_idx": 0,
+      "description": "My budget tracker uses Flask 2.3.1 with PostgreSQL, and the deployment deadline is March 15, 2024. [ISO_DATES: 2024-03-15]",
+      "source": "named_date"
+    }
+  ],
+  "memory_cards": [
+    {
+      "card_type": "session",
+      "card_key": "session:overview",
+      "title": "Session overview",
+      "summary": "The session focused on the budget tracker stack and the path to deployment.",
+      "state": {
+        "major_topics": [
+          "stack",
+          "deployment"
+        ],
+        "current_focus": "deployment",
+        "unresolved": [
+          "hosting"
+        ]
+      },
+      "confidence": 0.8,
+      "version_id": 0,
+      "valid_to_msg_idx": -1
+    },
+    {
+      "card_type": "topic",
+      "card_key": "topic:timeline_0_1_6eaa409f649a",
+      "title": "Deployment planning",
+      "summary": "Deployment planning became a major focus for the budget tracker work.",
+      "state": {
+        "subtopics": [
+          "deployment"
+        ],
+        "counts": {},
+        "open_items": [
+          "hosting"
+        ],
+        "key_dates": [
+          "2024-03-15"
+        ]
+      },
+      "confidence": 0.82,
+      "version_id": 0,
+      "valid_to_msg_idx": -1
+    }
+  ],
+  "memory_card_evidence": [
+    {
+      "card_key": "topic:timeline_0_1_6eaa409f649a",
+      "evidence_table": "facts",
+      "message_idx": 0,
+      "snippet": "BudgetTracker uses Flask",
+      "weight": 1.0
+    }
+  ],
+  "episodic_memory": [
+    {
+      "content": "Budget tracker stack uses Flask 2.3.1 and has a deployment deadline on March 15, 2024.",
+      "source": "sleep_consolidation",
+      "importance": 0.6,
+      "metadata": {
+        "original_count": 1,
+        "source": "beam_user",
+        "llm_used": true
+      },
+      "veracity": "unknown"
+    },
+    {
+      "content": "Work moved from stack setup into deployment planning.",
+      "source": "sleep_consolidation",
+      "importance": 0.6,
+      "metadata": {
+        "original_count": 1,
+        "source": "beam_assistant",
+        "llm_used": true
+      },
+      "veracity": "unknown"
+    }
+  ],
+  "consolidation_log": [
+    {
+      "items_consolidated": 2,
+      "summary_preview": "2 summaries (llm) from 2 items"
+    }
+  ]
+}

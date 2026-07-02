@@ -187,7 +187,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--model",
-        help="Answering model (defaults: deepseek-v4-flash for nan, gpt-4o for openai, openai/gpt-4o for openrouter, gemini-2.5-flash for gemini)",
+        help="Answering model (defaults: qwen3.6 for nan, gpt-4o for openai, openai/gpt-4o for openrouter, gemini-2.5-flash for gemini)",
     )
     parser.add_argument("--judge-model", help="Judge model (defaults to --model)")
     parser.add_argument("--api-key", help="Override API key for the selected provider")
@@ -234,7 +234,7 @@ def main() -> None:
             sys.exit(1)
     else:
         base_url = dot_env.get("CHAT_MODEL_BASE_URL", "https://api.nan.builders/v1")
-        model = args.model or "deepseek-v4-flash"
+        model = args.model or "qwen3.6"
         api_key = (
             args.api_key
             or os.getenv("NAN_API_KEY")

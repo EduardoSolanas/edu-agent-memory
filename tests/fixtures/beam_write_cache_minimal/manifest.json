@@ -1,0 +1,7 @@
+{
+  "session_id": "write-cache-session",
+  "scale": "fixture",
+  "conversation_id": "fixture-conv0",
+  "llm_model": "qwen3.6",
+  "replay_mode": "cached_live_ingest"
+}

@@ -6,11 +6,12 @@ import os
 def _assemble_memory_context(memories: list, max_chars: int) -> tuple[str, list]:
     """Sort memories by relevance descending (stable), deduplicate, skip score<0.20,
     build [Memory] context string up to max_chars. Supports per-type sub-budgets
-    (EDUMEM_SUB_BUDGET_FACT, EDUMEM_SUB_BUDGET_TIMELINE) so one type doesn't
-    crowd out another. Mutates each mem's 'final_context_included' key.
+    (EDUMEM_SUB_BUDGET_FACT, EDUMEM_SUB_BUDGET_TIMELINE, EDUMEM_SUB_BUDGET_MEMORIA)
+    so one type doesn't crowd out another. Mutates each mem's 'final_context_included' key.
     Returns (context_str, memories)."""
     fact_budget = int(os.environ.get("EDUMEM_SUB_BUDGET_FACT", "12000"))
     timeline_budget = int(os.environ.get("EDUMEM_SUB_BUDGET_TIMELINE", "6000"))
+    memoria_budget = int(os.environ.get("EDUMEM_SUB_BUDGET_MEMORIA", "6000"))
 
     def _score(m):
         s = m.get("score", m.get("relevance", 0))
@@ -22,7 +23,7 @@ def _assemble_memory_context(memories: list, max_chars: int) -> tuple[str, list]
         mem.setdefault("final_context_included", False)
 
     seen_content: set = set()
-    lanes = {"fact": [], "timeline": [], "summary": [], "other": []}
+    lanes = {"fact": [], "timeline": [], "summary": [], "memoria": [], "other": []}
 
     for mem in sorted_mems:
         content = mem.get("content", "")
@@ -41,10 +42,10 @@ def _assemble_memory_context(memories: list, max_chars: int) -> tuple[str, list]
         lanes[t].append((score, mem))
 
     sub_budgets = {"fact": fact_budget, "timeline": timeline_budget,
-                   "summary": None, "other": None}
+                   "summary": None, "memoria": memoria_budget, "other": None}
     selected = []
 
-    for t in ("fact", "timeline", "summary", "other"):
+    for t in ("fact", "timeline", "summary", "memoria", "other"):
         items = sorted(lanes[t], key=lambda x: -x[0])
         budget = sub_budgets[t]
         used = 0
@@ -90,3 +91,60 @@ def _assemble_memory_context(memories: list, max_chars: int) -> tuple[str, list]
         )
 
     return "\n\n".join(parts), sorted_mems
+
+
+def assemble_card_context(cards: list, evidence: list, max_chars: int = 16000) -> str:
+    """Render §6.6 card-context layout: cards first, evidence second.
+
+    Layout:
+        [Card TOPIC] Security hardening
+        Security work progressed from password hashing to RBAC...
+
+        [Card CHANGE] Deployment window
+        Current: February 5 through February 12...
+
+        [Evidence]
+        - MSGIDX:40 password hashing was added...
+        - MSGIDX:72 RBAC was introduced...
+
+    Cards are uppercase card_type. Evidence lines include MSGIDX:N when
+    message_idx is available. Truncates to max_chars (cards section first,
+    then evidence) so the budget is always respected.
+    """
+    parts: list[str] = []
+    total = 0
+
+    # --- Cards section (first) ---
+    for card in cards:
+        card_type = (card.get('card_type') or 'card').upper()
+        title = card.get('title', '').strip()
+        summary = card.get('summary', '').strip()
+        block = f"[Card {card_type}] {title}\n{summary}"
+        if total + len(block) > max_chars:
+            remaining = max_chars - total
+            if remaining > 40:
+                parts.append(block[:remaining] + '...')
+                total += remaining
+            break
+        parts.append(block)
+        total += len(block)
+
+    # --- Evidence section (second) ---
+    ev_lines: list[str] = []
+    for ev in evidence:
+        msg_idx = ev.get('message_idx')
+        snippet = (ev.get('snippet') or '').strip()
+        if not snippet:
+            continue
+        if msg_idx is not None:
+            line = f"- MSGIDX:{msg_idx} {snippet}"
+        else:
+            line = f"- {snippet}"
+        ev_lines.append(line)
+
+    if ev_lines:
+        ev_block = "[Evidence]\n" + "\n".join(ev_lines)
+        if total + len(ev_block) <= max_chars:
+            parts.append(ev_block)
+
+    return "\n\n".join(parts)

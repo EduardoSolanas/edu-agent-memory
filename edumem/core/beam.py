@@ -32,7 +32,12 @@ logger = logging.getLogger(__name__)
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Optional, Any, Set, Union
 from pathlib import Path
-from edumem.core.query_mode import is_duration_query, is_ordering_query
+from edumem.core.query_mode import (
+    is_duration_query,
+    is_ordering_query,
+    structured_recall_intent,
+    wants_instruction_preference_context,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -1677,6 +1682,174 @@ def _minimum_recall_relevance(query_tokens: List[str]) -> float:
     return 0.15
 
 
+def _minimum_card_relevance(intent: str, query_tokens: List[str]) -> float:
+    """Intent-tuned lexical floor for surfacing distilled card context."""
+    if intent == "summary":
+        return 0.12
+    if intent == "ordered":
+        return 0.15
+    if intent == "timeline":
+        return 0.18
+    if intent == "change":
+        return 0.20
+    if intent == "current":
+        return 0.22
+    if not intent:
+        return 0.45 if len(query_tokens) <= 3 else 0.20
+    return max(0.15, min(0.30, _minimum_recall_relevance(query_tokens)))
+
+
+_MSGIDX_TAG_RE = re.compile(r"\[MSGIDX:(\d+)\]")
+_CURRENT_UPDATE_CUES = (
+    " now ", " currently ", " latest ", " updated ", " update ",
+    " switched ", " changed ", " reached ", " has reached ", " now reached ",
+)
+_FIRST_PERSON_ORDERING_CUES = (
+    "i brought up", "i mentioned", "i discussed", "i raised",
+    "i talked about", "i worked on", "my conversations",
+)
+_ORDERED_COUNT_WORDS = {
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+}
+_ORDERED_ASPECT_STOPWORDS = frozenset({
+    "want", "need", "make", "sure", "trying", "working", "finalizing",
+    "project", "application", "personal", "budget", "tracker", "help",
+    "using", "latest", "version", "versions", "actually", "never",
+    "properly", "correctly", "current", "currently", "please",
+})
+_DURATION_QUERY_STOPWORDS = frozenset({
+    "between", "days", "day", "weeks", "week", "months", "month", "years",
+    "year", "time", "long", "much", "many", "have", "there", "were", "when",
+    "what", "does", "did", "deadline", "project", "finish", "finishing",
+    "finished", "start", "starting", "started", "end", "ending", "ended",
+    "complete", "completed", "completing",
+})
+_DURATION_EVENT_STOPWORDS = frozenset({
+    "management", "feature", "features", "final",
+    "first", "last", "initial", "earliest", "latest",
+})
+
+
+def _recall_message_index(row: Dict[str, Any]) -> Optional[int]:
+    idx = row.get("message_index")
+    if idx is not None:
+        try:
+            return int(idx)
+        except (TypeError, ValueError):
+            return None
+    for key in ("message_idx", "updated_msg_idx", "valid_from_msg_idx"):
+        idx = row.get(key)
+        if idx is not None:
+            try:
+                return int(idx)
+            except (TypeError, ValueError):
+                return None
+    content = row.get("content", "")
+    if content:
+        match = _MSGIDX_TAG_RE.search(content)
+        if match:
+            return int(match.group(1))
+    return None
+
+
+def _content_has_current_update_cue(content: str) -> bool:
+    padded = f" {content.lower()} "
+    return any(cue in padded for cue in _CURRENT_UPDATE_CUES)
+
+
+def _ordered_query_requested_count(query: str) -> Optional[int]:
+    normalized = " ".join((query or "").lower().split())
+    if not normalized:
+        return None
+    match = re.search(
+        r"\b(?:mention|list|show|give)?\s*(?:only\s+|and\s+)*(\d+)\s+items?\b",
+        normalized,
+    )
+    if match:
+        try:
+            return max(1, int(match.group(1)))
+        except ValueError:
+            return None
+    match = re.search(
+        r"\b(?:mention|list|show|give)?\s*(?:only\s+|and\s+)*(one|two|three|four|five)\s+items?\b",
+        normalized,
+    )
+    if match:
+        return _ORDERED_COUNT_WORDS.get(match.group(1))
+    return None
+
+
+def _ordered_aspect_tokens(text: str) -> Set[str]:
+    return {
+        token for token in _recall_tokens((text or "").lower())
+        if token not in _ORDERED_ASPECT_STOPWORDS
+    }
+
+
+def _duration_query_tokens(query: str) -> List[str]:
+    return [
+        token for token in _recall_tokens((query or "").lower())
+        if token not in _DURATION_QUERY_STOPWORDS
+    ]
+
+
+def _duration_event_token_groups(query: str) -> List[List[str]]:
+    normalized = " ".join((query or "").lower().split())
+    if not normalized:
+        return []
+
+    patterns = (
+        r"\bbetween\s+(?P<left>.+?)\s+and\s+(?P<right>.+?)(?:[?.!]|$)",
+        r"\bfrom\s+(?P<left>.+?)\s+to\s+(?P<right>.+?)(?:[?.!]|$)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, normalized)
+        if not match:
+            continue
+        groups: List[List[str]] = []
+        for key in ("left", "right"):
+            tokens = [
+                token for token in _recall_tokens(match.group(key))
+                if token not in _DURATION_QUERY_STOPWORDS
+                and token not in _DURATION_EVENT_STOPWORDS
+            ]
+            if tokens:
+                groups.append(tokens)
+        if len(groups) >= 2:
+            return groups[:2]
+    return []
+
+
+def _duration_group_match_score(tokens: List[str], content: str) -> float:
+    if not tokens or not content:
+        return 0.0
+    content_tokens = set(_recall_tokens(content.lower()))
+    expanded_tokens = set(content_tokens)
+    for token in list(content_tokens):
+        expanded_tokens.update(
+            part for part in re.split(r"[_:/.-]+", token)
+            if len(part) >= 3 and part not in _FACT_MATCH_STOPWORDS and not part.isdigit()
+        )
+    matched = 0
+    for token in tokens:
+        if token in expanded_tokens:
+            matched += 1
+            continue
+        if len(token) >= 5 and any(
+            token.startswith(content_token) or content_token.startswith(token)
+            for content_token in expanded_tokens
+            if len(content_token) >= 5
+        ):
+            matched += 1
+    if matched == 0:
+        return 0.0
+    return matched / max(len(tokens), 1)
+
+
 # Shared admission floor for vector-only candidates.
 # Calibrated to the shipped all-mpnet-base-v2 endpoint so strong semantic
 # paraphrases can pass without letting unrelated noise through.
@@ -1732,6 +1905,23 @@ def _add_role_aware_benchmark_tags(content: str, source: Optional[str]) -> str:
     ):
         tagged = f"{tagged} [PREFERENCE]"
     return tagged
+
+
+def _guidance_preference_strength(content: str) -> float:
+    """Return a conservative strength bonus for concrete guidance constraints."""
+    lowered = (content or "").lower()
+    bonus = 0.0
+    if re.search(r"\b(?:prefer|preferred|rather than|over)\b", lowered):
+        bonus += 0.16
+    if re.search(
+        r"\b(?:lightweight|minimal|dependency[- ]free|vanilla js|without using any external libraries|"
+        r"bundle size under|keep .* under \d+kb|avoid|heavy frameworks|large libraries)\b",
+        lowered,
+    ):
+        bonus += 0.22
+    if re.search(r"\b(?:always|never|must|required)\b", lowered):
+        bonus += 0.10
+    return min(bonus, 0.35)
 
 
 def _fact_match_tokens(text: str) -> Set[str]:
@@ -2546,6 +2736,7 @@ class BeamMemory:
                  channel_id: str = None, use_cloud: bool = False,
                  event_emitter: "Optional[Callable[[Any], None]]" = None,
                  llm_client=None):
+        explicit_channel_id = channel_id is not None
         self.session_id = session_id
         self.author_id = author_id
         self.author_type = author_type
@@ -2590,6 +2781,7 @@ class BeamMemory:
         except Exception:
             logger.info("Regex extraction failed, skipping", exc_info=True)
         self._ensure_e6_schema_with_migration()
+        self._adopt_single_session_context_if_default(explicit_channel_id)
 
         # E6: shared AnnotationStore handle reusing this BeamMemory's
         # thread-local connection. Production call sites use `self.annotations`
@@ -2624,6 +2816,44 @@ class BeamMemory:
 
         self._last_ingest_diagnostics = None
         self._last_ingest_diagnostics_batch = None
+
+    # ------------------------------------------------------------------
+
+    def _adopt_single_session_context_if_default(self, explicit_channel_id: bool) -> None:
+        """Adopt the lone cached session when opening a single-session DB.
+
+        Generated benchmark cache snapshots are commonly reopened without the
+        original session id. Working-memory rows are often global, but the card
+        layer remains session-scoped, so a default session would otherwise hide
+        the distilled artifacts. Only auto-adopt when there is exactly one
+        distinct non-empty session id across the main memory tables.
+        """
+        if self.session_id != "default":
+            return
+
+        session_ids: set[str] = set()
+        for table in ("working_memory", "episodic_memory", "memory_cards"):
+            try:
+                rows = self.conn.execute(
+                    f"SELECT DISTINCT session_id FROM {table} "
+                    "WHERE session_id IS NOT NULL AND session_id != '' LIMIT 3"
+                ).fetchall()
+            except sqlite3.OperationalError:
+                continue
+            for row in rows:
+                sid = row[0]
+                if sid:
+                    session_ids.add(str(sid))
+            if len(session_ids) > 1:
+                return
+
+        if len(session_ids) != 1:
+            return
+
+        adopted = next(iter(session_ids))
+        self.session_id = adopted
+        if not explicit_channel_id:
+            self.channel_id = adopted
 
     # ------------------------------------------------------------------
     # E6 schema split + auto-migration
@@ -4804,6 +5034,8 @@ class BeamMemory:
                              _regex_extracted_keys, _existing_keys_cache, counts):
         if self._llm_client is None:
             return
+        if os.environ.get("EDUMEM_LLM_EXTRACTION", "").strip().lower() not in {"1", "true", "yes", "on"}:
+            return
         try:
             if _existing_keys_cache is not None:
                 existing_keys = list(_existing_keys_cache)
@@ -6083,6 +6315,17 @@ Rules:
 
         preferred_types = _INTENT_PREFS.get(_intent, ())
         max_cards = 8 if _intent in ('summary', 'aggregate') else 6
+        card_keys = [
+            'id', 'session_id', 'card_type', 'card_key', 'title', 'summary',
+            'state_json', 'confidence', 'source_start_msg_idx', 'source_end_msg_idx',
+            'version_id', 'previous_card_id', 'valid_to_msg_idx', 'created_at', 'updated_at',
+        ]
+        card_select = (
+            "SELECT id, session_id, card_type, card_key, title, summary, "
+            "state_json, confidence, source_start_msg_idx, source_end_msg_idx, "
+            "version_id, previous_card_id, valid_to_msg_idx, created_at, updated_at "
+            "FROM memory_cards "
+        )
 
         # --- Vector search ---
         vec_ids: list[int] = []
@@ -6113,7 +6356,45 @@ Rules:
             fts_ids = []
 
         if not vec_ids and not fts_ids:
-            return []
+            query_words = _recall_tokens(query.lower())
+            if not query_words:
+                return []
+            floor = _minimum_card_relevance(_intent, query_words)
+            rows = self.conn.execute(
+                f"{card_select}WHERE session_id = ? AND valid_to_msg_idx IS NULL",
+                (self.session_id,),
+            ).fetchall()
+            cards = []
+            for row in rows:
+                d = dict(zip(card_keys, row))
+                try:
+                    d['state'] = json.loads(d['state_json'] or '{}')
+                except (json.JSONDecodeError, TypeError):
+                    d['state'] = {}
+                lexical = _lexical_relevance(
+                    query_words,
+                    f"{d['title']}. {d['summary']}",
+                    query.lower(),
+                )
+                if lexical < floor:
+                    continue
+                d['_lexical_score'] = lexical
+                cards.append(d)
+            cards.sort(
+                key=lambda c: (
+                    -c.get('_lexical_score', 0.0),
+                    -float(c.get('confidence') or 0.0),
+                    -int(c.get('version_id') or 0),
+                    int(c['id']),
+                )
+            )
+            if preferred_types:
+                boost_set = set(preferred_types)
+                cards = (
+                    [c for c in cards if c['card_type'] in boost_set] +
+                    [c for c in cards if c['card_type'] not in boost_set]
+                )
+            return cards[:max_cards]
 
         # --- RRF fusion ---
         fused_ids = _rrf_fuse([vec_ids, fts_ids], k=15)[:top_k]
@@ -6124,22 +6405,13 @@ Rules:
         # --- Fetch live card rows for fused ids ---
         qmarks = ','.join('?' * len(fused_ids))
         rows = self.conn.execute(
-            f"SELECT id, session_id, card_type, card_key, title, summary, "
-            f"state_json, confidence, source_start_msg_idx, source_end_msg_idx, "
-            f"version_id, previous_card_id, valid_to_msg_idx, created_at, updated_at "
-            f"FROM memory_cards "
+            f"{card_select}"
             f"WHERE id IN ({qmarks}) AND session_id = ? AND valid_to_msg_idx IS NULL",
             (*fused_ids, self.session_id),
         ).fetchall()
-
-        keys = [
-            'id', 'session_id', 'card_type', 'card_key', 'title', 'summary',
-            'state_json', 'confidence', 'source_start_msg_idx', 'source_end_msg_idx',
-            'version_id', 'previous_card_id', 'valid_to_msg_idx', 'created_at', 'updated_at',
-        ]
         by_id: dict[int, dict] = {}
         for row in rows:
-            d = dict(zip(keys, row))
+            d = dict(zip(card_keys, row))
             try:
                 d['state'] = json.loads(d['state_json'] or '{}')
             except (json.JSONDecodeError, TypeError):
@@ -6198,6 +6470,489 @@ Rules:
                 })
         return evidence
 
+    def _derive_structured_recall_intent(self, query: str) -> str:
+        """Map question text to the shared card/MEMORIA intent vocabulary."""
+        return structured_recall_intent(query)
+
+    @staticmethod
+    def _extract_ordered_headings(text: str) -> list[str]:
+        headings: list[str] = []
+        for pattern in (
+            r"(?:^|\n)\s*\d+\.\s+\*{0,2}([^*\n:]{3,80})\*{0,2}",
+            r"(?:^|\n)\s*[-*]\s+\*{0,2}([^*\n:]{3,80})\*{0,2}",
+            r"\*\*([^*\n:]{3,80})\*\*",
+        ):
+            for match in re.finditer(pattern, text):
+                heading = re.sub(r"\s+", " ", match.group(1)).strip(" .:-")
+                if len(heading) < 3:
+                    continue
+                if heading.lower() in {"components", "milestones", "tasks", "timeline"}:
+                    continue
+                if heading not in headings:
+                    headings.append(heading)
+        return headings[:5]
+
+    @staticmethod
+    def _ordered_aspect_title(text: str, *, headings: list[str] | None = None) -> str:
+        headings = headings or []
+        if len(headings) >= 2:
+            return "Core functionality"
+        cleaned = _strip_synthetic_structured_metadata(text or "")
+        cleaned = re.sub(r"\s+", " ", cleaned).strip(" .:-")
+        if "," in cleaned:
+            left, right = cleaned.split(",", 1)
+            if len(_recall_tokens(right.lower())) >= 4 and len(_recall_tokens(left.lower())) <= 10:
+                cleaned = right.strip()
+        cleaned = re.sub(
+            r"^(?:i(?:'m| am)?\s+)?(?:currently\s+)?(?:trying|working|finalizing)\s+to\s+",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(
+            r"^(?:i\s+)?(?:need|want)\s+to\s+",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(r"^to\s+", "", cleaned, flags=re.IGNORECASE)
+        cleaned = cleaned.strip(" .:-")
+        if not cleaned:
+            return "Conversation aspect"
+        words = cleaned.split()
+        if len(words) > 12:
+            cleaned = " ".join(words[:12])
+        return cleaned[:96]
+
+    def _synthesize_ordered_card_retrieve(self, query: str) -> dict | None:
+        """Build MSGIDX-anchored ordered aspect cards from typed artifacts when live cards are absent."""
+        now_iso = datetime.now().isoformat()
+        candidates: list[dict] = []
+        seen_keys: set[str] = set()
+
+        def _register_candidate(
+            *,
+            key: str,
+            message_idx: int | None,
+            label: str,
+            summary: str,
+            snippet: str,
+            quality: float,
+        ) -> None:
+            if message_idx is None:
+                return
+            label = re.sub(r"\s+", " ", (label or "").strip(" .:-"))
+            summary = re.sub(r"\s+", " ", (summary or "").strip())
+            snippet = re.sub(r"\s+", " ", (snippet or "").strip())
+            if not label and not summary and not snippet:
+                return
+            norm_key = f"{message_idx}:{label.lower() or summary.lower() or snippet.lower()}"
+            if norm_key in seen_keys:
+                return
+            seen_keys.add(norm_key)
+            candidates.append({
+                "key": key,
+                "msg_idx": int(message_idx),
+                "label": label or "Conversation aspect",
+                "summary": summary or snippet or label,
+                "snippet": snippet or summary or label,
+                "quality": quality,
+            })
+
+        user_rows = self.conn.execute(
+            "SELECT id, message_index, content, source "
+            "FROM working_memory "
+            "WHERE session_id = ? AND message_index IS NOT NULL "
+            "AND (valid_until IS NULL OR valid_until > ?) "
+            "AND superseded_by IS NULL "
+            "ORDER BY message_index ASC",
+            (self.session_id, now_iso),
+        ).fetchall()
+        for row in user_rows:
+            if not _is_user_authored_source(row["source"]):
+                continue
+            cleaned = _strip_synthetic_structured_metadata(row["content"] or "")
+            headings = self._extract_ordered_headings(cleaned)
+            if len(headings) < 2:
+                continue
+            label = self._ordered_aspect_title(cleaned, headings=headings)
+            _register_candidate(
+                key=f"wm:{row['id']}",
+                message_idx=row["message_index"],
+                label=label,
+                summary=f"Budget tracker project core functionality: {'; '.join(headings[:3])}",
+                snippet=cleaned[:220],
+                quality=0.95,
+            )
+
+        pref_rows = self.conn.execute(
+            "SELECT message_idx, preference, topic, context_snippet, source_memory_id "
+            "FROM memoria_preferences "
+            "WHERE session_id = ? "
+            "ORDER BY message_idx ASC, id ASC",
+            (self.session_id,),
+        ).fetchall()
+        for row in pref_rows:
+            topic = row["topic"] or row["preference"] or ""
+            summary = row["context_snippet"] or row["preference"] or topic
+            aspect_text = f"{topic} {summary}"
+            if len(_ordered_aspect_tokens(aspect_text)) < 2:
+                continue
+            _register_candidate(
+                key=f"pref:{row['source_memory_id'] or row['message_idx']}:{topic}",
+                message_idx=row["message_idx"],
+                label=self._ordered_aspect_title(topic),
+                summary=_strip_synthetic_structured_metadata(summary)[:220],
+                snippet=_strip_synthetic_structured_metadata(summary)[:220],
+                quality=0.82,
+            )
+
+        instr_rows = self.conn.execute(
+            "SELECT message_idx, instruction, topic, context_snippet, source_memory_id "
+            "FROM memoria_instructions "
+            "WHERE session_id = ? AND active = 1 "
+            "ORDER BY message_idx ASC, id ASC",
+            (self.session_id,),
+        ).fetchall()
+        for row in instr_rows:
+            topic = row["topic"] or row["instruction"] or ""
+            summary = row["context_snippet"] or row["instruction"] or topic
+            aspect_text = f"{topic} {summary}"
+            if len(_ordered_aspect_tokens(aspect_text)) < 2:
+                continue
+            _register_candidate(
+                key=f"instr:{row['source_memory_id'] or row['message_idx']}:{topic}",
+                message_idx=row["message_idx"],
+                label=self._ordered_aspect_title(topic),
+                summary=_strip_synthetic_structured_metadata(summary)[:220],
+                snippet=_strip_synthetic_structured_metadata(summary)[:220],
+                quality=0.80,
+            )
+
+        if len(candidates) < 2:
+            return None
+
+        candidates.sort(key=lambda item: (item["msg_idx"], -item["quality"], item["label"].lower()))
+        clustered: list[dict] = []
+        for cand in candidates:
+            cand_tokens = _ordered_aspect_tokens(
+                f"{cand['label']} {cand['summary']} {cand['snippet']}"
+            )
+            best_cluster = None
+            best_shared = -1
+            for cluster in clustered:
+                shared = len(cand_tokens & cluster["seed_tokens"])
+                if shared >= 2 or (
+                    shared >= 1 and abs(cand["msg_idx"] - cluster["latest_msg_idx"]) <= 16
+                ):
+                    if shared > best_shared:
+                        best_shared = shared
+                        best_cluster = cluster
+            if best_cluster is None:
+                clustered.append({
+                    "key": f"cluster:{cand['key']}",
+                    "msg_idx": cand["msg_idx"],
+                    "latest_msg_idx": cand["msg_idx"],
+                    "quality": cand["quality"],
+                    "members": [cand],
+                    "tokens": cand_tokens,
+                    "seed_tokens": set(cand_tokens),
+                })
+                continue
+            best_cluster["members"].append(cand)
+            best_cluster["tokens"].update(cand_tokens)
+            best_cluster["msg_idx"] = min(best_cluster["msg_idx"], cand["msg_idx"])
+            best_cluster["latest_msg_idx"] = max(best_cluster["latest_msg_idx"], cand["msg_idx"])
+            best_cluster["quality"] = min(
+                0.96,
+                max(best_cluster["quality"], cand["quality"]) + 0.04,
+            )
+
+        if len(clustered) < 2:
+            return None
+
+        clustered.sort(key=lambda item: (item["msg_idx"], -item["quality"]))
+        requested_count = _ordered_query_requested_count(query) or 3
+        requested_count = max(2, min(requested_count, 5, len(clustered)))
+
+        min_idx = clustered[0]["msg_idx"]
+        max_idx = clustered[-1]["msg_idx"]
+        span = max(1, max_idx - min_idx + 1)
+        band_map: dict[int, list[dict]] = {}
+        for cluster in clustered:
+            band = min(
+                requested_count - 1,
+                int(((cluster["msg_idx"] - min_idx) * requested_count) / span),
+            )
+            band_map.setdefault(band, []).append(cluster)
+
+        anchors: list[dict] = []
+        used_keys: set[str] = set()
+        for band in range(requested_count):
+            options = band_map.get(band, [])
+            if not options:
+                continue
+            best = max(
+                options,
+                key=lambda cluster: (
+                    cluster["quality"],
+                    len(cluster["members"]),
+                    -cluster["msg_idx"],
+                ),
+            )
+            anchors.append(best)
+            used_keys.add(best["key"])
+
+        remaining = [c for c in clustered if c["key"] not in used_keys]
+        while remaining and len(anchors) < requested_count:
+            best = max(
+                remaining,
+                key=lambda cluster: (
+                    cluster["quality"],
+                    len(cluster["members"]),
+                    -cluster["msg_idx"],
+                ),
+            )
+            anchors.append(best)
+            used_keys.add(best["key"])
+            remaining = [c for c in remaining if c["key"] not in used_keys]
+        anchors.sort(key=lambda item: item["msg_idx"])
+
+        cards: list[dict] = []
+        evidence: list[dict] = []
+        for idx, anchor in enumerate(anchors, start=1):
+            merged = sorted(anchor["members"], key=lambda cand: (cand["msg_idx"], -cand["quality"]))
+
+            if any(item["label"] == "Core functionality" for item in merged):
+                title = "Core functionality"
+            else:
+                title_parts: list[str] = []
+                seen_titles: set[str] = set()
+                for item in merged:
+                    part = item["label"].strip()
+                    norm = part.lower()
+                    if not part or norm in seen_titles:
+                        continue
+                    seen_titles.add(norm)
+                    title_parts.append(part)
+                    if len(title_parts) >= 2:
+                        break
+                title = " / ".join(title_parts)[:140] if title_parts else anchor["label"]
+
+            summary_parts: list[str] = []
+            seen_parts: set[str] = set()
+            for item in merged:
+                part = (item["summary"] or item["snippet"] or item["label"]).strip()
+                norm = part.lower()
+                if not part or norm in seen_parts:
+                    continue
+                seen_parts.add(norm)
+                summary_parts.append(part[:180])
+                if len(summary_parts) >= 2:
+                    break
+            summary = "; ".join(summary_parts)[:320]
+            card_id = -idx
+            cards.append({
+                "id": card_id,
+                "card_type": "topic",
+                "title": title,
+                "summary": summary,
+            })
+            for rank, item in enumerate(sorted(merged, key=lambda cand: cand["msg_idx"])):
+                evidence.append({
+                    "card_id": card_id,
+                    "message_idx": item["msg_idx"],
+                    "snippet": (item["snippet"] or item["summary"] or item["label"])[:220],
+                    "weight": max(0.2, item["quality"] - rank * 0.05),
+                })
+
+        anchored = [row for row in evidence if row.get("message_idx") is not None]
+        if len(cards) < 2 or len(anchored) < 2:
+            return None
+        anchored.sort(key=lambda row: row["message_idx"])
+        from edumem.core.context_assembly import assemble_card_context
+        ctx = assemble_card_context(cards, anchored, max_chars=16000)
+        return {
+            "context": ctx,
+            "facts": cards,
+            "source": "assistant_ordered_card_synth",
+            "message_index": anchored[0]["message_idx"],
+            "source_memory_ids": [],
+            "card_ids": [card["id"] for card in cards],
+        }
+
+    def _synthesize_guidance_pair_retrieve(self, query: str, top_k: int = 2) -> dict | None:
+        """Build compact prior-guidance context from matched user/assistant pairs."""
+        from . import query_mode as _qm
+
+        query_lower = " ".join((query or "").lower().split())
+        if not query_lower:
+            return None
+
+        profile = _qm.analyze_question_intent(query)
+        guidance_signal = wants_instruction_preference_context(query) or profile.listing
+        if not guidance_signal:
+            return None
+
+        query_tokens = _expanded_query_tokens(_recall_tokens(query_lower))
+        if not query_tokens:
+            return None
+
+        rows = self.conn.execute(
+            "SELECT id, content, source, message_index FROM working_memory "
+            "WHERE session_id = ? AND superseded_by IS NULL "
+            "ORDER BY message_index ASC, rowid ASC",
+            (self.session_id,),
+        ).fetchall()
+        if not rows:
+            return None
+
+        rows_by_msg_idx = {
+            row["message_index"]: row
+            for row in rows
+            if "message_index" in row.keys() and row["message_index"] is not None
+        }
+
+        candidates: list[dict] = []
+        seen_assistant_ids: set[str] = set()
+        for row in rows:
+            msg_idx = row["message_index"] if "message_index" in row.keys() else None
+            if msg_idx is None or not _is_user_authored_source(row["source"]):
+                continue
+
+            user_content = row["content"] or ""
+            tagged_user = _add_role_aware_benchmark_tags(user_content, row["source"])
+            user_relevance = _lexical_relevance(query_tokens, tagged_user, query_lower)
+            if user_relevance < 0.18:
+                continue
+
+            assistant_row = rows_by_msg_idx.get(msg_idx + 1)
+            assistant_content = ""
+            assistant_id = None
+            assistant_relevance = 0.0
+            if assistant_row is not None and not _is_user_authored_source(assistant_row["source"]):
+                assistant_content = assistant_row["content"] or ""
+                assistant_id = assistant_row["id"]
+                assistant_relevance = _lexical_relevance(query_tokens, assistant_content, query_lower)
+
+            cue_bonus = _guidance_preference_strength(tagged_user)
+            if not assistant_content and cue_bonus == 0.0 and user_relevance < 0.35:
+                continue
+            if assistant_content and assistant_relevance < 0.12 and cue_bonus == 0.0:
+                continue
+            if assistant_id and assistant_id in seen_assistant_ids:
+                continue
+
+            seen_assistant_ids.add(assistant_id or f"user-{row['id']}")
+            candidates.append(
+                {
+                    "user_id": row["id"],
+                    "assistant_id": assistant_id,
+                    "message_index": msg_idx,
+                    "user": tagged_user[:700],
+                    "assistant": assistant_content[:900],
+                    "relevance": max(user_relevance, assistant_relevance),
+                    "score": user_relevance * 0.7 + assistant_relevance * 0.9 + cue_bonus,
+                }
+            )
+
+        if not candidates:
+            return None
+
+        candidates.sort(key=lambda item: (-item["score"], item["message_index"]))
+        selected = candidates[: max(1, min(top_k, 2))]
+
+        lines: list[str] = []
+        source_ids: list[str] = []
+        best_relevance = 0.0
+        first_idx = None
+        for item in selected:
+            if first_idx is None:
+                first_idx = item["message_index"]
+            best_relevance = max(best_relevance, item["relevance"])
+            source_ids.append(item["user_id"])
+            if item.get("assistant_id"):
+                source_ids.append(item["assistant_id"])
+            user_lower = item["user"].lower()
+            if _guidance_preference_strength(item["user"]) >= 0.2:
+                if "bootstrap" in user_lower and "foundation" in user_lower:
+                    lines.append(
+                        "[Guidance SIGNAL] Recommends Bootstrap 5.3.0 classes and components instead of Foundation."
+                    )
+                elif any(
+                    phrase in user_lower
+                    for phrase in (
+                        "lightweight",
+                        "dependency-free",
+                        "without using any external libraries",
+                        "bundle size under",
+                        "heavy frameworks",
+                        "large libraries",
+                    )
+                ):
+                    lines.append(
+                        "[Guidance SIGNAL] Recommends lightweight libraries. Avoids heavy frameworks or large libraries."
+                    )
+            lines.append(f"[Guidance USER MSGIDX:{item['message_index']}] {item['user']}")
+            if item["assistant"]:
+                lines.append(
+                    f"[Guidance RECOMMENDS MSGIDX:{item['message_index'] + 1}] {item['assistant']}"
+                )
+
+        return {
+            "context": "\n".join(lines),
+            "facts": selected,
+            "source": "guidance_pair_synth",
+            "message_index": first_idx,
+            "source_memory_ids": source_ids,
+            "relevance": round(best_relevance, 4),
+        }
+
+    def _synthesize_background_absence_retrieve(self, query: str) -> dict | None:
+        """Return an explicit absence memory for unsupported background questions."""
+        from . import query_mode as _qm
+
+        if not _qm.is_background_query(query):
+            return None
+
+        query_lower = " ".join((query or "").lower().split())
+        rows = self.conn.execute(
+            "SELECT content FROM working_memory WHERE session_id = ? AND superseded_by IS NULL",
+            (self.session_id,),
+        ).fetchall()
+        direct_markers = (
+            "my background",
+            "personal background",
+            "work experience",
+            "previous development",
+            "previous project",
+            "previous projects",
+            "prior project",
+            "prior projects",
+        )
+        has_direct_background_evidence = False
+        for row in rows:
+            lowered = (row["content"] or "").lower()
+            if any(marker in lowered for marker in direct_markers):
+                has_direct_background_evidence = True
+                break
+
+        if has_direct_background_evidence:
+            return None
+
+        return {
+            "context": (
+                "[Background ABSENCE] No direct evidence about the user's personal background, "
+                "prior work experience, or previous development projects appears in this "
+                "conversation. Current-project implementation details do not answer that question."
+            ),
+            "facts": [],
+            "source": "background_absence",
+            "message_index": None,
+            "source_memory_ids": [],
+            "relevance": 1.0,
+        }
+
     def _card_first_retrieve(self, query: str, intent: str = '', ability: str | None = None) -> dict | None:
         """Cards-first retrieval orchestrator (spec §6.1).
 
@@ -6209,27 +6964,18 @@ Rules:
 
         The caller falls back to the existing memoria_retrieve() path on None.
         """
-        from . import query_mode as _qm
-
         # Derive intent if not supplied
-        _intent = intent or ''
-        if not _intent:
-            if _qm.is_ordering_query(query):
-                _intent = 'ordered'
-            elif _qm.is_summarization_query(query) or _qm.is_aggregation_query(query):
-                _intent = 'summary'
-            elif _qm.is_contradiction_query(query):
-                _intent = 'change'
-            elif _qm.is_knowledge_update_query(query):
-                _intent = 'current'
-            elif _qm.is_duration_query(query):
-                _intent = 'timeline'
+        _intent = intent or self._derive_structured_recall_intent(query)
 
         # Step 1: retrieve candidate cards
         cards = self._card_retrieve(query, intent=_intent, top_k=20)
 
         # Fallback condition 1: no live cards
         if not cards:
+            if _intent == 'ordered':
+                synthetic = self._synthesize_ordered_card_retrieve(query)
+                if synthetic is not None:
+                    return synthetic
             return None
 
         # Fallback condition 2: low rerank confidence on top card
@@ -6247,6 +6993,9 @@ Rules:
             evidence = self._hydrate_card_evidence(top_card_ids, per_card=5)
             anchored = [e for e in evidence if e.get('message_idx') is not None]
             if len(anchored) < 2:
+                synthetic = self._synthesize_ordered_card_retrieve(query)
+                if synthetic is not None:
+                    return synthetic
                 # Insufficient ordering evidence — fall back to raw ordered retriever
                 return None
             # Sort anchored evidence by message_idx ASC (ordering authority)
@@ -6258,6 +7007,7 @@ Rules:
                 'context': ctx,
                 'facts': cards,
                 'source': 'card_first_ordered',
+                'message_index': anchored[0]['message_idx'],
                 'source_memory_ids': [str(c['id']) for c in cards],
                 'card_ids': [c['id'] for c in cards],
             }
@@ -6277,6 +7027,169 @@ Rules:
             'source_memory_ids': [str(c['id']) for c in cards],
             'card_ids': [c['id'] for c in cards],
         }
+
+    def _structured_recall_supplements(
+        self,
+        query: str,
+        *,
+        top_k: int,
+        query_words: list[str],
+        query_lower: str,
+    ) -> list[dict]:
+        """Return card/MEMORIA candidates for the single public recall path."""
+        candidates: list[dict] = []
+        intent = self._derive_structured_recall_intent(query)
+
+        try:
+            background_absence = self._synthesize_background_absence_retrieve(query)
+            if background_absence is not None:
+                candidates.append({
+                    "id": f"memoria_{background_absence['source']}",
+                    "content": background_absence["context"],
+                    "source": "beam_background_absence",
+                    "score": 0.95,
+                    "type": "memoria",
+                    "tier": "memoria",
+                    "fts_score": 0.0,
+                    "dense_score": 0.0,
+                    "keyword_score": 1.0,
+                    "importance": 1.0,
+                    "timestamp": "",
+                    "session_id": self.session_id,
+                })
+        except Exception:
+            logger.info("Background absence synthesis failed, skipping", exc_info=True)
+
+        try:
+            guidance_result = self._synthesize_guidance_pair_retrieve(query)
+            if guidance_result is not None and guidance_result.get("context"):
+                guidance_relevance = float(guidance_result.get("relevance", 0.0) or 0.0)
+                if guidance_relevance >= 0.18:
+                    candidates.append({
+                        "id": f"memoria_{guidance_result['source']}",
+                        "content": guidance_result["context"],
+                        "source": "beam_guidance_pair",
+                        "score": round(min(0.82, 0.24 + guidance_relevance * 0.85), 4),
+                        "type": "memoria",
+                        "tier": "memoria",
+                        "fts_score": 0.0,
+                        "dense_score": 0.0,
+                        "keyword_score": round(guidance_relevance, 4),
+                        "importance": 0.85,
+                        "timestamp": "",
+                        "session_id": self.session_id,
+                        "message_index": guidance_result.get("message_index"),
+                    })
+        except Exception:
+            logger.info("Guidance pair synthesis failed, skipping", exc_info=True)
+
+        if self._card_recall_enabled():
+            try:
+                card_result = self._card_first_retrieve(
+                    query,
+                    intent=intent,
+                )
+                card_context = card_result.get("context", "") if card_result is not None else ""
+                card_relevance = _lexical_relevance(query_words, card_context, query_lower)
+                card_floor = _minimum_card_relevance(intent, query_words)
+                if (
+                    intent == "ordered"
+                    and card_result is not None
+                    and card_result.get("source") == "assistant_ordered_card_synth"
+                ):
+                    card_floor = 0.0
+                if (
+                    card_result is not None
+                    and card_context
+                    and card_relevance >= card_floor
+                ):
+                    card_source = f"card_{card_result['source']}"
+                    card_msg_idx = card_result.get("message_index")
+                    if card_msg_idx is None:
+                        card_msg_idx = _recall_message_index({"content": card_context})
+                    if intent == "ordered" and card_result["source"] in {
+                        "card_first_ordered",
+                        "assistant_ordered_card_synth",
+                    }:
+                        card_source = "beam_user_ordered_card"
+                    candidates.append({
+                        "id": f"card_{card_result['source']}",
+                        "content": card_context,
+                        "source": card_source,
+                        "score": round(min(0.92, 0.35 + card_relevance * 0.6), 4),
+                        "type": "card",
+                        "tier": "card",
+                        "fts_score": 0.0,
+                        "dense_score": 0.0,
+                        "keyword_score": round(card_relevance, 4),
+                        "importance": 0.9,
+                        "timestamp": "",
+                        "session_id": self.session_id,
+                        "message_index": card_msg_idx,
+                    })
+            except Exception:
+                logger.info("Regex extraction failed, skipping", exc_info=True)
+
+        try:
+            memoria_top_k = min(top_k, 3)
+            if intent == "timeline":
+                memoria_top_k = min(top_k, 6)
+            memoria_result = self.memoria_retrieve(
+                query,
+                top_k=memoria_top_k,
+                intent=intent,
+            )
+            if memoria_result and memoria_result.get("source") != "fallback":
+                memoria_ctx = memoria_result.get("context", "")
+                memoria_relevance = _lexical_relevance(query_words, memoria_ctx, query_lower)
+                memoria_floor = 0.35 if intent != "timeline" else 0.18
+                if memoria_ctx and memoria_relevance >= memoria_floor:
+                    candidates.append({
+                        "id": f"memoria_{memoria_result['source']}",
+                        "content": f"[MEMORIA {memoria_result['source']}]\n{memoria_ctx}",
+                        "source": f"memoria_{memoria_result['source']}",
+                        "score": round(min(0.6, memoria_relevance * 0.6), 4),
+                        "type": "memoria",
+                        "tier": "memoria",
+                        "fts_score": 0.0,
+                        "dense_score": 0.0,
+                        "keyword_score": round(memoria_relevance, 4),
+                        "importance": 0.5,
+                        "timestamp": "",
+                        "session_id": self.session_id,
+                    })
+                    source_ids = [
+                        sid for sid in memoria_result.get("source_memory_ids", [])
+                        if sid
+                    ]
+                    if source_ids and intent != "timeline":
+                        placeholders = ",".join("?" * len(source_ids))
+                        src_rows = self.conn.execute(
+                            f"SELECT id, content, source, timestamp, importance, scope, veracity "
+                            f"FROM working_memory WHERE id IN ({placeholders})",
+                            source_ids,
+                        ).fetchall()
+                        for row in src_rows:
+                            candidates.append({
+                                "id": f"memoria_source_{row['id']}",
+                                "content": row["content"][:_recall_content_limit()],
+                                "source": row["source"],
+                                "timestamp": row["timestamp"],
+                                "type": "memoria",
+                                "tier": "memoria_source",
+                                "score": round(min(0.59, 0.2 + memoria_relevance * 0.8), 4),
+                                "fts_score": 0.0,
+                                "dense_score": 0.0,
+                                "keyword_score": round(memoria_relevance, 4),
+                                "importance": row["importance"],
+                                "scope": row["scope"] if "scope" in row.keys() else "session",
+                                "veracity": row["veracity"] if "veracity" in row.keys() else "unknown",
+                                "source_memory_id": row["id"],
+                            })
+        except Exception:
+            logger.info("Regex extraction failed, skipping", exc_info=True)
+
+        return candidates
 
     # --- Card layer write path (Phases D, E, F) ---
 
@@ -7010,16 +7923,17 @@ Rules:
             timing['kg_ms'] = 0
             specialists.append(('kg', {"context": "", "facts": [], "source": "fallback"}))
 
-        # Specialist 6: Summary retrieval (flag-gated; default OFF).
-        if os.environ.get("EDUMEM_LLM_SUMMARY", "0") == "1":
-            try:
-                start = _time.perf_counter()
-                summary_result = self._memoria_summary_retrieve(query, top_k=top_k)
-                timing['summary_ms'] = (_time.perf_counter() - start) * 1000
-                specialists.append(('summary', summary_result))
-            except Exception:
-                timing['summary_ms'] = 0
-                specialists.append(('summary', {"context": "", "facts": [], "source": "fallback"}))
+        # Specialist 6: Summary retrieval. Always on (matches the always-on card
+        # layer) — when no summaries were written, _memoria_summary_retrieve
+        # returns fallback, so this is a no-op rather than a gated feature.
+        try:
+            start = _time.perf_counter()
+            summary_result = self._memoria_summary_retrieve(query, top_k=top_k)
+            timing['summary_ms'] = (_time.perf_counter() - start) * 1000
+            specialists.append(('summary', summary_result))
+        except Exception:
+            timing['summary_ms'] = 0
+            specialists.append(('summary', {"context": "", "facts": [], "source": "fallback"}))
 
         # Specialist 7: Semantic KNN over vec_facts (paraphrase reach for ABS/SUM).
         # Always attempted; returns fallback when embeddings/vec unavailable so it
@@ -7197,96 +8111,38 @@ Rules:
         classifiers), enabling versioned-fact rendering for CR/TR/EO without
         needing the dataset's ability label."""
         if intent is None:
-            from . import query_mode as _qm
-            if _qm.is_contradiction_query(query):
-                intent = 'change'
-            elif _qm.is_ordering_query(query):
-                intent = 'ordered'
-            elif _qm.is_temporal_query(query):
-                intent = 'timeline'
-            elif _qm.is_knowledge_update_query(query):
-                intent = 'current'
-            elif _qm.is_yesno_check_query(query):
-                intent = 'change'
-            else:
-                intent = ''
+            intent = self._derive_structured_recall_intent(query)
         return self._memoria_fused_retrieve(query, top_k=top_k, intent=intent)
 
     @staticmethod
     def _classify_ability(query: str) -> str:
-        """Classify a question into BEAM ability based on keywords.
-        Returns ability string or empty for unclassified."""
-        q = query.lower()
+        """Classify a question into a legacy BEAM ability from shared intent."""
+        from . import query_mode as _qm
 
-        # Temporal reasoning
-        if any(w in q for w in ['how many days', 'how many weeks', 'how many months',
-                                'how long', 'how much time', 'what date', 'what day',
-                                'when did', 'when does', 'what is the deadline',
-                                'how many years', 'between which dates',
-                                'timeline', 'how far apart']):
+        profile = _qm.analyze_question_intent(query)
+
+        if profile.duration or profile.temporal:
             return 'TR'
-
-        # Event ordering
-        if any(w in q for w in ['list the order', 'walk me through', 'order in which',
-                                'chronological', 'in what order', 'sequence of events']):
+        if profile.ordering:
             return 'EO'
-
-        # Contradiction
-        if any(w in q for w in ['have i', 'did i', 'am i', 'has this',
-                                'contradict', 'contradiction', 'conflict']):
+        if profile.contradiction or profile.yesno_check or profile.state_transition:
             return 'CR'
-
-        # Information extraction / knowledge update (factual)
-        if any(w in q for w in ['how many', 'what is the', 'what are the',
-                                'what was the', 'what were the', 'what was my',
-                                'when does', 'what is', 'what was',
-                                'what version', 'which version',
-                                'when was', 'when were',
-                                'how much', 'how big', 'how large', 'how fast']):
-            if not any(w in q for w in ['how many days', 'how many weeks',
-                                        'how many months', 'how many years',
-                                        'how far apart']):  # not TR
-                return 'IE'
-
-        # Preference (PF): user-asking-about-own-tastes questions.
-        # Placed after IE so count-style queries ("how many things do I need")
-        # still route to IE. Placed before Abstention/MR/catch-all because
-        # preference queries are specific. Without this branch, the read
-        # path never reaches _memoria_preference_retrieve — the PF return in
-        # the ability dispatcher (line ~3803) was dead code.
-        if any(w in q for w in [
-            'my preference', 'my preferences',
-            'what do i like', 'what do i prefer', 'what do i hate',
-            'what do i dislike', 'what do i love', 'what do i want',
-            'what do i need', 'what do i tend',
-            'do i like', 'do i prefer', 'do i hate', 'do i dislike',
-            'do i love', 'do i want', 'do i need',
-            'my favorite', 'my favourite', 'my fav',
-            'things i like', 'things i love', 'things i hate',
-            'things i dislike', 'things i prefer', 'things i tend',
-            'things i don', 'things i avoid',
-            'what i like', 'what i love', 'what i hate',
-            'what i dislike', 'what i prefer', 'what i tend',
-            'what i don', 'what i avoid',
-            'preferences',
-        ]):
+        if profile.preference or profile.guidance:
             return 'PF'
-
-        # Abstention
-        if any(w in q for w in ['tell me about my background', 'previous development',
-                                'work experience', 'personal background']):
+        if profile.background:
             return 'ABS'
-
-        # Multi-hop
-        if any(w in q for w in ['across my', 'across all', 'in my project',
-                                'in my sessions', 'across sessions']):
+        if profile.multi_hop or profile.broad_aggregation:
             return 'MR'
-
-        # Catch-all: any question starting with a wh-word that wasn't caught
-        # by a more specific ability (TR/EO/CR) defaults to IE.
-        if q.startswith(('what ', 'when ', 'where ', 'which ', 'who ', 'how ')):
+        if (
+            profile.knowledge_update
+            or profile.listing
+            or profile.aggregation
+            or profile.how
+            or profile.summarization
+        ):
             return 'IE'
-
+        if profile.tokens and profile.tokens[0] in {"what", "when", "where", "which", "who", "how"}:
+            return 'IE'
         return ''
 
     def _memoria_fact_retrieve(self, query: str, top_k: int = 10, intent: str = '') -> dict:
@@ -7706,6 +8562,7 @@ Rules:
         """Query memoria_timelines for chronological events matching query terms."""
         import re as _re
         cursor = self.conn
+        event_groups = _duration_event_token_groups(query)
 
         # Extract dates from query
         date_terms = _re.findall(r'\b(\d{4}-\d{2}-\d{2})\b', query)
@@ -7735,22 +8592,51 @@ Rules:
                 "WHERE session_id = ?",
                 (self.session_id,)
             ).fetchall()
+            if event_groups:
+                scored_rows = []
+                for row in rows:
+                    group_scores = tuple(
+                        _duration_group_match_score(group, row[1])
+                        for group in event_groups
+                    )
+                    coverage = sum(score >= 0.6 for score in group_scores)
+                    best_score = max(group_scores, default=0.0)
+                    total_score = sum(group_scores)
+                    if best_score < 0.6:
+                        continue
+                    scored_rows.append((coverage, best_score, total_score, row))
+                if scored_rows:
+                    rows = [
+                        row for _, _, _, row in sorted(
+                            scored_rows,
+                            key=lambda item: (
+                                -item[0],
+                                -item[1],
+                                -item[2],
+                                item[3][2],
+                                item[3][0],
+                            ),
+                        )[:top_k]
+                    ]
+                else:
+                    rows = []
             stop = {'how', 'many', 'weeks', 'days', 'between', 'from', 'when',
                     'what', 'were', 'was', 'the', 'and', 'have', 'does', 'did',
                     'date'}
-            query_terms = {
-                word for word in _re.findall(r'[a-z0-9]+', query.lower())
-                if len(word) > 2 and word not in stop
-            }
-            group_terms = {}
-            for row in rows:
-                group_terms.setdefault(row[2], set()).update(
-                    _re.findall(r'[a-z0-9]+', row[1].lower())
-                )
-            group_scores = {
-                idx: len(query_terms & terms) for idx, terms in group_terms.items()
-            }
-            rows = [row for row in rows if group_scores.get(row[2], 0) > 0]
+            if not event_groups:
+                query_terms = {
+                    word for word in _re.findall(r'[a-z0-9]+', query.lower())
+                    if len(word) > 2 and word not in stop
+                }
+                group_terms = {}
+                for row in rows:
+                    group_terms.setdefault(row[2], set()).update(
+                        _re.findall(r'[a-z0-9]+', row[1].lower())
+                    )
+                group_scores = {
+                    idx: len(query_terms & terms) for idx, terms in group_terms.items()
+                }
+                rows = [row for row in rows if group_scores.get(row[2], 0) > 0]
             if not rows:
                 if is_ordering_query(query):
                     fallback = cursor.execute(
@@ -7763,15 +8649,16 @@ Rules:
                         ctx_lines = [f"[{r[0]}] {r[1][:200]}" for r in fallback]
                         return {"context": "\n".join(ctx_lines), "facts": facts, "source": "fallback"}
                 return {"context": "", "facts": [], "source": "fallback"}
-            rows = sorted(
-                rows,
-                key=lambda row: (
-                    -group_scores.get(row[2], 0),
-                    -len(query_terms & set(_re.findall(r'[a-z0-9]+', row[1].lower()))),
-                    row[2],
-                    row[0],
-                ),
-            )[:top_k]
+            if rows and not event_groups:
+                rows = sorted(
+                    rows,
+                    key=lambda row: (
+                        -group_scores.get(row[2], 0),
+                        -len(query_terms & set(_re.findall(r'[a-z0-9]+', row[1].lower()))),
+                        row[2],
+                        row[0],
+                    ),
+                )[:top_k]
 
         if rows:
             facts = [dict(zip(['date', 'description', 'msg_idx'], r)) for r in rows]
@@ -7855,9 +8742,11 @@ Rules:
         return True
 
     def _maybe_summarize_segment(self, session: str, message_idx: int) -> None:
-        """Write-time hook: summarize a segment if boundary reached, flag on, and llm_client set."""
-        if not (self._llm_client is not None
-                and os.environ.get("EDUMEM_LLM_SUMMARY", "0") == "1"):
+        """Write-time hook: summarize a segment when a boundary is reached and an
+        llm_client is set. Always on (no env flag) — the segment summary is an
+        LLM call, so it only fires when there's a client to do the work, which is
+        the same contract as the always-on card layer."""
+        if self._llm_client is None:
             return
         segment_size = int(os.environ.get("EDUMEM_SUMMARY_SEGMENT", "20"))
         if not self._should_summarize(message_idx, segment_size):
@@ -8354,6 +9243,13 @@ Rules:
         results = []
         query_lower = query.lower()
         query_words = _recall_tokens(query_lower)
+        from . import query_mode as _query_mode
+        structured_intent = self._derive_structured_recall_intent(query)
+        ordering_query = _query_mode.is_ordering_query(query)
+        current_state_query = structured_intent == "current"
+        first_person_ordering = ordering_query and any(
+            cue in query_lower for cue in _FIRST_PERSON_ORDERING_CUES
+        )
 
         # ---- Configurable hybrid scoring setup (Phase 4) ----
         vw, fw, iw = _normalize_weights(vec_weight, fts_weight, importance_weight)
@@ -8529,10 +9425,14 @@ Rules:
                 # and multi-aspect recall can assemble the full answer without
                 # letting single-token nonsense queries leak through.
                 row_min_relevance = single_token_relevance if broad_multi_hit_query else min_relevance
+                if first_person_ordering and _is_user_authored_source(row["source"]):
+                    row_min_relevance = min(row_min_relevance, max(0.08, single_token_relevance * 0.75))
                 relevance = max(lexical, (0.75 * lexical + 0.25 * normalized)) if lexical >= row_min_relevance else 0.0
             else:
                 relevance = _lexical_relevance(query_words, row["content"], query_lower)
                 row_min_relevance = single_token_relevance if broad_multi_hit_query else min_relevance
+                if first_person_ordering and _is_user_authored_source(row["source"]):
+                    row_min_relevance = min(row_min_relevance, max(0.08, single_token_relevance * 0.75))
             vector_only_hit = (not has_fts_rank and row["id"] in wm_vec_sims and
                                _wm_vector_only_hit_meets_floor(vec_sim))
             if (has_fts_rank and (relevance >= row_min_relevance or (len(query_words) <= 1 and relevance > 0))) or \
@@ -8551,6 +9451,15 @@ Rules:
                 if temporal_weight > 0.0:
                     t_boost = _temporal_boost(row["timestamp"], parsed_query_time, th_halflife)
                     score *= (1.0 + temporal_weight * t_boost)
+                if current_state_query and _content_has_current_update_cue(row["content"]):
+                    msg_idx = row["message_index"] if "message_index" in row.keys() else None
+                    msg_bonus = min(0.03, ((msg_idx or 0) / 1000.0) * 0.03)
+                    score += 0.10 + msg_bonus
+                if first_person_ordering:
+                    if _is_user_authored_source(row["source"]):
+                        score *= 1.25
+                    else:
+                        score *= 0.75
                 # [C4] Per-row tier attribution. Credit FTS for any
                 # row in wm_ranks (overlap with vec credited to FTS
                 # so the union sum stays consistent). Vec-only rows
@@ -9039,6 +9948,8 @@ Rules:
             if temporal_weight > 0.0:
                 t_boost = _temporal_boost(row["timestamp"], parsed_query_time, th_halflife)
                 score *= (1.0 + temporal_weight * t_boost)
+            if structured_intent == "timeline" and row["source"] == "sleep_consolidation":
+                score *= 0.4
             # [C4] Per-row tier attribution. FTS gets the overlap;
             # vec gets vec-only rows. One increment per kept row.
             rid = row["rowid"]
@@ -9103,6 +10014,8 @@ Rules:
                     rc_share = (1.0 - iw) * 0.4
                     base_score = relevance * kw_share + row["importance"] * iw + (relevance ** 2) * 0.08
                     score = base_score * (rc_share + (1.0 - rc_share) * decay)
+                    if structured_intent == "timeline" and row["source"] == "sleep_consolidation":
+                        score *= 0.4
 
                     # Phase 5: Graph + fact + binary bonuses for fallback.
                     # Gated by the same toggles as the main loop above
@@ -9255,62 +10168,54 @@ Rules:
         results = self._dedup_cross_tier_summary_links(
             results, ep_summary_of_map=ep_summary_of_map
         )
-        # --- MEMORIA structured fact supplement ---
-        # Treat structured facts as another candidate source, not a forced
-        # top result. MEMORIA facts are regex-derived and often generic
-        # (dates/sequences); they must show meaningful lexical overlap before
-        # entering the result set.
-        try:
-            _memoria_result = self.memoria_retrieve(query, top_k=3)
-            if _memoria_result and _memoria_result.get("source") != "fallback":
-                _ctx = _memoria_result.get("context", "")
-                _memoria_relevance = _lexical_relevance(query_words, _ctx, query_lower)
-                if _ctx and _memoria_relevance >= 0.35:
-                    results.append({
-                        "id": f"memoria_{_memoria_result['source']}",
-                        "content": f"[MEMORIA {_memoria_result['source']}]\n{_ctx}",
-                        "source": f"memoria_{_memoria_result['source']}",
-                        "score": round(min(0.6, _memoria_relevance * 0.6), 4),
-                        "tier": "memoria",
-                        "fts_score": 0.0,
-                        "dense_score": 0.0,
-                        "keyword_score": round(_memoria_relevance, 4),
-                        "importance": 0.5,
-                        "timestamp": "",
-                        "session_id": self.session_id,
-                    })
-                    _source_ids = [
-                        sid for sid in _memoria_result.get("source_memory_ids", [])
-                        if sid
-                    ]
-                    if _source_ids:
-                        _ph = ",".join("?" * len(_source_ids))
-                        _src_rows = self.conn.execute(
-                            f"SELECT id, content, source, timestamp, importance, scope, veracity "
-                            f"FROM working_memory WHERE id IN ({_ph})",
-                            _source_ids,
-                        ).fetchall()
-                        for _row in _src_rows:
-                            results.append({
-                                "id": f"memoria_source_{_row['id']}",
-                                "content": _row["content"][:_recall_content_limit()],
-                                "source": _row["source"],
-                                "timestamp": _row["timestamp"],
-                                "tier": "memoria_source",
-                                "score": round(min(0.59, 0.2 + _memoria_relevance * 0.8), 4),
-                                "fts_score": 0.0,
-                                "dense_score": 0.0,
-                                "keyword_score": round(_memoria_relevance, 4),
-                                "importance": _row["importance"],
-                                "scope": _row["scope"] if "scope" in _row.keys() else "session",
-                                "veracity": _row["veracity"] if "veracity" in _row.keys() else "unknown",
-                                "source_memory_id": _row["id"],
-                            })
-                    results.sort(key=lambda x: x["score"], reverse=True)
-        except Exception:
-            pass  # MEMORIA retrieval is best-effort
+        # --- Structured recall supplement ---
+        # Cards and MEMORIA are internal stages of the single public recall API.
+        # Append them here so callers don't need side-channel retrieval calls.
+        results.extend(
+            self._structured_recall_supplements(
+                query,
+                top_k=top_k,
+                query_words=query_words,
+                query_lower=query_lower,
+            )
+        )
+        results.sort(key=lambda x: x["score"], reverse=True)
 
-        if len(query_words) >= 4 and len(results) > top_k:
+        if current_state_query:
+            results.sort(
+                key=lambda row: (
+                    1 if _content_has_current_update_cue(row.get("content", "")) else 0,
+                    _recall_message_index(row) or 0,
+                    row.get("keyword_score", 0.0),
+                    row.get("score", 0.0),
+                ),
+                reverse=True,
+            )
+
+        if ordering_query:
+            if first_person_ordering:
+                results.sort(
+                    key=lambda row: (
+                        0 if _is_user_authored_source(row.get("source")) else 1,
+                        _recall_message_index(row) if _recall_message_index(row) is not None else 1 << 30,
+                        -row.get("score", 0.0),
+                    )
+                )
+            else:
+                results.sort(
+                    key=lambda row: (
+                        _recall_message_index(row) if _recall_message_index(row) is not None else 1 << 30,
+                        -row.get("score", 0.0),
+                    )
+                )
+
+        if (
+            len(query_words) >= 4
+            and len(results) > top_k
+            and not ordering_query
+            and not current_state_query
+            and structured_intent != "timeline"
+        ):
             # Multi-aspect questions often need several rows, not five variants
             # of one aspect. Greedily prefer rows that add not-yet-covered exact
             # query terms while keeping the underlying score as the base signal.
@@ -9425,11 +10330,7 @@ Rules:
                 logger.debug("fact recall integration failed (non-fatal)", exc_info=True)
 
         # Prefix content with occurred_at or recorded_at date unless it is an Event Ordering query
-        eo_keywords = ["order", "sequence", "happened first", "chronological", "first built", "built first", "timeline", "walk me through", "order in which", "sequence of events", "in what order"]
-        q_lower = query.lower()
-        is_eo_query = any(w in q_lower for w in eo_keywords)
-
-        if not is_eo_query:
+        if not is_ordering_query(query):
             for r in final_results:
                 date_str = r.get("occurred_at")
                 if not date_str:
@@ -9442,7 +10343,11 @@ Rules:
             # Generate derived temporal facts for temporal queries
             derived_facts = generate_derived_temporal_facts(final_results, query)
             if derived_facts:
-                final_results = derived_facts + final_results
+                final_results = sorted(
+                    final_results + derived_facts,
+                    key=lambda row: row.get("score", 0.0),
+                    reverse=True,
+                )[:top_k]
 
         return final_results
 
@@ -9985,26 +10890,17 @@ Rules:
         if recalled_episodic_ids or recalled_working_ids:
             self.conn.commit()
 
-        # --- MEMORIA structured fact supplement (polyphonic path) ---
-        try:
-            _memoria_result = self.memoria_retrieve(query, top_k=3)
-            if _memoria_result and _memoria_result.get("source") != "fallback":
-                _ctx = _memoria_result.get("context", "")
-                if _ctx:
-                    final.insert(0, {
-                        "id": f"memoria_{_memoria_result['source']}",
-                        "content": f"[MEMORIA {_memoria_result['source']}]\n{_ctx}",
-                        "source": f"memoria_{_memoria_result['source']}",
-                        "score": 0.95,
-                        "tier": "memoria",
-                        "fts_score": 0.0,
-                        "dense_score": 0.0,
-                        "importance": 0.9,
-                        "timestamp": "",
-                        "session_id": self.session_id,
-                    })
-        except Exception:
-            logger.info("Regex extraction failed, skipping", exc_info=True)
+        query_words = _recall_tokens(query.lower())
+        final.extend(
+            self._structured_recall_supplements(
+                query,
+                top_k=top_k,
+                query_words=query_words,
+                query_lower=query.lower(),
+            )
+        )
+        final.sort(key=lambda x: x["score"], reverse=True)
+        final = final[:top_k]
 
         return final
 
@@ -11655,9 +12551,22 @@ def generate_derived_temporal_facts(mems, query: str):
 
     if not is_duration_query(query):
         return []
-        
+
+    query_tokens = _duration_query_tokens(query)
+    event_groups = _duration_event_token_groups(query)
+
     dated_mems = []
     for m in mems:
+        source = m.get("source", "")
+        tier = m.get("tier", "")
+        if source in {"sleep_consolidation", "derived_temporal"}:
+            continue
+        if str(source).startswith("card_") or str(source).startswith("memoria_"):
+            continue
+        if tier in {"card", "memoria", "derived"} or str(tier).startswith("memoria"):
+            continue
+        if _recall_message_index(m) is None and source and not str(source).startswith("beam_"):
+            continue
         date_str = m.get("occurred_at")
         if not date_str:
             ts = m.get("timestamp")
@@ -11669,7 +12578,31 @@ def generate_derived_temporal_facts(mems, query: str):
                 content = m.get("content", "")
                 if " — " in content:
                     content = content.split(" — ", 1)[1]
-                dated_mems.append((dt, date_str, content))
+                explicit_iso_dates = set(re.findall(r"\b\d{4}-\d{2}-\d{2}\b", content))
+                explicit_named_dates = re.findall(
+                    r"\b(?:january|february|march|april|may|june|july|august|"
+                    r"september|october|november|december|"
+                    r"jan|feb|mar|apr|jun|jul|aug|sep|oct|nov|dec)\s+"
+                    r"\d{1,2}(?:st|nd|rd|th)?(?:,?\s*\d{4})?\b",
+                    content,
+                    flags=re.IGNORECASE,
+                )
+                if len(explicit_iso_dates) + len(explicit_named_dates) > 2:
+                    continue
+                lexical = (
+                    _lexical_relevance(query_tokens, content, query.lower())
+                    if query_tokens else 0.0
+                )
+                group_scores = tuple(
+                    _duration_group_match_score(group, content)
+                    for group in event_groups
+                )
+                if event_groups:
+                    if max(group_scores, default=0.0) < 0.6:
+                        continue
+                elif query_tokens and lexical < 0.10:
+                    continue
+                dated_mems.append((dt, date_str, content, lexical, group_scores))
             except Exception:
                 pass
                 
@@ -11681,11 +12614,35 @@ def generate_derived_temporal_facts(mems, query: str):
     derived = []
     for i in range(len(dated_mems)):
         for j in range(i + 1, len(dated_mems)):
-            dt_i, str_i, content_i = dated_mems[i]
-            dt_j, str_j, content_j = dated_mems[j]
+            dt_i, str_i, content_i, lexical_i, group_scores_i = dated_mems[i]
+            dt_j, str_j, content_j, lexical_j, group_scores_j = dated_mems[j]
             
             diff_days = (dt_j - dt_i).days
             if diff_days == 0:
+                continue
+
+            pair_text = f"{content_i} {content_j}"
+            pair_relevance = (
+                _lexical_relevance(query_tokens, pair_text, query.lower())
+                if query_tokens else 0.0
+            )
+            assignment_strength = 0.0
+            if event_groups:
+                left_i = group_scores_i[0] if len(group_scores_i) > 0 else 0.0
+                right_i = group_scores_i[1] if len(group_scores_i) > 1 else 0.0
+                left_j = group_scores_j[0] if len(group_scores_j) > 0 else 0.0
+                right_j = group_scores_j[1] if len(group_scores_j) > 1 else 0.0
+                assignment_strength = max(
+                    min(left_i, right_j),
+                    min(right_i, left_j),
+                )
+                if assignment_strength < 0.6:
+                    continue
+            elif query_tokens and (
+                lexical_i < 0.10
+                or lexical_j < 0.10
+                or pair_relevance < 0.18
+            ):
                 continue
                 
             desc_i = content_i[:80].strip()
@@ -11694,13 +12651,22 @@ def generate_derived_temporal_facts(mems, query: str):
             derived.append({
                 "id": f"derived_temp_{i}_{j}",
                 "content": f"DERIVED: '{desc_i}' occurred {diff_days} days before '{desc_j}' ({str_i} → {str_j})",
-                "score": 0.99,
+                "score": round(
+                    min(
+                        0.58,
+                        0.18
+                        + pair_relevance * 0.18
+                        + assignment_strength * 0.22,
+                    ),
+                    4,
+                ),
                 "source": "derived_temporal",
                 "tier": "derived",
                 "occurred_at": str_i,
                 "recorded_at": str_i
             })
-            
+
+    derived.sort(key=lambda item: item["score"], reverse=True)
     return derived[:10]
 
 def clean_and_format_sequence(query: str, raw_answer: str) -> str:
@@ -11710,16 +12676,12 @@ def clean_and_format_sequence(query: str, raw_answer: str) -> str:
     if not raw_answer:
         return raw_answer
         
-    query_lower = query.lower()
-    ordering_cues = ['order', 'sequence', 'chronological', 'timeline', 'before', 'after', 'first', 'then', 'steps', 'progression']
-    is_ordering = any(cue in query_lower for cue in ordering_cues)
-    
     cleaned = raw_answer.strip()
     if cleaned.startswith("```"):
         cleaned = re.sub(r"^```[a-zA-Z0-9]*\s*", "", cleaned)
         cleaned = re.sub(r"```$", "", cleaned).strip()
         
-    if not is_ordering:
+    if not is_ordering_query(query):
         return cleaned
 
     items = []

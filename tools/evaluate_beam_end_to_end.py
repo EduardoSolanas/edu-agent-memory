@@ -12,8 +12,8 @@ BEAM benchmark protocol:
 Published SOTA (BEAM 10M):
   Hindsight: 64.1%   Honcho: 40.6%   LIGHT: 26.6%   RAG: 24.9%
 
-LLM: Nvidia API (deepseek-v4-flash) via OpenAI-compatible endpoint.
-     Fast, cheap (~$2/M tokens), no local GPU needed.
+LLM: NAN/OpenAI-compatible API (qwen3.6 by default).
+     Fast, cheap, no local GPU needed.
 
 Usage:
   cd /root/.hermes/projects/edumem
@@ -62,38 +62,77 @@ except Exception:
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+# Benchmark defaults: make the runner self-contained against the local inference
+# container so these need not be exported on every invocation. setdefault only
+# fills values absent from the environment, so explicit exports still win.
+# MUST run BEFORE importing edumem.core.beam: EMBEDDING_DIM is derived from the
+# embedding model at embeddings-module import time, so an absent/wrong model
+# yields 384 instead of the container's 768 and corrupts every vec table.
+os.environ.setdefault("EDUMEM_EMBEDDING_MODEL", "Alibaba-NLP/gte-modernbert-base")
+os.environ.setdefault("EDUMEM_EMBEDDING_API_URL", "http://127.0.0.1:3002")
+os.environ.setdefault("EDUMEM_RERANKER_URL", "http://127.0.0.1:3002/rerank")
+os.environ.setdefault("EDUMEM_EMBEDDINGS_VIA_API", "1")
+os.environ.setdefault("EDUMEM_EXTRACTION_TIMEOUT", "300")
+
+# Resolve the LLM API key + base URL ONCE, up front, so neither the user nor a
+# launch script needs to export EDUMEM_LLM_* by hand. Precedence:
+#   explicit EDUMEM_LLM_API_KEY > NAN_API_KEY > NAN_APY_KEY (legacy .env typo)
+#   > OPENROUTER_API_KEY.
+# We also auto-load .env (KEY=VALUE) without overriding real env vars, then stamp
+# the resolved values into EDUMEM_LLM_* so the lazily-imported ExtractionClient
+# (which reads EDUMEM_LLM_API_KEY/BASE at import) inherits the same credentials.
+def _load_dotenv_into_environ():
+    p = PROJECT_ROOT / ".env"
+    if not p.exists():
+        return
+    for _line in p.read_text(encoding="utf-8", errors="replace").splitlines():
+        _line = _line.strip()
+        if not _line or _line.startswith("#") or "=" not in _line:
+            continue
+        _k, _v = _line.split("=", 1)
+        os.environ.setdefault(_k.strip(), _v.strip().strip('"').strip("'"))
+
+_load_dotenv_into_environ()
+_llm_key = (
+    os.environ.get("EDUMEM_LLM_API_KEY")
+    or os.environ.get("NAN_API_KEY")
+    or os.environ.get("NAN_APY_KEY")
+    or os.environ.get("OPENROUTER_API_KEY")
+)
+if _llm_key:
+    os.environ.setdefault("EDUMEM_LLM_API_KEY", _llm_key)
+    # A NAN key implies the NAN base URL unless one is set explicitly.
+    if os.environ.get("NAN_API_KEY") or os.environ.get("NAN_APY_KEY"):
+        os.environ.setdefault("EDUMEM_LLM_BASE_URL", "https://api.nan.builders/v1")
+
+# Cap concurrent LLM calls to the (flaky) inference endpoint. The ingest
+# message-classifier pool and the eval question-worker pool are the only
+# concurrent LLM-call sources, and the run phases are sequential, so bounding
+# both pools by this value bounds total in-flight calls. Default 3 keeps the
+# endpoint from 429/401/empty storms; override with EDUMEM_MAX_CONCURRENT_LLM.
+os.environ.setdefault("EDUMEM_MAX_CONCURRENT_LLM", "3")
+
 import urllib.request
 import urllib.error
 import numpy as np
 
 from edumem.core.beam import BeamMemory, init_beam, _embeddings, _vec_available, _vec_insert, _fts_search_working, _generate_id, parse_relative_date
 from edumem.core.query_mode import (
-    build_system_prompt, is_temporal_query, needs_second_pass, is_ordering_query, is_duration_query,
+    analyze_question_intent, build_system_prompt, is_temporal_query, needs_second_pass, is_ordering_query, is_duration_query,
     is_aggregation_query, is_date_interval_query, is_stated_duration_query, is_summarization_query,
-    is_contradiction_query
+    is_contradiction_query, is_multi_hop_query, is_yesno_check_query, is_list_query,
+    is_background_query, wants_instruction_preference_context
 )
 
 
 def _deterministic_intent(question: str) -> str | None:
     """Return intent only when the question contains an explicit signal."""
-    import re
-
-    q = (question or "").lower()
-    if is_ordering_query(question):
+    profile = analyze_question_intent(question)
+    if profile.ordering:
         return "ordered"
-    if (
-        is_duration_query(question)
-        or is_date_interval_query(question)
-        or re.search(r"\b(?:date|deadline|when|timeline)\b", q)
-    ):
+    if profile.duration or profile.date_interval or profile.timeline_reference:
         return "timeline"
-    if (
-        is_contradiction_query(question)
-        or re.match(r"^\s*have\s+(?:i|we)\b", q)
-        or re.search(r"\b(?:changed?|switched?|contradict(?:ion|ory)?|conflicting|from\s+.+\s+to)\b", q)
-        or re.search(r"\bprevious(?:ly)?\s+(?:versus|vs\.?|compared\s+to|and)\s+(?:current|new|now)\b", q)
-        or re.search(r"\b(?:current|new|now)\s+(?:versus|vs\.?|compared\s+to|and)\s+previous(?:ly)?\b", q)
-    ):
+    if profile.contradiction or profile.yesno_check or profile.state_transition:
         return "change"
     return None
 
@@ -127,31 +166,16 @@ def _is_calculator_question(question: str) -> bool:
 
 def _wants_broad_aggregation_retrieval(question: str) -> bool:
     """Return True only when aggregation language is explicitly broad."""
-    q = (question or "").lower()
-    if not is_aggregation_query(question):
-        return False
-    broad_markers = (
-        "combination",
-        "combined",
-        "combine",
-        "across",
-        "total",
-        "altogether",
-        "in total",
-    )
-    return any(marker in q for marker in broad_markers)
+    profile = analyze_question_intent(question)
+    return profile.broad_aggregation
 
 
 def _wants_negation_retrieval(question: str) -> bool:
     """Return True only when the question is actually asking about negation."""
-    import re
-
-    q = (question or "").strip().lower()
     if is_duration_query(question) or is_stated_duration_query(question):
         return False
-    if "contradict" in q or "conflict" in q:
-        return True
-    return re.match(r"^(?:(?:have|did|do|am)\s+i\b|has\b)", q) is not None
+    profile = analyze_question_intent(question)
+    return profile.contradiction or profile.yesno_check
 
 
 def _tr_python_answer_is_trustworthy(py_answer: str, timeline_size: int,
@@ -182,7 +206,7 @@ def _tr_python_answer_is_trustworthy(py_answer: str, timeline_size: int,
     return True
 
 
-from edumem.core.context_assembly import _assemble_memory_context  # noqa: E402, F401
+from edumem.core.context_assembly import _assemble_memory_context, assemble_card_context  # noqa: E402, F401
 
 
 _CTX_MATCH_STOP = {
@@ -329,23 +353,7 @@ def _normalize_time_anchor(value) -> str | None:
 
 def _query_wants_if_pf(question: str) -> bool:
     """Detect when a question likely needs instruction/preference memories."""
-    import re
-
-    q = (question or "").lower()
-    patterns = (
-        r'\binstruction(s)?\b',
-        r'\bformat\b',
-        r'\bfollow\b',
-        r'\bpreference(s)?\b',
-        r'\bprefer\b',
-        r'\blike\b.*\bkeep\b',
-        r'\bmust\b',
-        r'\bshould\b',
-        r'\balways\b',
-        r'\bnever\b',
-        r'\bhelp me\s+(?:set up|build|create|organize)\b',
-    )
-    return any(re.search(p, q) for p in patterns)
+    return wants_instruction_preference_context(question)
 
 
 def _select_conversations(conversations: list[dict], sample_size: int | None = None,
@@ -765,7 +773,7 @@ OPENROUTER_BASE_URL = (
     or os.environ.get("OPENROUTER_BASE_URL", "")
     or "https://openrouter.ai/api/v1"
 )
-DEFAULT_MODEL = os.environ.get("EDUMEM_LLM_MODEL", "deepseek-v4-flash")
+DEFAULT_MODEL = os.environ.get("EDUMEM_LLM_MODEL", "qwen3.6")
 CONSOLIDATION_MODEL = "deepseek/deepseek-v4-flash"  # Cheap model for LLM-based consolidation summaries
 FALLBACK_MODELS = []  # Disabled -- fallback cascade burned $30 in credits
 DEFAULT_TOP_K = 10  # Memories to retrieve per question
@@ -801,6 +809,80 @@ def _benchmark_pure_recall_enabled() -> bool:
     if raw is None:
         return True
     return _env_truthy("EDUMEM_BENCHMARK_PURE_RECALL")
+
+
+def _reflect_synthesis_block(
+    llm: LLMClient,
+    question: str,
+    context: str,
+    ability: str | None,
+    diag: dict | None = None,
+) -> str | None:
+    """Run a narrow reflect-style synthesis pass for SUM/MR answer generation.
+
+    This is deliberately answer-path only: callers invoke it only after memory
+    context has already been assembled and only for SUM/MR questions.
+    """
+    reflect_mode = ability
+    if reflect_mode not in ("SUM", "MR"):
+        if is_summarization_query(question):
+            reflect_mode = "SUM"
+        elif is_multi_hop_query(question) or is_aggregation_query(question):
+            reflect_mode = "MR"
+        else:
+            return None
+
+    context = (context or "").strip()
+    if not context or context == "[No memories found]":
+        return None
+
+    if reflect_mode == "SUM":
+        system_prompt = (
+            "You are a reflection step for a summarization question. "
+            "Given the retrieved memories, synthesize a coherent summary using "
+            "only the provided evidence. Return plain prose only."
+        )
+        user_prompt = (
+            f"QUESTION: {question}\n\n"
+            f"RETRIEVED MEMORIES:\n{context}\n\n"
+            "SYNTHESIZED SUMMARY:"
+        )
+        max_tokens = 1024
+    else:
+        system_prompt = (
+            "You are a reflection step for a multi-hop reasoning question. "
+            "Given the retrieved memories, synthesize the connected facts and "
+            "compute any requested aggregate using only the provided evidence. "
+            "Return plain prose only."
+        )
+        user_prompt = (
+            f"QUESTION: {question}\n\n"
+            f"RETRIEVED MEMORIES:\n{context}\n\n"
+            "SYNTHESIZED ANALYSIS:"
+        )
+        max_tokens = 1024
+
+    reflection = llm.chat(
+        [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        temperature=0.0,
+        max_tokens=max_tokens,
+    ).strip()
+
+    if not reflection or reflection.startswith("[LLM_ERROR:"):
+        return None
+
+    if diag is not None:
+        reflect_diag = diag.setdefault("reflect", {})
+        reflect_diag["activated"] = True
+        reflect_diag["ability"] = reflect_mode
+        reflect_diag["context_chars"] = len(context)
+        reflect_diag["response_chars"] = len(reflection)
+
+    return reflection
+
 BENCHMARK_QUERIES_PER_CONV = 50  # Max probing questions per conversation
 
 def _result_paths(output_dir: Path):
@@ -872,18 +954,26 @@ class LLMClient:
         self.last_response = ""
         self.last_retry_count = 0
 
-    MAX_RETRIES = 6  # Resilient to a shared/contended endpoint (429s, transient 5xx).
+    # Patient retry budget: the NAN endpoint has intermittent multi-minute
+    # outage waves (sustained 401/429/5xx) that a 3-attempt budget can't survive.
+    # Override with EDUMEM_LLM_MAX_ATTEMPTS to ride through longer waves.
+    MAX_RETRIES = max(1, int(os.environ.get("EDUMEM_LLM_MAX_ATTEMPTS", "8")))
 
     @staticmethod
     def _is_retryable_error(error_text: str, status_code: int | None) -> bool:
-        """Retry on rate limits (429), server errors (5xx), and timeouts."""
+        """Retry transient transport failures: rate limits (429), auth blips
+        (401/403 — the key is validated out-of-band, so these are NAN load
+        artifacts), request-timeout-ish 4xx (408/409/425), server errors (5xx),
+        and timeouts."""
         if status_code is not None:
-            if status_code == 429 or 500 <= status_code <= 599:
+            if status_code in (401, 403, 408, 409, 425, 429) or 500 <= status_code <= 599:
                 return True
         low = error_text.lower()
         if "429" in error_text or "rate" in low:
             return True
-        if "timeout" in low or "timed out" in low:
+        if "401" in error_text or "403" in error_text or "unauthorized" in low or "forbidden" in low:
+            return True
+        if "timeout" in low or "timed out" in low or "connection" in low:
             return True
         if any(code in error_text for code in ("500", "502", "503", "504")):
             return True
@@ -1403,7 +1493,8 @@ def ingest_conversation(beam: BeamMemory, messages: list[dict], diag: dict | Non
                 def _classify_worker(job):
                     idx, content = job
                     return idx, _classify_message_llm(llm, content)
-                with ThreadPoolExecutor(max_workers=4) as executor:
+                _ingest_workers = max(1, int(os.environ.get("EDUMEM_MAX_CONCURRENT_LLM", "3")))
+                with ThreadPoolExecutor(max_workers=_ingest_workers) as executor:
                     results = list(executor.map(_classify_worker, user_jobs))
                 classifications = {idx: tags for idx, tags in results}
 
@@ -1636,55 +1727,16 @@ MAX_MEMORY_CONTEXT_CHARS = int(os.environ.get("EDUMEM_MAX_CONTEXT_CHARS", "16000
 
 
 def _recall_safe(beam: BeamMemory, query: str, top_k: int, temporal_weight: float = 0.0) -> list:
-    """Safe recall wrapper with timeout + fresh connection isolation.
-    Prevents indefinite hangs and thread-contention on shared connections."""
-    import threading
-    import sqlite3
-    _log = logging.getLogger("recall_safe")
-    _thread_id = threading.get_ident()
+    """Safe recall wrapper — calls beam.recall() directly on the existing connection."""
     _start = time.time()
-    _log.info(f"RECALL START | query={query[:60]!r} | thread={_thread_id} | top_k={top_k}")
-
-    result = []
-    exception = [None]
-    done = threading.Event()
-
-    def _worker():
-        nonlocal result
-        old_conn = getattr(beam, 'conn', None)
-        fresh_conn = None
-        try:
-            # Fresh connection per call to avoid thread contention
-            db_path = getattr(beam, 'db_path', None)
-            if db_path:
-                fresh_conn = sqlite3.connect(db_path, timeout=120, check_same_thread=False)
-                fresh_conn.row_factory = sqlite3.Row
-                fresh_conn.execute("PRAGMA journal_mode=WAL")
-                fresh_conn.execute("PRAGMA busy_timeout=120000")
-                beam.conn = fresh_conn
-            result = beam.recall(query, top_k=top_k, temporal_weight=temporal_weight)
-        except Exception as e:
-            exception[0] = e
-        finally:
-            if fresh_conn is not None:
-                beam.conn = old_conn
-                try:
-                    fresh_conn.close()
-                except Exception:
-                    pass
-            done.set()
-
-    t = threading.Thread(target=_worker, daemon=True)
-    t.start()
-    if not done.wait(timeout=120):
-        _log.warning(f"RECALL TIMEOUT | query={query[:60]!r} | duration={time.time()-_start:.1f}s | thread={_thread_id}")
-        print(f"    [RECALL-TIMEOUT] recall({query[:60]!r}) exceeded 120s timeout, returning empty", flush=True)
+    try:
+        result = beam.recall(query, top_k=top_k, temporal_weight=temporal_weight)
+    except Exception as e:
+        print(f"    [RECALL-ERROR] recall({query[:60]!r}): {e}", flush=True)
         return []
-    if exception[0]:
-        _log.warning(f"RECALL ERROR | query={query[:60]!r} | error={exception[0]} | thread={_thread_id}")
-        print(f"    [RECALL-ERROR] recall({query[:60]!r}): {exception[0]}", flush=True)
-        return []
-    _log.info(f"RECALL END | query={query[:60]!r} | duration={time.time()-_start:.1f}s | thread={_thread_id}")
+    elapsed = time.time() - _start
+    if elapsed > 5.0:
+        print(f"    [RECALL-SLOW] recall({query[:60]!r}) took {elapsed:.1f}s", flush=True)
     return result
 
 
@@ -1768,6 +1820,9 @@ def _multi_strategy_recall(beam: BeamMemory, question: str, top_k: int = DEFAULT
             bucket["candidates_before_dedup"] += max(candidates_before_dedup, 0)
             bucket["added_after_dedup"] += max(added_after_dedup, 0)
 
+    # Save original top_k for saturation gates before ability-specific tripling.
+    _orig_top_k = top_k
+
     # FIX 2 (EO): Raise candidate depth for ordering queries.
     # Ordering questions need more candidates to capture all [MSGIDX:N] mentions.
     # Multiply top_k by 3 for ordering questions so they get broader context.
@@ -1797,7 +1852,7 @@ def _multi_strategy_recall(beam: BeamMemory, question: str, top_k: int = DEFAULT
     
     # Strategy 1: Direct question search (mostly keyword via FTS5)
     _mark("S1")
-    _candidate_mems = _recall_safe(beam, question, top_k * 2, temporal_weight=temporal_weight)
+    _candidate_mems = _recall_safe(beam, question, _orig_top_k * 2, temporal_weight=temporal_weight)
     _note_add("S1", len(_candidate_mems), _add_unique(_candidate_mems, "S1"))
 
     # Always create the negation bucket so skipped negation routing is explicit.
@@ -1882,13 +1937,14 @@ def _multi_strategy_recall(beam: BeamMemory, question: str, top_k: int = DEFAULT
             except Exception:
                 pass
 
-    # Strategy 3: Key entity/term searches
-    terms = _extract_search_terms(question)
-    for term in terms[:5]:
-        if len(term) > 2:
-            _mark("S3")
-            _candidate_mems = _recall_safe(beam, term, max(5, top_k // 3), temporal_weight=temporal_weight)
-            _note_add("S3", len(_candidate_mems), _add_unique(_candidate_mems, "S3"))
+    # Strategy 3: Key entity/term searches (skip when S1 already saturated)
+    if len(all_memories) < _orig_top_k:
+        terms = _extract_search_terms(question)
+        for term in terms[:5]:
+            if len(term) > 2:
+                _mark("S3")
+                _candidate_mems = _recall_safe(beam, term, max(5, top_k // 3), temporal_weight=temporal_weight)
+                _note_add("S3", len(_candidate_mems), _add_unique(_candidate_mems, "S3"))
     
     # Strategy 4: Temporal search for date-related questions
     if is_temporal:
@@ -1896,7 +1952,7 @@ def _multi_strategy_recall(beam: BeamMemory, question: str, top_k: int = DEFAULT
         # Stronger temporal boost for date-specific sub-queries
         date_temporal_weight = 0.5
         # Search for dates and timelines
-        _candidate_mems = _recall_safe(beam, "deadline schedule timeline date", top_k, temporal_weight=date_temporal_weight)
+        _candidate_mems = _recall_safe(beam, "deadline schedule timeline date", _orig_top_k, temporal_weight=date_temporal_weight)
         _note_add("TR", len(_candidate_mems), _add_unique(_candidate_mems, "TR"))
 
         # --- NEW: Hard-filter for specific extracted date strings ---
@@ -1931,7 +1987,9 @@ def _multi_strategy_recall(beam: BeamMemory, question: str, top_k: int = DEFAULT
                 _note_add("TR", len(_candidate_mems), _add_unique(_candidate_mems, "TR"))
 
     # Strategy 5: Two-hop entity retrieval for multi-hop reasoning
-    if len(all_memories) > 0:
+    # Skip when S1+S3 already saturated — the extra hops add ~150ms each
+    # for entities unrelated to the query (e.g. camelCase identifiers).
+    if len(all_memories) > 0 and len(all_memories) < _orig_top_k:
         _hop_entities = set()
         for mem in all_memories[:10]:
             _hop_content = mem.get("content", "")
@@ -2496,6 +2554,140 @@ def _detect_contradictions(messages: list, question: str) -> str | None:
     return None
 
 
+def _trim_background_absence_answer(question: str, answer: str) -> str:
+    """Keep background/prior-project abstentions from drifting into tangential detail."""
+    import re as _re_bg
+
+    if not answer or not is_background_query(question):
+        return answer
+
+    lower = answer.lower()
+    absence_markers = (
+        "does not contain specific information",
+        "does not contain that information",
+        "does not contain information about your personal background",
+        "there is no information about your background",
+    )
+    if not any(marker in lower for marker in absence_markers):
+        return answer
+
+    cutoff = len(answer)
+    for pattern in (
+        r"\bhowever\b",
+        r"\bbut\b",
+        r"\n\s*[-*]",
+        r"\n\s*\d+[.)]",
+    ):
+        match = _re_bg.search(pattern, answer, _re_bg.IGNORECASE)
+        if match:
+            cutoff = min(cutoff, match.start())
+    sentence_splits = _re_bg.split(r"(?<=[.!?])\s+", answer.strip())
+    if len(sentence_splits) > 1:
+        followup = sentence_splits[1].lower()
+        if any(marker in followup for marker in (
+            "current project",
+            "current portfolio",
+            "current codebase",
+            "current implementation",
+            "the context only details",
+            "the context only describes",
+        )):
+            cutoff = min(cutoff, len(sentence_splits[0]))
+    trimmed = answer[:cutoff].strip()
+    return trimmed.rstrip(" ,;")
+
+
+def _trim_unversioned_dependency_items(question: str, answer: str) -> str:
+    """Drop bare dependency names without versions from versioned dependency answers."""
+    import re as _re_dep
+
+    if not answer or not is_list_query(question):
+        return answer
+
+    q_lower = question.lower()
+    if not any(token in q_lower for token in ("libraries", "dependencies", "frameworks", "technologies")):
+        return answer
+
+    version_pat = _re_dep.compile(r"(?:==|>=|<=|~=|!=)?\s*v?\d+\.\d+(?:\.\d+)?")
+    bullet_pat = _re_dep.compile(r"^\s*(?:[-*+]|\d+[.)])\s*")
+    lines = answer.splitlines()
+    if len(lines) < 2:
+        return answer
+
+    kept_lines = []
+    prefix_lines = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        is_item = bool(bullet_pat.match(stripped)) or ":" in stripped
+        if not is_item:
+            if not kept_lines:
+                prefix_lines.append(stripped)
+            continue
+        if version_pat.search(stripped):
+            kept_lines.append(stripped)
+
+    if len(kept_lines) < 2:
+        return answer
+
+    rendered = []
+    if prefix_lines:
+        rendered.append(prefix_lines[0])
+    rendered.extend(kept_lines)
+    return "\n".join(rendered)
+
+
+def _postprocess_answer(question: str, answer: str) -> str:
+    """Apply narrow, benchmark-safe cleanups after the answer LLM returns."""
+    if not answer:
+        return answer
+    answer = _trim_background_absence_answer(question, answer)
+    answer = _trim_unversioned_dependency_items(question, answer)
+    return answer
+
+
+def _augment_ordering_memories(beam: BeamMemory, memories: list[dict], max_samples: int = 12) -> list[dict]:
+    """Add timeline-spread user memories for ordering questions.
+
+    Mirrors the Hindsight lesson that order questions need coverage across the
+    whole trace, not just the highest-scoring few snippets from one early phase.
+    """
+    try:
+        existing_keys = {m.get("content", "")[:120] for m in memories}
+        rows = beam.conn.execute(
+            "SELECT id, content, message_index, source FROM working_memory "
+            "WHERE session_id = ? AND content != '' AND source = 'beam_user' "
+            "ORDER BY message_index ASC",
+            (beam.session_id,),
+        ).fetchall()
+        if not rows:
+            return memories
+
+        stride = max(1, len(rows) // max_samples)
+        sampled = rows[::stride]
+        if sampled[-1]["id"] != rows[-1]["id"]:
+            sampled.append(rows[-1])
+
+        for row in sampled[:max_samples]:
+            ck = row["content"][:120]
+            if ck in existing_keys:
+                continue
+            existing_keys.add(ck)
+            memories.append({
+                "id": row["id"],
+                "content": row["content"],
+                "score": 0.22,
+                "source": "eo_timeline_sample",
+                "raw_score": 0.22,
+                "retrieval_strategy": "EO",
+                "message_index": row["message_index"],
+            })
+    except Exception:
+        pass
+    return memories
+
+
 _POLYPHONIC_VOICE_KEYS = frozenset({"vector", "graph", "fact", "temporal"})
 _LINEAR_VOICE_KEYS = frozenset({"vec", "fts", "keyword", "importance", "recency_decay"})
 
@@ -2768,7 +2960,7 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
         else:
             print(f"    [TR] no timeline extracted or too few dates")
     
-    _cr_context = None  # PATCH: CR injection removed — contradictions handled generically by CONSOLIDATED_SYSTEM_PROMPT step 2
+    _cr_context = None
     # ---- END PER-ABILITY BYPASSES ----
     
     # FULL-CONTEXT MODE: send the entire conversation to the LLM, bypassing edumem retrieval.
@@ -2827,40 +3019,20 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
         ]
         return _ret(llm.chat(messages, temperature=0.1, max_tokens=2048))
 
-    # ALWAYS use multi-strategy retrieval to test edumem's recall quality.
-    # The previous <=500 bypass sent full raw conversations to the LLM,
-    # completely bypassing edumem's retrieval pipeline.
-    # This benchmark exists to measure MEMORY performance, not LLM reading comprehension.
-    
-    # Multi-strategy retrieval
-    memories = _multi_strategy_recall(beam, question, top_k * 3, ability=None, diag=diag)  # label-free recall
+    # ---- Production recall path ----
+    # Single public read surface: beam.recall(). Structured retrieval stages
+    # (cards, MEMORIA, raw rows) stay behind that one call.
+    memories = []
 
-    # ---- MEMORIA: Structured Fact Retrieval (Phase 2) ----
-    # Supplement recall with structured facts from memoria_facts, memoria_timelines,
-    # and memoria_kg tables. These provide exact values that FTS5/vector search
-    # may miss (dates, metrics, versions, negations, sequences, entity mappings).
-    # Injected as synthetic high-score entries so they surface ahead of fuzzy matches.
-    # Retrieval always runs RRF fusion over all specialists; no per-question routing.
+    # 1. Unified recall (raw + cards + MEMORIA supplements)
     try:
-        _memoria_result = beam.memoria_retrieve(question, ability=routing_ability, top_k=top_k)
-        if _memoria_result and _memoria_result.get("source") != "fallback" and _memoria_result.get("context"):
-            _memoria_facts = _memoria_result.get("facts", [])
-            print(f"    [MEMORIA] {_memoria_result['source']} hit for ability={routing_ability}: {len(_memoria_facts)} facts", flush=True)
-            memories.insert(0, {
-                "content": f"[MEMORIA {_memoria_result['source']}]\n{_memoria_result['context']}",
-                "score": 0.95,
-                "source": f"memoria_{_memoria_result['source']}",
-                "raw_score": 0.95,
-                "retrieval_strategy": "MEMORIA",
-            })
+        raw_memories = beam.recall(question, top_k=top_k * 2)
+        for mem in raw_memories:
+            mem.setdefault("raw_score", mem.get("score", mem.get("relevance", 0.0)))
+            mem.setdefault("retrieval_strategy", "recall")
+        memories.extend(raw_memories)
     except Exception:
-        pass  # MEMORIA retrieval is best-effort
-
-    # Cross-encoder reranking now happens inside `_memoria_fused_retrieve`
-    # (edumem.core.beam._fusion_rerank), reordering the fused MEMORIA facts by
-    # query relevance. The harness no longer reranks the message-level memories
-    # here: that re-ranked the bundled MEMORIA blob (memories[0]) rather than the
-    # facts inside it, so it could not surface the right facts.
+        pass
 
     # ---- EO: Sort by message_index for ordering queries ----
     if is_ordering_query(question):
@@ -2893,24 +3065,6 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
             if best_match:
                 context_answer = best_match
 
-    # If cloud extraction enabled, also search the facts table
-    if getattr(beam, 'use_cloud', False):
-        try:
-            fact_memories = beam.fact_recall(question, top_k=top_k)
-            # Convert fact dicts to same format as recall results
-            for f in fact_memories:
-                memories.append({
-                    "content": f"FACT: {f['content']}",
-                    "score": f.get("score", 0.5) * 2.0,  # 2x weight for facts
-                    "source": "fact_extraction",
-                    "raw_score": f.get("score", 0.5) * 2.0,
-                    "retrieval_strategy": "FACT",
-                })
-            # Re-sort by score
-            memories.sort(key=lambda x: x.get("score", 0), reverse=True)
-        except Exception:
-            pass  # Fact recall is best-effort
-    
     # LLM RERANKING: DISABLED -- rate-limit avoidance + proven ineffective (Reality Check 5.3)
     # The re-ranker cannot beat baseline by >3pp and causes 429 rate-limit cascades.
     # Left as dead code for reference.
@@ -2962,7 +3116,11 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
     if needs_second_pass(question):
         # --- Helper: build context string from memory list ---
         def _build_context(mems, recents):
-            if routing_ability == "EO":
+            # Use the deterministic ordering classifier, NOT routing_ability:
+            # in pure-recall mode routing_ability is forced to None, so the
+            # message-index sort silently never fired and EO context stayed in
+            # relevance order (scrambled sequence -> wrong order -> tau-b ~0).
+            if is_ordering_query(question):
                 # Sort by message_index (true conversation order). All messages
                 # share a constant ingest timestamp, so timestamp sort is a no-op.
                 mems = sorted(mems, key=lambda x: x.get("message_index") if x.get("message_index") is not None else float('inf'))
@@ -3061,7 +3219,10 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
                                     "raw_score": 1.0,
                                     "retrieval_strategy": "TR"})
                 print(f"    [TR-timeline] injected {len(_tr_timeline)} dates from conversation", flush=True)
-        
+
+        if is_ordering_query(question):
+            memories = _augment_ordering_memories(beam, memories)
+
         # --- Pass 1: Initial context building (no LLM call, only retrieval) ---
         pass1_ctx = _build_context(memories, recent_parts)
 
@@ -3070,15 +3231,20 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
         import re as _re_gap
         gap_queries = []
 
-        # Extract dates from Pass 1 context
-        gap_queries.extend(_re_gap.findall(r'\b\d{4}-\d{2}-\d{2}\b', pass1_ctx))
-
-        # Extract month+day patterns
-        gap_queries.extend(_re_gap.findall(
+        date_pattern = (
             r'(?:January|February|March|April|May|June|July|August|September|'
-            r'October|November|December)\s+\d{1,2}(?:,?\s*\d{4})?',
-            pass1_ctx, _re_gap.IGNORECASE
-        ))
+            r'October|November|December)\s+\d{1,2}(?:,?\s*\d{4})?'
+        )
+
+        # Prefer anchors from the question itself. Pulling every date from the
+        # already-built context often selects generic timeline noise, then pays
+        # for extra recall and a second answer pass without adding signal.
+        gap_queries.extend(_re_gap.findall(r'\b\d{4}-\d{2}-\d{2}\b', question))
+        gap_queries.extend(_re_gap.findall(date_pattern, question, _re_gap.IGNORECASE))
+
+        if len(gap_queries) < 2 and is_date_interval_query(question):
+            gap_queries.extend(_re_gap.findall(r'\b\d{4}-\d{2}-\d{2}\b', pass1_ctx)[:2])
+            gap_queries.extend(_re_gap.findall(date_pattern, pass1_ctx, _re_gap.IGNORECASE)[:2])
 
         # Extract named entities from the question that aren't in pass1 results
         q_entities = _re_gap.findall(r'\b[A-Z][a-z]+(?:[-\s][A-Z][a-z]+)*\b', question)
@@ -3092,20 +3258,25 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
             if len(term) > 2 and term.lower() not in pass1_ctx.lower()[:2000]:
                 gap_queries.append(term)
 
-        # Deduplicate
-        gap_queries = list(dict.fromkeys(gap_queries))
+        # Deduplicate and cap. More than a few gap queries turns one question
+        # into multiple full retrieval passes and dominates BEAM wall time.
+        gap_queries = list(dict.fromkeys(gap_queries))[:2]
 
         # Debug: log gap analysis results
         print(f"    [DEBUG-GAP] ability={routing_ability} regex-extracted queries={gap_queries}", flush=True)
         
         # --- Pass 2: Targeted retrieval + re-answer ---
+        gap_diag = None
         if gap_queries:
             gap_memories = []
             gap_seen = set()
-            gap_diag = {"strategies": {}}
-            for gq in gap_queries[:3]:
-                # Standard recall
-                for mem in _multi_strategy_recall(beam, gq, top_k, ability=routing_ability, diag=gap_diag):
+            for gq in gap_queries:
+                # Single targeted recall (same path as production agent)
+                try:
+                    _gap_raw = beam.recall(gq, top_k=top_k)
+                except Exception:
+                    _gap_raw = []
+                for mem in _gap_raw:
                     ck = mem.get("content", "")[:80]
                     if ck not in gap_seen:
                         gap_seen.add(ck)
@@ -3124,6 +3295,7 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
                                 "score": 0.95,
                                 "source": f"memoria_gap_{_memoria_gap['source']}",
                                 "raw_score": 0.95,
+                                "type": "memoria",
                                 "retrieval_strategy": "MEMORIA",
                             })
                 except Exception:
@@ -3143,7 +3315,11 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
             # Ordering questions need ALL events to order correctly, so give them
             # a much larger budget; duration questions only need a few dates.
             pass2_ctx = _build_context(all_mems, recent_parts)
-            _pass2_limit = 16000 if is_ordering_query(question) else 6000
+            # Ordering needs ALL mentioned topics in order; a 16K cap truncated
+            # later topic labels out of context (EO recall misses). Match the
+            # generous budget the card path gives other abilities. Env-tunable.
+            _eo_budget = int(os.environ.get("EDUMEM_EO_CONTEXT_CHARS", "48000"))
+            _pass2_limit = _eo_budget if is_ordering_query(question) else 6000
             if len(pass2_ctx) > _pass2_limit:
                 pass2_ctx = pass2_ctx[:_pass2_limit] + "...[truncated]"
 
@@ -3176,7 +3352,7 @@ Follow this format strictly:
                     {"role": "system", "content": _pass2_prompt},
                     {"role": "user", "content": _pass2_temporal_cheat + pass2_ctx + "\n\nQUESTION: " + question + "\n\nANSWER:"},
                 ]
-            _record_second_pass_diagnostics(diag, gap_queries[:3], gap_diag)
+            _record_second_pass_diagnostics(diag, gap_queries, gap_diag)
             return _ret(llm.chat(pass2_messages, temperature=0.1, max_tokens=8192), all_mems)
 
         # No gaps: fall through to the single final LLM answer below
@@ -3242,8 +3418,11 @@ Follow this format strictly:
         except Exception:
             pass
 
-    # Build retrieved memory context (deduplicated, relevance-sorted)
-    _effective_max_chars = 24000 if _is_sum else MAX_MEMORY_CONTEXT_CHARS
+    # Build retrieved memory context (deduplicated, relevance-sorted).
+    # Summarization must cover all conversation themes; a 24K cap truncated
+    # later-phase content (SUM recall misses). Match the card-path budget.
+    _sum_budget = int(os.environ.get("EDUMEM_SUM_CONTEXT_CHARS", "48000"))
+    _effective_max_chars = _sum_budget if _is_sum else MAX_MEMORY_CONTEXT_CHARS
     _mem_context_str, memories = _assemble_memory_context(memories, _effective_max_chars)
     memory_parts = _mem_context_str.split("\n\n") if _mem_context_str else []
 
@@ -3264,6 +3443,18 @@ Follow this format strictly:
     # If we found a direct context→value match, return it immediately (zero LLM cost)
     if context_answer:
         return _ret(context_answer, memories)
+
+    # SUM/MR get a narrow reflect-style synthesis pass before the final answer.
+    # This stays on the answer path only and reuses the same LLM client.
+    _reflect_block = _reflect_synthesis_block(llm, question, context, ability, diag=diag)
+    if _reflect_block:
+        context = f"REFLECTED SYNTHESIS:\n{_reflect_block}\n\n{context}"
+
+    # Inject retrieved contradiction context for yes/no and explicit conflict queries.
+    # Pure-recall legal: this scans only the retrieved memories that already made
+    # it onto the answer path, not the raw conversation.
+    if memories and (is_yesno_check_query(question) or is_contradiction_query(question)):
+        _cr_context = _detect_contradictions(memories, question)
 
     # Inject CR contradiction context if detected
     _cr_prefix_ret = ""
@@ -3302,6 +3493,7 @@ Follow this format strictly:
         ans = clean_and_format_sequence(question, ans)
     except Exception as e:
         print(f"[!] Warning: clean_and_format_sequence failed: {e}")
+    ans = _postprocess_answer(question, ans)
     return _ret(ans, memories)
 
 
@@ -3854,7 +4046,11 @@ def evaluate_conversation(
     jobs = [(idx, q) for idx, q in enumerate(questions)]
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    max_workers = max(1, int(os.environ.get("BEAM_QUESTION_WORKERS", "4")))
+    # Honor BEAM_QUESTION_WORKERS but never exceed the global concurrency cap.
+    max_workers = max(1, min(
+        int(os.environ.get("BEAM_QUESTION_WORKERS", "4")),
+        int(os.environ.get("EDUMEM_MAX_CONCURRENT_LLM", "3")),
+    ))
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(_evaluate_question_worker, job): job for job in jobs}
         for future in as_completed(futures):
@@ -4379,8 +4575,6 @@ def main():
                              "With no path, uses the default results file.")
     parser.add_argument("--dry-run", action="store_true",
                         help="Download data and print stats, don't evaluate")
-    parser.add_argument("--use-cloud", action="store_true",
-                        help="Enable LLM fact extraction (cloud tier). Requires EDUMEM_LLM_API_KEY.")
     parser.add_argument("--config-id", default=None,
                         help="Run identifier written into the paired-outcomes "
                              "JSONL alongside results JSON. Defaults to a "
@@ -4585,8 +4779,9 @@ def main():
             with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
                 db_path = Path(tmpdir) / f"beam_{scale}_{conv['id']}.db"
                 init_beam(db_path)
+                # Production flow: always run LLM extraction + card building.
                 beam = BeamMemory(session_id=f"beam_{scale}_{conv['id']}",
-                                   db_path=db_path, use_cloud=args.use_cloud,
+                                   db_path=db_path, use_cloud=True,
                                    llm_client=llm)
                 conv_diag = {
                     "reranker": reranker_preflight,
@@ -4741,7 +4936,7 @@ def main():
                     "pure_recall": _pure_recall,
                     "allow_harness_oracles": args.allow_harness_oracles,
                     "full_context": args.full_context,
-                    "use_cloud": args.use_cloud,
+                    "use_cloud": True,
                     "allow_no_reranker": args.allow_no_reranker,
                     "case_index": args.case_index,
                     "start_index": args.start_index,

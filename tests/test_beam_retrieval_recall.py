@@ -5,7 +5,11 @@ Pre-LLM recall gate: measures whether answer-bearing rubric nuggets appear
 in the context string that the answer-LLM WOULD see, WITHOUT calling any
 answer or judge LLM.
 
-Gated by EDUMEM_RETRIEVAL_E2E=1 (skip by default).
+When EDUMEM_RETRIEVAL_E2E=1, reads the prebuilt recall cache
+(tests/.beam_recall_cache/beam_100K_x3.db) and runs recall against it. Skips by
+default so the offline fast suite does not silently include a benchmark-scale
+retrieval run just because a local cache file exists. Needs the embeddings
+container at 127.0.0.1:3002.
 
 Run:
   EDUMEM_RETRIEVAL_E2E=1 python -m pytest tests/test_beam_retrieval_recall.py -q -s
@@ -21,10 +25,16 @@ from pathlib import Path
 
 import pytest
 
-# Gate: skip entire module unless explicitly enabled
+# Gate: this is a benchmark-style recall test, not part of the default fast
+# suite. The cache may exist locally for development, but its presence alone
+# must not make `python -m pytest tests/ -q` take minutes.
+_CACHE_DB = Path(__file__).resolve().parent / ".beam_recall_cache" / "beam_100K_x3.db"
 pytestmark = pytest.mark.skipif(
-    os.environ.get("EDUMEM_RETRIEVAL_E2E") != "1",
-    reason="retrieval e2e; set EDUMEM_RETRIEVAL_E2E=1 and have embeddings container up at 127.0.0.1:3002"
+    os.environ.get("EDUMEM_RETRIEVAL_E2E") != "1" or not _CACHE_DB.exists(),
+    reason=(
+        "retrieval recall benchmark is opt-in; set EDUMEM_RETRIEVAL_E2E=1 "
+        f"and ensure cache exists at {_CACHE_DB}"
+    ),
 )
 
 # ============================================================
@@ -230,8 +240,14 @@ def get_cached_beams():
             try:
                 while beam.sleep(force=True).get("status") not in ("no_op", "error"):
                     pass
-            except Exception:
-                pass
+            except Exception as sleep_err:
+                # A broken consolidation cycle silently degrades conclusion/
+                # episodic coverage; surface it instead of hiding it so a bad
+                # build is visible rather than producing a quietly-worse cache.
+                import traceback
+                print(f"[cache] WARNING: sleep consolidation failed for '{sid}': "
+                      f"{type(sleep_err).__name__}: {sleep_err}", flush=True)
+                traceback.print_exc()
             beam.conn.close()
             convs_meta.append((sid, conv.get("questions", [])))
         print(f"[cache] All conversations ingested.", flush=True)
@@ -245,8 +261,46 @@ def beam_with_convs(tmp_path_factory):
     return get_cached_beams()
 
 
+def _assert_retrieval_backends_live():
+    """Hard precondition: embeddings + reranker endpoints must actually respond.
+
+    `embeddings.available()` only checks that the API URL is SET, not that the
+    endpoint is reachable. When the container is down, `embed_query()` returns
+    None and `beam.recall()` silently falls back to keyword-only — producing
+    degraded recall numbers that masquerade as a regression. This benchmark
+    measures dense+rerank recall, so a dead endpoint is a hard error, not a
+    silent downgrade. Fail with an actionable message instead.
+    """
+    from edumem.core import embeddings as _emb
+    from edumem.core.beam import _fusion_rerank
+
+    emb_url = os.environ.get("EDUMEM_EMBEDDING_API_URL", "<unset>")
+    rer_url = os.environ.get("EDUMEM_RERANKER_URL", "http://127.0.0.1:3002/rerank")
+
+    # 1. Embedding endpoint must return a real vector (not None).
+    probe = _emb.embed_query("database migration postgresql")
+    assert probe is not None and getattr(probe, "size", 0) > 0, (
+        f"Embedding endpoint at {emb_url} is unreachable or returned no vector. "
+        f"Dense recall would silently degrade to keyword-only. "
+        f"Start the container: `docker start edumem-server` and confirm "
+        f"`curl {emb_url}/health` returns 200."
+    )
+
+    # 2. Reranker endpoint must return real scores (not None = degraded to RRF).
+    scores = _fusion_rerank("which database", ["We use PostgreSQL", "Redis cache"])
+    assert scores is not None and isinstance(scores, list) and len(scores) == 2, (
+        f"Reranker endpoint at {rer_url} is unreachable or returned no scores. "
+        f"Fusion would silently degrade to RRF order. "
+        f"Start the container: `docker start edumem-server`."
+    )
+
+
 def test_retrieval_recall_per_ability(beam_with_convs):
     """Check that rubric nuggets appear in the retrieved context for each question."""
+    # Fail loudly if the dense/rerank backends are down — never measure
+    # keyword-only recall and report it as if the full pipeline ran.
+    _assert_retrieval_backends_live()
+
     db_path, convs_meta = beam_with_convs
 
     # Collect all questions with their session_id

@@ -35,7 +35,7 @@ def test_extract_conclusions_returns_synthesized_insights(monkeypatch):
                 '"source": [40, 120], "confidence": 0.85}]')
 
     monkeypatch.setattr(ExtractionClient, "chat", _fake_chat)
-    client = ExtractionClient()
+    client = ExtractionClient(model="test-model")
     msgs = [{"role": "user", "content": "I added password hashing then token auth."}]
     conclusions = client.extract_conclusions(msgs)
 
@@ -97,13 +97,16 @@ def test_extraction_model_follows_canonical_llm_model(monkeypatch):
     """Extraction (facts + conclusions) must default to the canonical chat model
     EDUMEM_LLM_MODEL (e.g. qwen3.6 on NAN) so it runs on the SAME provider as the
     answer path. Otherwise the google/gemini default silently no-ops against a
-    NAN base_url. Precedence: EDUMEM_EXTRACTION_MODEL > EDUMEM_LLM_MODEL > gemini."""
+    NAN base_url. No hardcoded fallback: raises when unconfigured."""
     from edumem.extraction.client import _default_extraction_model
     from edumem.extraction import ExtractionClient
 
     monkeypatch.delenv("EDUMEM_EXTRACTION_MODEL", raising=False)
     monkeypatch.delenv("EDUMEM_LLM_MODEL", raising=False)
-    assert _default_extraction_model() == "google/gemini-2.5-flash"
+    assert _default_extraction_model() is None
+    import pytest
+    with pytest.raises(RuntimeError):
+        ExtractionClient()
 
     monkeypatch.setenv("EDUMEM_LLM_MODEL", "qwen3.6")
     assert _default_extraction_model() == "qwen3.6"
@@ -131,4 +134,4 @@ def test_extraction_reasoning_payload_disables_qwen_thinking():
     assert _reasoning_payload_extra("qwen3.6") == {"chat_template_kwargs": {"enable_thinking": False}}
     assert _reasoning_payload_extra("gemma4") == {"chat_template_kwargs": {"enable_thinking": False}}
     assert _reasoning_payload_extra("deepseek-v4-flash") == {"reasoning_effort": "low"}
-    assert _reasoning_payload_extra("google/gemini-2.5-flash") == {}
+    assert _reasoning_payload_extra("unknown/model") == {}

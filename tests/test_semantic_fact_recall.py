@@ -322,6 +322,120 @@ def test_embed_api_reuses_one_pooled_session_across_calls(monkeypatch):
     assert sessions_used[0] is stub
 
 
+def test_embed_api_truncates_long_texts_to_existing_char_budget():
+    """API embeddings should cap each text to the existing char budget before POST.
+
+    Uses a real local HTTP server to capture the outgoing payload. This is the
+    live failure mode from the BEAM runner: very long singleton texts reached
+    the embedding server unchanged and triggered GPU OOMs.
+    """
+    import importlib
+    import json
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    import edumem.core.embeddings as _e
+
+    seen_payloads = []
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            payload = json.loads(body.decode("utf-8"))
+            seen_payloads.append(payload)
+            data = {
+                "data": [
+                    {"embedding": [0.0, 0.0, 0.0], "index": idx, "object": "embedding"}
+                    for idx, _ in enumerate(payload.get("input", []))
+                ]
+            }
+            encoded = json.dumps(data).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(encoded)))
+            self.end_headers()
+            self.wfile.write(encoded)
+
+        def log_message(self, *_args, **_kwargs):
+            return
+
+    saved_url = os.environ.get("EDUMEM_EMBEDDING_API_URL")
+    saved_model = os.environ.get("EDUMEM_EMBEDDING_MODEL")
+    saved_chars = os.environ.get("EDUMEM_EMBEDDING_BATCH_TOTAL_CHARS")
+    server = HTTPServer(("127.0.0.1", 0), _Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        os.environ["EDUMEM_EMBEDDING_API_URL"] = f"http://127.0.0.1:{server.server_address[1]}"
+        os.environ["EDUMEM_EMBEDDING_MODEL"] = "test-model"
+        os.environ["EDUMEM_EMBEDDING_BATCH_TOTAL_CHARS"] = "64"
+        importlib.reload(_e)
+
+        long_text = "A" * 256
+        out = _e._embed_api([long_text])
+
+        assert out is not None
+        assert len(seen_payloads) == 1
+        assert seen_payloads[0]["input"] == [long_text[:64]]
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+        if saved_url is None:
+            os.environ.pop("EDUMEM_EMBEDDING_API_URL", None)
+        else:
+            os.environ["EDUMEM_EMBEDDING_API_URL"] = saved_url
+        if saved_model is None:
+            os.environ.pop("EDUMEM_EMBEDDING_MODEL", None)
+        else:
+            os.environ["EDUMEM_EMBEDDING_MODEL"] = saved_model
+        if saved_chars is None:
+            os.environ.pop("EDUMEM_EMBEDDING_BATCH_TOTAL_CHARS", None)
+        else:
+            os.environ["EDUMEM_EMBEDDING_BATCH_TOTAL_CHARS"] = saved_chars
+        importlib.reload(_e)
+
+
+def test_embed_api_retries_failed_large_batch_by_splitting(monkeypatch):
+    """_embed_api should split a failed API batch and preserve input order.
+
+    Non-vacuous: stub `_embed_api_batch` so any batch larger than 128 returns
+    None, while smaller batches succeed with embeddings that encode the original
+    text index. Reverting the split-on-failure path makes `_embed_api(...)`
+    return None for the same 300 inputs.
+    """
+    import edumem.core.embeddings as _e
+
+    monkeypatch.setenv("EDUMEM_EMBEDDING_API_URL", "http://embedding.test.local")
+    monkeypatch.setenv("EDUMEM_EMBEDDING_MODEL", "test-model")
+    monkeypatch.setattr(_e, "_EMBED_API_BATCH_SIZE", 256)
+
+    calls = []
+
+    def _fake_embed_api_batch(texts, url, headers, cert_file):
+        calls.append(len(texts))
+        if len(texts) > 128:
+            return None
+        out = []
+        for text in texts:
+            idx = int(str(text).split(":")[1])
+            out.append([float(idx)])
+        return out
+
+    monkeypatch.setattr(_e, "_embed_api_batch", _fake_embed_api_batch)
+
+    payload = [f"row:{idx}" for idx in range(300)]
+    out = _e._embed_api(payload)
+
+    assert out is not None
+    assert out.shape == (300, 1)
+    assert out[0][0] == 0.0
+    assert out[128][0] == 128.0
+    assert out[299][0] == 299.0
+    assert any(size > 128 for size in calls), calls
+    assert any(size == 128 for size in calls), calls
+
+
 def test_flush_fact_embeddings_populates_vec_facts_live(tmp_path):
     """Live integration test: real embed() against the endpoint populates vec_facts.
 

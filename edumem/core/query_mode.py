@@ -18,187 +18,463 @@ Rules this file obeys:
 
 # --- generic intent detection (question text only) -------------------------
 
-_ORDERING_KEYWORDS = (
-    "order", "sequence", "what order", "in what order", "order in which",
-    "sequence of", "walk me through", "happened first", "came first",
-    "list the steps", "chronolog",  # matches chronological / chronologically
+from dataclasses import dataclass
+from functools import lru_cache
+import re
+import unicodedata
+
+
+@dataclass(frozen=True)
+class _CueGroup:
+    """Reusable lexical cue family for one abstract concept."""
+
+    prefixes: tuple[str, ...] = ()
+    phrases: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class QuestionIntentProfile:
+    """Typed intent artifact derived from question text only."""
+
+    normalized: str
+    tokens: tuple[str, ...]
+    ordering: bool
+    stated_duration: bool
+    duration: bool
+    date_interval: bool
+    timeline_reference: bool
+    knowledge_update: bool
+    state_transition: bool
+    multi_hop: bool
+    summarization: bool
+    aggregation: bool
+    broad_aggregation: bool
+    contradiction: bool
+    yesno_check: bool
+    how: bool
+    guidance: bool
+    preference: bool
+    listing: bool
+    background: bool
+    temporal: bool
+    second_pass: bool
+
+
+_WORD_RE = re.compile(r"[a-z0-9]+")
+_ISO_DATE_RE = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")
+_MONTH_DATE_RE = re.compile(
+    r"\b(?:january|february|march|april|may|june|july|august|"
+    r"september|october|november|december|"
+    r"jan|feb|mar|apr|jun|jul|aug|sep|oct|nov|dec)\s+"
+    r"\d{1,2}(?:st|nd|rd|th)?(?:,?\s*\d{4})?\b"
 )
 
-_DURATION_KEYWORDS = (
-    "how long", "how much time", "duration", "time between",
-    "how many days", "how many weeks", "how many months", "how many years",
-    "days between", "weeks between", "months between", "years between",
-    "happened earlier", "came earlier", "came later", "earlier or later",
-    "how old", "between",  # broad, but base prompt safely handles any misroute
+_WH_CUES = _CueGroup(
+    prefixes=(
+        "what", "which", "when", "how", "cuanto", "cuanta", "cuantos", "cuantas",
+        "cual", "cuales", "que", "como", "quando", "quel", "quelle", "quels",
+        "quelles", "combien", "wie", "welch", "wann",
+    ),
+)
+_ORDER_CUES = _CueGroup(
+    prefixes=("order", "sequen", "chronolog", "orden", "ordem", "folge", "reihe", "paso", "etap"),
+    phrases=(
+        "what order", "in what order", "order in which", "walk me through",
+        "happened first", "came first", "list the steps", "en que orden",
+        "em que ordem", "dans quel ordre", "in welcher reihenfolge",
+    ),
+)
+_DURATION_CUES = _CueGroup(
+    prefixes=("durat", "between", "tiempo", "duracion", "dura", "zwischen", "tempo"),
+    phrases=(
+        "how long", "how much time", "time between", "how old",
+        "cuanto tiempo", "cuantos dias", "cuantas semanas", "cuantos meses",
+        "cuantos anos", "combien de temps", "wie lange",
+    ),
+)
+_TEMPORAL_UNIT_CUES = _CueGroup(
+    prefixes=(
+        "day", "week", "month", "year", "dias", "dia", "seman", "mes", "ano",
+        "jour", "jours", "semaine", "mois", "an", "ans", "tag", "tage",
+        "woche", "monat", "jahr",
+    ),
+)
+_EVENT_PAIR_CUES = _CueGroup(
+    prefixes=("between", "from", "since", "entre", "desde", "zwischen", "depuis"),
+    phrases=(
+        "passed between", "elapsed between", "between when", "between the time",
+        "from when", "since when", "from the time", "start and the end",
+        "beginning and the end", "desde cuando",
+    ),
+)
+_REPORT_CUES = _CueGroup(
+    prefixes=(
+        "say", "said", "mention", "mentioned", "dije", "dicho", "mencion",
+        "mencione", "decir", "dis", "mentionn", "sagte",
+    ),
+    phrases=(
+        "did i say", "did we say", "i said", "we said", "i mentioned",
+        "we mentioned", "what duration did i", "what duration did we",
+        "dije que", "mencione que",
+    ),
+)
+_EXPECTATION_CUES = _CueGroup(
+    prefixes=("expect", "suppos", "plan", "estim", "would", "take", "last", "need", "durar", "iba", "previst", "dauer"),
+    phrases=(
+        "expected to take", "supposed to take", "planned to take",
+        "estimated to take", "would take", "would last", "would need",
+        "was expected to take", "is expected to take", "was supposed to take",
+        "is supposed to take", "iba a durar",
+    ),
+)
+_CURRENT_CUES = _CueGroup(
+    prefixes=("current", "latest", "recent", "actual", "ahora", "now", "ultima", "ultimo", "ultim", "recient", "newest"),
+    phrases=("most recent", "now using", "a dia de hoy"),
+)
+_CHANGE_CUES = _CueGroup(
+    prefixes=("updat", "chang", "switch", "migrat", "cambi", "actualiz", "modific", "nuevo", "nueva"),
+    phrases=("changed to", "switched to", "moved to", "paso a", "cambio a"),
+)
+_STATE_VALUE_CUES = _CueGroup(
+    prefixes=("version", "status", "deadline", "fecha", "count", "total", "included", "inclu", "uso", "using", "state"),
+)
+_TIME_REFERENCE_CUES = _CueGroup(
+    prefixes=("date", "deadline", "timeline", "schedule", "when", "fecha", "cuando", "quand", "wann"),
+)
+_POSSESSION_CUES = _CueGroup(
+    prefixes=("have", "has", "using", "use", "tengo", "tenemos", "uso", "usamos", "hay"),
+    phrases=("do i have", "do we have", "are there", "what do i have", "what do we have"),
+)
+_RELATION_CUES = _CueGroup(
+    prefixes=("across", "combin", "together", "relat", "connect", "link", "depend", "asoci", "relacion", "conect", "vincul"),
+    phrases=("relationship between", "related to", "connected to", "como se relaciona", "en conjunto"),
+)
+_SUMMARY_CUES = _CueGroup(
+    prefixes=("summar", "overview", "recap", "highlight", "gist", "resum", "resumen"),
+    phrases=("main topics", "key themes", "vision general", "temas principales"),
+)
+_CONFLICT_CUES = _CueGroup(
+    prefixes=("contradict", "conflict", "inconsist", "disagree", "contradic", "conflic", "desacuer"),
+    phrases=("both said",),
+)
+_COUNT_CUES = _CueGroup(
+    prefixes=("many", "much", "total", "count", "cuanto", "cuanta", "cuantos", "cuantas", "combien"),
+    phrases=("how many", "how much", "in total", "altogether", "en total"),
+)
+_BROAD_SCOPE_CUES = _CueGroup(
+    prefixes=("across", "combined", "together", "overall", "global"),
+    phrases=("all the", "across sessions", "every time", "each time", "in total", "en conjunto"),
+)
+_VERSUS_CUES = _CueGroup(
+    prefixes=("versus", "vs", "previous", "old", "new", "anterior", "nuevo"),
+    phrases=("compared to", "previous versus current", "current versus previous", "from"),
+)
+_YESNO_START_CUES = _CueGroup(prefixes=("have", "did", "has", "was", "is", "do", "am", "he", "ha", "esta"))
+_HOW_CUES = _CueGroup(
+    prefixes=("how", "como", "comment", "wie", "organize", "structure", "approach", "handle", "manage"),
+    phrases=("how did i", "how did we", "how was", "how were", "how have i", "how have we"),
+)
+_GUIDANCE_CUES = _CueGroup(
+    prefixes=(
+        "instruction", "format", "template", "style", "layout", "follow", "guid",
+        "constraint", "rule", "must", "should", "always", "never", "help",
+        "setup", "configur", "install", "build", "create", "organ", "structur",
+        "workflow", "deploy", "implement", "formato", "plantill", "estilo",
+        "ayud", "configur", "despleg", "paso",
+    ),
+    phrases=(
+        "help me", "set up", "what steps", "how can i", "how should i",
+        "walk me through", "que pasos", "como puedo", "como debo",
+        "ayudame", "en que formato",
+    ),
+)
+_PREFERENCE_CUES = _CueGroup(
+    prefixes=(
+        "prefer", "like", "dislike", "hate", "love", "enjoy", "favorit", "favourit",
+        "want", "need", "avoid", "prefier", "gust", "odia", "encant", "quier",
+        "gost", "bevorzug", "lieb",
+    ),
+    phrases=(
+        "what do i like", "what do i prefer", "what do i hate", "what do i dislike",
+        "what do i love", "what format do i prefer", "que formato prefiero",
+        "que prefiero", "what is my preference",
+    ),
+)
+_LIST_CUES = _CueGroup(
+    prefixes=("list", "bibliotec", "dependenc", "librar", "framework", "tool", "technolog", "herramient", "bibliothe"),
+    phrases=(
+        "list all", "list the", "what libraries", "which libraries",
+        "what dependencies", "which dependencies", "what tools", "which tools",
+        "what technologies", "which technologies", "what frameworks",
+        "which frameworks", "que bibliotecas", "que dependencias",
+    ),
+)
+_BACKGROUND_CUES = _CueGroup(
+    phrases=(
+        "my background", "personal background", "work experience",
+        "previous development", "previous projects", "prior projects",
+        "experiencia laboral", "proyectos anteriores", "antecedentes personales",
+    ),
 )
 
-_STATED_DURATION_KEYWORDS = (
-    "did i say", "did we say", "i said", "we said", "i mentioned", "we mentioned",
-    "expected to take", "supposed to take", "planned to take", "estimated to take",
-    "would take", "would last", "would need", "was expected to take",
-    "is expected to take", "was supposed to take", "is supposed to take",
-    "what duration did i", "what duration did we",
-)
 
-_DATE_INTERVAL_KEYWORDS = (
-    "passed between",
-    "elapsed between",
-    "between when",
-    "between the time",
-    "from when",
-    "since when",
-    "from the time",
-    "start and the end",
-    "beginning and the end",
-)
-
-_KU_KEYWORDS = (
-    "current", "latest", "updated", "changed to", "switched to",
-    "now using", "most recent",
-    "how many", "included", "do i have", "are there",
-    "deadline",
-    "what is", "what was",
-)
-
-_MR_KEYWORDS = (
-    "across", "combining", "combined", "together", "relationship between",
-    "connect", "related to",
-)
-
-_SUM_KEYWORDS = (
-    "summarize", "summary", "overview", "main topics",
-    "key themes", "recap", "highlights", "gist",
-)
-
-_CR_KEYWORDS = (
-    "contradict", "contradiction", "conflict", "conflicting",
-    "both said", "inconsistent", "disagree", "disagreement",
-)
-
-_YESNO_CHECK_KEYWORDS = (
-    "have i ", "did i ", "have we ", "did we ",
-    "has the ", "was the ", "is the ",
-)
-
-_AGGREGATION_KEYWORDS = (
-    "how many", "how much", "total", "all the", "across",
-    "across my", "across our", "across sessions",
-    "combined", "altogether", "in total",
-    "everything", "every time", "each time",
-)
-
-_HOW_KEYWORDS = (
-    "how did i ", "how did we ", "how was ", "how were ",
-    "how have i ", "how have we ",
-    "organize", "structure", "approach", "handle", "manage",
-)
-
-_LIST_KEYWORDS = (
-    "which libraries", "which dependencies", "what libraries", "what dependencies",
-    "list all", "list the", "what tools", "which tools",
-    "what technologies", "which technologies", "what frameworks", "which frameworks",
-)
+def _normalize_question(question: str) -> str:
+    folded = unicodedata.normalize("NFKD", question or "")
+    folded = "".join(ch for ch in folded if not unicodedata.combining(ch))
+    lowered = folded.lower()
+    return " ".join(lowered.split())
 
 
-def is_ordering_query(question: str) -> bool:
-    q = question.lower()
-    return any(k in q for k in _ORDERING_KEYWORDS)
+def _tokenize(question: str) -> tuple[str, ...]:
+    return tuple(_WORD_RE.findall(question))
 
 
-def is_stated_duration_query(question: str) -> bool:
-    q = question.lower()
-    return any(k in q for k in _STATED_DURATION_KEYWORDS)
+def _contains_phrase(normalized: str, phrases: tuple[str, ...]) -> bool:
+    if not normalized or not phrases:
+        return False
+    padded = f" {normalized} "
+    return any(f" {phrase} " in padded for phrase in phrases)
 
 
-def _has_explicit_date_text(q: str) -> bool:
-    import re
-
-    if re.search(r"\b\d{4}-\d{2}-\d{2}\b", q):
-        return True
-    month_names = (
-        "january|february|march|april|may|june|july|august|"
-        "september|october|november|december|"
-        "jan|feb|mar|apr|jun|jul|aug|sep|oct|nov|dec"
-    )
-    if re.search(rf"\b(?:{month_names})[a-z]*\s+\d{{1,2}}(?:st|nd|rd|th)?(?:,?\s*\d{{4}})?\b", q):
-        return True
+def _contains_prefix(tokens: tuple[str, ...], prefixes: tuple[str, ...]) -> bool:
+    for token in tokens:
+        for prefix in prefixes:
+            if len(prefix) < 3:
+                if token == prefix:
+                    return True
+            elif token.startswith(prefix):
+                return True
     return False
 
 
-def _has_event_pair_interval_language(q: str) -> bool:
-    return any(k in q for k in _DATE_INTERVAL_KEYWORDS)
+def _matches(tokens: tuple[str, ...], normalized: str, cue: _CueGroup) -> bool:
+    return _contains_phrase(normalized, cue.phrases) or _contains_prefix(tokens, cue.prefixes)
+
+
+def _starts_with(tokens: tuple[str, ...], cue: _CueGroup) -> bool:
+    if not tokens:
+        return False
+    first = tokens[0]
+    return any(first.startswith(prefix) for prefix in cue.prefixes)
+
+
+def _has_explicit_date_text(normalized: str) -> bool:
+    return bool(_ISO_DATE_RE.search(normalized) or _MONTH_DATE_RE.search(normalized))
+
+
+@lru_cache(maxsize=4096)
+def analyze_question_intent(question: str) -> QuestionIntentProfile:
+    normalized = _normalize_question(question)
+    tokens = _tokenize(normalized)
+
+    order_signal = _matches(tokens, normalized, _ORDER_CUES)
+    duration_signal = _matches(tokens, normalized, _DURATION_CUES)
+    temporal_unit_signal = _matches(tokens, normalized, _TEMPORAL_UNIT_CUES)
+    event_pair_phrase_signal = _contains_phrase(normalized, _EVENT_PAIR_CUES.phrases)
+    event_pair_connector_signal = event_pair_phrase_signal or _contains_prefix(tokens, _EVENT_PAIR_CUES.prefixes)
+    report_signal = _matches(tokens, normalized, _REPORT_CUES)
+    expectation_signal = _matches(tokens, normalized, _EXPECTATION_CUES)
+    current_signal = _matches(tokens, normalized, _CURRENT_CUES)
+    change_signal = _matches(tokens, normalized, _CHANGE_CUES)
+    state_value_signal = _matches(tokens, normalized, _STATE_VALUE_CUES)
+    timeline_reference_signal = _matches(tokens, normalized, _TIME_REFERENCE_CUES)
+    possession_signal = _matches(tokens, normalized, _POSSESSION_CUES)
+    relation_signal = _matches(tokens, normalized, _RELATION_CUES)
+    summary_signal = _matches(tokens, normalized, _SUMMARY_CUES)
+    conflict_signal = _matches(tokens, normalized, _CONFLICT_CUES)
+    count_signal = _matches(tokens, normalized, _COUNT_CUES)
+    broad_scope_signal = _matches(tokens, normalized, _BROAD_SCOPE_CUES)
+    versus_signal = _matches(tokens, normalized, _VERSUS_CUES)
+    guidance_signal = _matches(tokens, normalized, _GUIDANCE_CUES)
+    preference_signal = _matches(tokens, normalized, _PREFERENCE_CUES)
+    list_signal = _matches(tokens, normalized, _LIST_CUES)
+    background_signal = _matches(tokens, normalized, _BACKGROUND_CUES)
+    how_signal = _matches(tokens, normalized, _HOW_CUES)
+    wh_signal = _starts_with(tokens, _WH_CUES)
+
+    stated_duration = report_signal and (expectation_signal or duration_signal or temporal_unit_signal)
+    duration = not stated_duration and (
+        duration_signal
+        or (count_signal and temporal_unit_signal)
+        or (event_pair_connector_signal and temporal_unit_signal)
+    )
+    date_interval = (
+        not stated_duration
+        and not order_signal
+        and duration
+        and (
+            _has_explicit_date_text(normalized)
+            or event_pair_phrase_signal
+            or (event_pair_connector_signal and temporal_unit_signal)
+        )
+    )
+    aggregation = count_signal or broad_scope_signal
+    broad_aggregation = aggregation and broad_scope_signal
+    state_transition = change_signal or conflict_signal or (
+        versus_signal
+        and (
+            ("current" in tokens)
+            or ("new" in tokens)
+            or ("now" in tokens)
+            or ("actual" in tokens)
+            or ("ultimo" in tokens)
+        )
+    )
+    knowledge_update = (
+        current_signal
+        or change_signal
+        or (state_value_signal and (wh_signal or possession_signal or count_signal))
+        or (count_signal and possession_signal)
+    )
+    multi_hop = relation_signal or (aggregation and broad_scope_signal)
+    contradiction = conflict_signal
+    yesno_check = _starts_with(tokens, _YESNO_START_CUES)
+    guidance = how_signal or guidance_signal
+    preference = preference_signal
+    listing = list_signal
+    background = background_signal
+    ordering = order_signal
+    summarization = summary_signal
+    how = how_signal and not yesno_check
+    temporal = ordering or duration
+    strict_duration = duration and (
+        temporal_unit_signal
+        or _contains_phrase(
+            normalized,
+            (
+                "time between",
+                "duration",
+                "how many days",
+                "how many weeks",
+                "how many months",
+                "how many years",
+                "cuantos dias",
+                "cuantas semanas",
+                "cuantos meses",
+                "cuantos anos",
+            ),
+        )
+    )
+    second_pass = ordering or date_interval or strict_duration
+
+    return QuestionIntentProfile(
+        normalized=normalized,
+        tokens=tokens,
+        ordering=ordering,
+        stated_duration=stated_duration,
+        duration=duration,
+        date_interval=date_interval,
+        timeline_reference=timeline_reference_signal,
+        knowledge_update=knowledge_update,
+        state_transition=state_transition,
+        multi_hop=multi_hop,
+        summarization=summarization,
+        aggregation=aggregation,
+        broad_aggregation=broad_aggregation,
+        contradiction=contradiction,
+        yesno_check=yesno_check,
+        how=how,
+        guidance=guidance,
+        preference=preference,
+        listing=listing,
+        background=background,
+        temporal=temporal,
+        second_pass=second_pass,
+    )
+
+
+def is_ordering_query(question: str) -> bool:
+    return analyze_question_intent(question).ordering
+
+
+def is_stated_duration_query(question: str) -> bool:
+    return analyze_question_intent(question).stated_duration
 
 
 def is_duration_query(question: str) -> bool:
-    q = question.lower()
-    return not is_stated_duration_query(q) and any(k in q for k in _DURATION_KEYWORDS)
+    return analyze_question_intent(question).duration
 
 
 def is_date_interval_query(question: str) -> bool:
-    q = question.lower()
-    if is_stated_duration_query(q) or is_ordering_query(q):
-        return False
-    if not is_duration_query(q):
-        return False
-    return _has_explicit_date_text(q) or _has_event_pair_interval_language(q)
+    return analyze_question_intent(question).date_interval
 
 
 def is_knowledge_update_query(question: str) -> bool:
-    q = question.lower()
-    return any(k in q for k in _KU_KEYWORDS)
+    return analyze_question_intent(question).knowledge_update
 
 
 def is_multi_hop_query(question: str) -> bool:
-    q = question.lower()
-    return any(k in q for k in _MR_KEYWORDS)
+    return analyze_question_intent(question).multi_hop
 
 
 def is_summarization_query(question: str) -> bool:
-    q = question.lower()
-    return any(k in q for k in _SUM_KEYWORDS)
+    return analyze_question_intent(question).summarization
 
 
 def is_aggregation_query(question: str) -> bool:
-    q = question.lower()
-    return any(k in q for k in _AGGREGATION_KEYWORDS)
+    return analyze_question_intent(question).aggregation
 
 
 def is_contradiction_query(question: str) -> bool:
-    q = question.lower()
-    return any(k in q for k in _CR_KEYWORDS)
+    return analyze_question_intent(question).contradiction
 
 
 def is_yesno_check_query(question: str) -> bool:
-    q = question.lower().lstrip()
-    return any(q.startswith(k) for k in _YESNO_CHECK_KEYWORDS)
+    return analyze_question_intent(question).yesno_check
 
 
 def is_how_query(question: str) -> bool:
-    q = question.lower()
-    return any(k in q for k in _HOW_KEYWORDS)
+    return analyze_question_intent(question).how
+
+
+def is_guidance_query(question: str) -> bool:
+    return analyze_question_intent(question).guidance
+
+
+def is_preference_query(question: str) -> bool:
+    return analyze_question_intent(question).preference
 
 
 def is_list_query(question: str) -> bool:
     """Return True when the question asks for a list of items to enumerate."""
-    q = question.lower()
-    return any(k in q for k in _LIST_KEYWORDS)
+    return analyze_question_intent(question).listing
+
+
+def is_background_query(question: str) -> bool:
+    """Return True for biographical or prior-project questions."""
+    return analyze_question_intent(question).background
 
 
 def is_temporal_query(question: str) -> bool:
-    return is_ordering_query(question) or is_duration_query(question)
+    return analyze_question_intent(question).temporal
 
 
 def needs_second_pass(question: str) -> bool:
     """Ordering/duration questions benefit from gap-analysis re-retrieval."""
-    q = question.lower()
-    strict_duration = any(
-        k in q for k in (
-            "how many days", "how many weeks", "how many months", "how many years",
-            "days between", "weeks between", "months between", "years between",
-            "time between", "duration",
-        )
-    )
-    return is_ordering_query(question) or is_date_interval_query(question) or strict_duration
+    return analyze_question_intent(question).second_pass
+
+
+def wants_instruction_preference_context(question: str) -> bool:
+    """Shared gate for guidance/policy/preference retrieval helpers."""
+    profile = analyze_question_intent(question)
+    return profile.guidance or profile.preference
+
+
+def structured_recall_intent(question: str) -> str:
+    """Map question text to the shared structured-recall intent vocabulary."""
+    profile = analyze_question_intent(question)
+
+    if profile.ordering:
+        return "ordered"
+    if profile.duration or profile.temporal:
+        return "timeline"
+    if profile.contradiction or profile.yesno_check or profile.state_transition:
+        return "change"
+    if profile.summarization or profile.broad_aggregation or profile.multi_hop:
+        return "summary"
+    if profile.knowledge_update or profile.aggregation:
+        return "current"
+    return ""
 
 
 # --- always-on base prompt (covers CR / ABS / KU / PF generically) ---------
@@ -244,7 +520,9 @@ TIMELINE COVERAGE:
 - Spread your items across the ENTIRE conversation timeline — from the LOWEST MSGIDX to the HIGHEST MSGIDX present in the context. Do NOT cluster all items on the earliest setup/feature-building topics.
 - Each item should be a distinct PHASE or milestone, distributed from the start of the conversation to the end. Ensure later phases are represented when present — e.g., testing, deployment, optimization, security hardening, error handling, and final refinements — not only the initial setup.
 - Pick the right granularity: each item is one high-level phase/aspect (how someone would summarize a milestone), NOT several sub-steps of the same early phase. Merge fine-grained early sub-steps that belong to one phase into a single item.
-- When the question says "ONLY N" items, output EXACTLY N items — no more, no fewer — and make those N span the full range of MSGIDX values."""
+- When the question says "ONLY N" items, output EXACTLY N items — no more, no fewer — and make those N span the full range of MSGIDX values.
+- Avoid GENERIC planning/setup labels when the context includes more CONCRETE implementation phases. Prefer milestone labels such as core functionality, testing, deployment, security, debugging, documentation, or error handling over generic labels like project scope, planning, timeline setup, or environment setup.
+- If the earliest messages are mostly planning/setup fragments, merge them into one opening phase and spend the remaining slots on later concrete milestones."""
 
 _DURATION_MODIFIER = """
 
@@ -253,7 +531,7 @@ Step 1: Identify the TWO specific events mentioned in the question.
 Step 2: For each event, find its date by reading the surrounding context — match the event description to the [MSGIDX:N] entry that discusses that specific event. Do NOT pick dates from unrelated events or different phases of the same topic.
 IMPORTANT: Match events by MEANING, not exact wording. The question's phrasing may differ from how events appear in context — e.g., a "launch deadline" might be stored as "go-live date" or "release target." Look for semantic matches, not literal strings.
 If the question mentions a milestone, look for ANY date associated with that milestone in the context, even if the exact phrase differs.
-IMPORTANT: If the conversation contains multiple different dates for the same event (e.g., an early plan and a later update), prefer the MOST RECENTLY STATED dates. A date stated in a later message supersedes an earlier planned date. Use the actual timing from later messages, not the initial plan.
+IMPORTANT: If the conversation contains multiple different dates for the SAME event or milestone (e.g., an early plan and a later update), prefer the MOST RECENTLY STATED date for that SAME milestone. A later message supersedes an earlier planned date only when it clearly updates or restates the same event. Do NOT replace one event with a newer date from a different phase just because it is later.
 Step 3: compute the difference between the two dates and state it explicitly (e.g. "2024-04-02 to 2024-05-03 = 31 days").
 Compute strictly from dates present in the context; do not estimate. End with the exact value the question asks for.
 
@@ -337,7 +615,11 @@ PROCEDURAL CONFLICT OVERRIDE: This overrides base rule 3. Unless the question ex
 
 _LIST_MODIFIER = """
 
-LIST COMPLETENESS: This question asks for a list of items. Be EXHAUSTIVE — include EVERY item found in the context with ALL available details (versions, configurations, purposes). Do not truncate or summarize. If versions are mentioned, always include the exact version number next to each item. Format as a bullet list or comma-separated list with details. Do NOT cut off your answer early — provide a complete enumeration."""
+LIST COMPLETENESS: This question asks for a list of items. Be EXHAUSTIVE — include EVERY item found in the context with ALL available details (versions, configurations, purposes). Do not truncate or summarize. If versions are mentioned, always include the exact version number next to each item. For dependency/library/framework questions, OMIT any item whose version is not explicitly stated in the context rather than listing it without a version. Format as a bullet list or comma-separated list with details. Do NOT cut off your answer early — provide a complete enumeration."""
+
+_BACKGROUND_MODIFIER = """
+
+BACKGROUND / PRIOR-PROJECT QUESTIONS: These questions ask about the user's personal background, prior work experience, or previous development projects. Only answer them when the context directly contains that biographical or prior-project information. Details about the CURRENT project, current codebase, or current implementation work do NOT count as evidence about personal background or previous projects. If that direct evidence is missing, give an absence answer and STOP there — do NOT append tangential current-project examples after abstaining."""
 
 
 def _procedural_base_prompt() -> str:
@@ -353,15 +635,16 @@ def _procedural_base_prompt() -> str:
 
 def build_system_prompt(question: str) -> str:
     """Base behavior always; append format guidance only when the question asks for it."""
-    yesno_query = is_yesno_check_query(question)
-    how_query = is_how_query(question) and not yesno_query
-    contradiction_query = is_contradiction_query(question)
+    profile = analyze_question_intent(question)
+    yesno_query = profile.yesno_check
+    how_query = profile.how and not yesno_query
+    contradiction_query = profile.contradiction
     prompt = _procedural_base_prompt() if how_query and not contradiction_query else _BASE_PROMPT
-    if is_ordering_query(question):
+    if profile.ordering:
         prompt += _ORDERING_MODIFIER
-    if is_stated_duration_query(question):
+    if profile.stated_duration:
         prompt += _STATED_DURATION_MODIFIER
-    elif is_duration_query(question):
+    elif profile.duration:
         prompt += _DURATION_MODIFIER
     if contradiction_query:
         prompt += _CR_MODIFIER
@@ -369,12 +652,14 @@ def build_system_prompt(question: str) -> str:
         prompt += _YESNO_CHECK_MODIFIER
     if how_query:
         prompt += _HOW_MODIFIER
-    if is_knowledge_update_query(question):
+    if profile.knowledge_update:
         prompt += _KU_MODIFIER
-    if is_multi_hop_query(question):
+    if profile.multi_hop:
         prompt += _MR_MODIFIER
-    if is_summarization_query(question):
+    if profile.summarization:
         prompt += _SUM_MODIFIER
-    if is_list_query(question):
+    if profile.listing:
         prompt += _LIST_MODIFIER
+    if profile.background:
+        prompt += _BACKGROUND_MODIFIER
     return prompt

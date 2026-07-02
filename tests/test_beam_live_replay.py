@@ -92,7 +92,7 @@ def test_beam_live_replay(tmp_path):
     cases = _select_cases(_load_cases())
     assert cases, "beam live replay fixture did not yield any cases"
 
-    answer_model = _resolve_model("EDUMEM_LLM_MODEL", "deepseek-v4-flash")
+    answer_model = _resolve_model("EDUMEM_LLM_MODEL", "qwen3.6")
     judge_model = _resolve_model("EDUMEM_JUDGE_MODEL", answer_model)
     should_judge = os.getenv("BEAM_LIVE_JUDGE") == "1"
     min_score = float(os.getenv("BEAM_LIVE_MIN_SCORE", "0.5"))

@@ -7,26 +7,27 @@ Reuses the same patterns as tools/evaluate_beam_end_to_end.py LLMClient.
 import json as _json
 import logging
 import os
+import re
 import time
 import urllib.request
 
 logger = logging.getLogger(__name__)
 
 # ── Defaults ──────────────────────────────────────────────────────────────
-def _default_extraction_model() -> str:
+def _default_extraction_model() -> str | None:
     """Resolve the model used for fact + conclusion extraction.
 
     Defaults to the canonical chat model (EDUMEM_LLM_MODEL) so extraction runs on
     the SAME provider/endpoint as the answer path -- e.g. qwen3.6 on NAN.
-    Otherwise the google/gemini default silently no-ops against a NAN base_url
-    (NAN does not serve Gemini), producing zero facts/conclusions. Precedence:
-    EDUMEM_EXTRACTION_MODEL (explicit override) > EDUMEM_LLM_MODEL (canonical
-    chat model) > google/gemini-2.5-flash (self-hosted / OpenRouter fallback).
+    Precedence: EDUMEM_EXTRACTION_MODEL (explicit override) > EDUMEM_LLM_MODEL
+    (canonical chat model). NO hardcoded fallback; returns None when unconfigured
+    (the caller raises). A silent default (e.g. a Gemini model an endpoint can't
+    serve) just no-ops/401s and produces zero facts -- fail loud instead.
     """
     return (
         os.environ.get("EDUMEM_EXTRACTION_MODEL")
         or os.environ.get("EDUMEM_LLM_MODEL")
-        or "google/gemini-2.5-flash"
+        or None
     )
 
 
@@ -100,9 +101,35 @@ class ExtractionClient:
         base_url: str = None,
     ):
         self.model = model or _default_extraction_model()
+        if not self.model:
+            raise RuntimeError(
+                "No extraction model configured: set EDUMEM_LLM_MODEL "
+                "(or EDUMEM_EXTRACTION_MODEL) to a model your endpoint serves."
+            )
         self.api_key = api_key or EXTRACTION_API_KEY
         self.base_url = (base_url or OPENROUTER_BASE_URL).rstrip("/")
         self.call_count = 0
+
+    # Patient attempt budget per model for chat() (429s, transient 401/5xx, AND
+    # empty responses). The NAN endpoint has intermittent multi-minute outage
+    # waves; a 3-attempt (~3s) budget can't survive them. Override with
+    # EDUMEM_LLM_MAX_ATTEMPTS. Backoff is capped (see chat()) so high attempt
+    # counts don't wait absurdly long.
+    _CHAT_MAX_ATTEMPTS = max(1, int(os.environ.get("EDUMEM_LLM_MAX_ATTEMPTS", "8")))
+    _CHAT_BACKOFF_CAP = max(1, int(os.environ.get("EDUMEM_LLM_BACKOFF_CAP", "30")))
+
+    @staticmethod
+    def _should_retry_empty(attempt: int, max_attempts: int = 3) -> bool:
+        """Decide whether an EMPTY (but non-error, non-429) API response should
+        be retried.
+
+        Pure predicate (no I/O) so the retry DECISION is testable with real
+        objects and no network. Empty completions from the NAN endpoint are
+        transient: retry within the same bounded budget used for 429s, but only
+        while attempts remain (attempt is 0-based; the final attempt does not
+        retry).
+        """
+        return attempt < max_attempts - 1
 
     def chat(
         self,
@@ -143,28 +170,51 @@ class ExtractionClient:
         last_exc = None
 
         for model in models_to_try:
-            for attempt in range(3):
+            for attempt in range(self._CHAT_MAX_ATTEMPTS):
                 try:
                     result = self._call_api(
                         model, messages, temperature, max_tokens
                     )
                     if not result:
-                        # API returned empty content. Record on the
-                        # cloud-tier no_output counter; extract_facts
-                        # will record the outer call outcome.
+                        # API returned a successful response with EMPTY
+                        # content (no exception, no 429). Observed as
+                        # transient NAN-endpoint flakiness: qwen3.6 can
+                        # return 0-char completions for many consecutive
+                        # calls, then recover. Treat as a retryable
+                        # transport failure with the SAME bounded budget
+                        # and backoff as 429s. Record one no_output per
+                        # empty attempt (mirrors the prior behavior of
+                        # recording no_output before returning).
                         diag.record_no_output("cloud")
+                        if self._should_retry_empty(attempt, self._CHAT_MAX_ATTEMPTS):
+                            time.sleep(min(2 ** attempt, self._CHAT_BACKOFF_CAP))
+                            continue
+                        # Budget exhausted: behave as before — return
+                        # the empty result so the caller can fall back.
+                        return result
                     # Note: don't record success here. extract_facts()
                     # decides based on parseable output.
                     return result
                 except Exception as e:
                     last_exc = e
                     msg = str(e)
-                    if "429" in msg or "rate" in msg.lower():
-                        wait = 2 ** attempt
-                        time.sleep(wait)
+                    # Retry transient transport failures with bounded backoff.
+                    # Auth failures are not transient here: a bad or mismatched
+                    # key should fail fast instead of making every extraction
+                    # call wait through the full retry budget.
+                    is_auth_error = bool(re.search(r"\b(401|403)\b", msg))
+                    transient = (not is_auth_error) and (
+                        bool(re.search(r"\b(408|409|425|429|5\d\d)\b", msg))
+                        or any(t in msg.lower() for t in (
+                            "rate", "timeout", "timed out", "connection",
+                            "temporarily", "unavailable", "reset",
+                        ))
+                    )
+                    if transient and attempt < self._CHAT_MAX_ATTEMPTS - 1:
+                        time.sleep(2 ** attempt)
                         continue
                     else:
-                        break  # Non-retryable, try next model
+                        break  # non-retryable (or budget exhausted), try next model
             # Brief pause between models
             time.sleep(1)
 
@@ -302,6 +352,135 @@ class ExtractionClient:
 
         return []
 
+    @staticmethod
+    def _parse_json_object(response: str) -> dict | None:
+        """Extract a JSON object from a model response string.
+
+        Handles:
+        - Clean JSON object strings.
+        - ```json ... ``` or ``` ... ``` fenced blocks.
+        - Leading/trailing whitespace.
+
+        Returns the parsed dict on success, or None on failure.
+        """
+        if not response:
+            return None
+        text = response.strip()
+        # Strip code fences if present.
+        if text.startswith("```"):
+            # Drop the opening fence line and the closing fence.
+            lines = text.splitlines()
+            # Remove first line (```json or ```)
+            lines = lines[1:]
+            # Remove last line if it is a closing fence
+            if lines and lines[-1].strip().startswith("```"):
+                lines = lines[:-1]
+            text = "\n".join(lines).strip()
+        # If the outermost value is a JSON array, this is not a card patch.
+        if text.startswith("["):
+            return None
+        # Find the outermost { ... } object.
+        start = text.find("{")
+        end = text.rfind("}") + 1
+        if start < 0 or end <= start:
+            return None
+        try:
+            parsed = _json.loads(text[start:end])
+            if isinstance(parsed, dict):
+                return parsed
+        except (_json.JSONDecodeError, ValueError):
+            pass
+        return None
+
+    @staticmethod
+    def _build_card_update_messages(
+        current_card: dict | None,
+        agenda: dict,
+        evidence_rows: list[dict],
+        session_overview: dict | None = None,
+    ) -> list[dict]:
+        """Build the system+user chat messages for a card-update call.
+
+        Pure (no network): renders CARD_UPDATE_USER_TEMPLATE with the inputs as
+        JSON. Factored out so the rendering can be tested with real objects.
+        """
+        from .prompts import CARD_UPDATE_SYSTEM_PROMPT, CARD_UPDATE_USER_TEMPLATE
+
+        user_content = CARD_UPDATE_USER_TEMPLATE.format(
+            agenda_json=_json.dumps(agenda, ensure_ascii=False),
+            current_card_json=_json.dumps(current_card, ensure_ascii=False),
+            session_overview_json=_json.dumps(session_overview, ensure_ascii=False),
+            evidence_rows_json=_json.dumps(evidence_rows, ensure_ascii=False),
+        )
+        return [
+            {"role": "system", "content": CARD_UPDATE_SYSTEM_PROMPT},
+            {"role": "user", "content": user_content},
+        ]
+
+    @staticmethod
+    def _build_session_overview_messages(live_cards: list[dict]) -> list[dict]:
+        """Build the system+user chat messages for a session-overview refresh.
+
+        Pure (no network): renders SESSION_OVERVIEW_USER_TEMPLATE with the live
+        cards as JSON. Factored out so the rendering can be tested with real
+        objects.
+        """
+        from .prompts import (
+            SESSION_OVERVIEW_SYSTEM_PROMPT,
+            SESSION_OVERVIEW_USER_TEMPLATE,
+        )
+
+        user_content = SESSION_OVERVIEW_USER_TEMPLATE.format(
+            live_cards_json=_json.dumps(live_cards, ensure_ascii=False),
+        )
+        return [
+            {"role": "system", "content": SESSION_OVERVIEW_SYSTEM_PROMPT},
+            {"role": "user", "content": user_content},
+        ]
+
+    def update_card(
+        self,
+        current_card: dict | None,
+        agenda: dict,
+        evidence_rows: list[dict],
+        session_overview: dict | None = None,
+    ) -> dict:
+        """Ask the LLM to emit a card patch for one dream-worker agenda item.
+
+        Returns the card-patch dict on success. On any parse failure or empty
+        response, returns {"action": "NOOP"} — a safe no-op default.
+        """
+        messages = self._build_card_update_messages(
+            current_card, agenda, evidence_rows, session_overview
+        )
+        response = self.chat(messages, temperature=0.0, max_tokens=1024)
+        patch = self._parse_json_object(response)
+        if patch is None:
+            logger.warning(
+                "ExtractionClient.update_card: JSON parse failed; %d chars returned",
+                len(response),
+            )
+            return {"action": "NOOP"}
+        return patch
+
+    def refresh_session_overview(self, live_cards: list[dict]) -> dict:
+        """Synthesize a session:overview card patch from current live cards.
+
+        Does not reread the raw conversation. Returns the card-patch dict on
+        success, or {"action": "NOOP"} on any parse failure or empty response.
+        """
+        messages = self._build_session_overview_messages(live_cards)
+        response = self.chat(messages, temperature=0.0, max_tokens=1024)
+        patch = self._parse_json_object(response)
+        if patch is None:
+            logger.warning(
+                "ExtractionClient.refresh_session_overview: JSON parse failed; "
+                "%d chars returned",
+                len(response),
+            )
+            return {"action": "NOOP"}
+        return patch
+
     def extract_conclusions(self, messages: list) -> list:
         """Extract synthesized CONCLUSIONS from a batch of messages.
 
@@ -328,7 +507,7 @@ class ExtractionClient:
                 conversation_text=conversation_text)},
         ]
 
-        response = self.chat(chat_messages, temperature=0.0, max_tokens=4096)
+        response = self.chat(chat_messages, temperature=0.0, max_tokens=8192)
         if not response:
             return []
 

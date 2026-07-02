@@ -16,7 +16,14 @@ from .diagnostics import (
     get_extraction_stats,
     reset_extraction_stats,
 )
-from .prompts import EXTRACTION_SYSTEM_PROMPT, EXTRACTION_USER_TEMPLATE
+from .prompts import (
+    EXTRACTION_SYSTEM_PROMPT,
+    EXTRACTION_USER_TEMPLATE,
+    CARD_UPDATE_SYSTEM_PROMPT,
+    CARD_UPDATE_USER_TEMPLATE,
+    SESSION_OVERVIEW_SYSTEM_PROMPT,
+    SESSION_OVERVIEW_USER_TEMPLATE,
+)
 
 
 @dataclass
@@ -24,7 +31,7 @@ class ExtractionConfig:
     """Configuration for the LLM fact extraction engine."""
 
     enabled: bool = False
-    model: str = "google/gemini-2.5-flash"
+    model: str | None = None
     batch_size: int = 20
     min_confidence: float = 0.3
 
@@ -35,6 +42,10 @@ __all__ = [
     "ExtractionDiagnostics",
     "EXTRACTION_SYSTEM_PROMPT",
     "EXTRACTION_USER_TEMPLATE",
+    "CARD_UPDATE_SYSTEM_PROMPT",
+    "CARD_UPDATE_USER_TEMPLATE",
+    "SESSION_OVERVIEW_SYSTEM_PROMPT",
+    "SESSION_OVERVIEW_USER_TEMPLATE",
     "get_diagnostics",
     "get_extraction_stats",
     "reset_extraction_stats",

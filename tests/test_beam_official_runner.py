@@ -73,3 +73,38 @@ def test_runner_fails_on_closed_local_ports():
 
     with pytest.raises(RuntimeError, match="reranker preflight failed"):
         runner._preflight_reranker(reranker_url)
+
+
+def test_runner_nan_provider_defaults_to_qwen36_for_answer_and_judge(monkeypatch, tmp_path):
+    monkeypatch.setattr(runner, "WORKDIR", tmp_path)
+    monkeypatch.setenv("NAN_API_KEY", "test-nan-key")
+    monkeypatch.delenv("EDUMEM_LLM_MODEL", raising=False)
+    monkeypatch.delenv("EDUMEM_JUDGE_MODEL", raising=False)
+    monkeypatch.delenv("CHAT_MODEL_BASE_URL", raising=False)
+
+    monkeypatch.setattr(runner, "_preflight_embedding", lambda *args, **kwargs: None)
+    monkeypatch.setattr(runner, "_preflight_reranker", lambda *args, **kwargs: None)
+
+    captured: dict[str, object] = {}
+
+    def fake_run(cmd, env=None, check=None):
+        captured["cmd"] = cmd
+        captured["env"] = env
+        captured["check"] = check
+        return runner.subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(runner.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        runner.sys,
+        "argv",
+        ["run_beam_official.py", "--provider", "nan", "--dry-run"],
+    )
+
+    runner.main()
+
+    cmd = captured["cmd"]
+    env = captured["env"]
+    assert cmd[cmd.index("--model") + 1] == "qwen3.6"
+    assert cmd[cmd.index("--judge-model") + 1] == "qwen3.6"
+    assert env["EDUMEM_LLM_MODEL"] == "qwen3.6"
+    assert env["EDUMEM_JUDGE_MODEL"] == "qwen3.6"

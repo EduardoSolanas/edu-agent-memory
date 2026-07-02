@@ -23,6 +23,7 @@ from tools.evaluate_beam_end_to_end import (
     _print_env_snapshot,
     _question_row_policy,
     _query_wants_if_pf,
+    _recall_safe,
     _select_conversations,
     _sanitize_sensitive_data,
     _summarize_judge_result,
@@ -3170,11 +3171,48 @@ def test_fused_recall_includes_kg_source(tmp_path):
 # Integration: flag-gated LLM extraction end-to-end
 # ---------------------------------------------------------------------------
 
+def test_llm_extraction_is_disabled_without_flag(tmp_path):
+    """A live llm_client stays idle unless EDUMEM_LLM_EXTRACTION is on."""
+    saved = os.environ.get("EDUMEM_NO_EMBEDDINGS")
+    saved_extra = os.environ.get("EDUMEM_LLM_EXTRACTION")
+    os.environ["EDUMEM_NO_EMBEDDINGS"] = "1"
+    os.environ.pop("EDUMEM_LLM_EXTRACTION", None)
+    try:
+        response = json.dumps({
+            "facts": [{"key": "launch_status", "value": "ready", "type": "metric"}],
+            "entities": [],
+            "relations": [],
+            "dates": [],
+        })
+        beam, client = _make_beam_with_llm(tmp_path, response=response)
+        counts = beam.extract_and_store_facts("A simple note about the launch.", message_idx=5)
+
+        assert client.chat_calls == [], "llm_client.chat should not run without the opt-in flag"
+        assert counts.get("llm_facts", 0) == 0
+        row = beam.conn.execute(
+            "SELECT COUNT(*) FROM memoria_facts WHERE session_id=? AND key='launch_status'",
+            (beam.session_id,),
+        ).fetchone()
+        assert row[0] == 0
+    finally:
+        beam.conn.close()
+        if saved is None:
+            os.environ.pop("EDUMEM_NO_EMBEDDINGS", None)
+        else:
+            os.environ["EDUMEM_NO_EMBEDDINGS"] = saved
+        if saved_extra is None:
+            os.environ.pop("EDUMEM_LLM_EXTRACTION", None)
+        else:
+            os.environ["EDUMEM_LLM_EXTRACTION"] = saved_extra
+
+
 def test_llm_extraction_happy_path_flag_on(tmp_path):
     """Full end-to-end: flag ON, client returns valid JSON → correct counts + storage."""
     saved = os.environ.get("EDUMEM_NO_EMBEDDINGS")
+    saved_extra = os.environ.get("EDUMEM_LLM_EXTRACTION")
     saved_consol = os.environ.get("EDUMEM_LLM_FACT_CONSOLIDATION")
     os.environ["EDUMEM_NO_EMBEDDINGS"] = "1"
+    os.environ["EDUMEM_LLM_EXTRACTION"] = "1"
     os.environ["EDUMEM_LLM_FACT_CONSOLIDATION"] = "0"
     try:
         response = json.dumps({
@@ -3229,6 +3267,10 @@ def test_llm_extraction_happy_path_flag_on(tmp_path):
             os.environ.pop("EDUMEM_NO_EMBEDDINGS", None)
         else:
             os.environ["EDUMEM_NO_EMBEDDINGS"] = saved
+        if saved_extra is None:
+            os.environ.pop("EDUMEM_LLM_EXTRACTION", None)
+        else:
+            os.environ["EDUMEM_LLM_EXTRACTION"] = saved_extra
         if saved_consol is None:
             os.environ.pop("EDUMEM_LLM_FACT_CONSOLIDATION", None)
         else:
@@ -3238,8 +3280,10 @@ def test_llm_extraction_happy_path_flag_on(tmp_path):
 def test_llm_extraction_version_chains_across_messages(tmp_path):
     """Flag ON: same key in two messages → version chain with previous_value."""
     saved = os.environ.get("EDUMEM_NO_EMBEDDINGS")
+    saved_extra = os.environ.get("EDUMEM_LLM_EXTRACTION")
     saved_consol = os.environ.get("EDUMEM_LLM_FACT_CONSOLIDATION")
     os.environ["EDUMEM_NO_EMBEDDINGS"] = "1"
+    os.environ["EDUMEM_LLM_EXTRACTION"] = "1"
     os.environ["EDUMEM_LLM_FACT_CONSOLIDATION"] = "0"
     try:
         v1 = json.dumps({
@@ -3272,6 +3316,10 @@ def test_llm_extraction_version_chains_across_messages(tmp_path):
             os.environ.pop("EDUMEM_NO_EMBEDDINGS", None)
         else:
             os.environ["EDUMEM_NO_EMBEDDINGS"] = saved
+        if saved_extra is None:
+            os.environ.pop("EDUMEM_LLM_EXTRACTION", None)
+        else:
+            os.environ["EDUMEM_LLM_EXTRACTION"] = saved_extra
         if saved_consol is None:
             os.environ.pop("EDUMEM_LLM_FACT_CONSOLIDATION", None)
         else:
@@ -3281,8 +3329,10 @@ def test_llm_extraction_version_chains_across_messages(tmp_path):
 def test_regex_keys_appear_in_llm_prompt(tmp_path):
     """Regex-extracted keys appear as structured categories (not flat list) in the LLM prompt."""
     saved = os.environ.get("EDUMEM_NO_EMBEDDINGS")
+    saved_extra = os.environ.get("EDUMEM_LLM_EXTRACTION")
     saved_consol = os.environ.get("EDUMEM_LLM_FACT_CONSOLIDATION")
     os.environ["EDUMEM_NO_EMBEDDINGS"] = "1"
+    os.environ["EDUMEM_LLM_EXTRACTION"] = "1"
     os.environ["EDUMEM_LLM_FACT_CONSOLIDATION"] = "0"
     try:
         response = json.dumps({"facts": [], "entities": [], "relations": [], "dates": []})
@@ -3308,6 +3358,10 @@ def test_regex_keys_appear_in_llm_prompt(tmp_path):
             os.environ.pop("EDUMEM_NO_EMBEDDINGS", None)
         else:
             os.environ["EDUMEM_NO_EMBEDDINGS"] = saved
+        if saved_extra is None:
+            os.environ.pop("EDUMEM_LLM_EXTRACTION", None)
+        else:
+            os.environ["EDUMEM_LLM_EXTRACTION"] = saved_extra
         if saved_consol is None:
             os.environ.pop("EDUMEM_LLM_FACT_CONSOLIDATION", None)
         else:
@@ -3317,8 +3371,10 @@ def test_regex_keys_appear_in_llm_prompt(tmp_path):
 def test_llm_extraction_empty_parse_falls_back_to_regex(tmp_path):
     """Flag ON but empty JSON response → falls through to regex path."""
     saved = os.environ.get("EDUMEM_NO_EMBEDDINGS")
+    saved_extra = os.environ.get("EDUMEM_LLM_EXTRACTION")
     saved_consol = os.environ.get("EDUMEM_LLM_FACT_CONSOLIDATION")
     os.environ["EDUMEM_NO_EMBEDDINGS"] = "1"
+    os.environ["EDUMEM_LLM_EXTRACTION"] = "1"
     os.environ["EDUMEM_LLM_FACT_CONSOLIDATION"] = "0"
     try:
         response = json.dumps({"facts": [], "entities": [], "relations": [], "dates": []})
@@ -3334,6 +3390,10 @@ def test_llm_extraction_empty_parse_falls_back_to_regex(tmp_path):
             os.environ.pop("EDUMEM_NO_EMBEDDINGS", None)
         else:
             os.environ["EDUMEM_NO_EMBEDDINGS"] = saved
+        if saved_extra is None:
+            os.environ.pop("EDUMEM_LLM_EXTRACTION", None)
+        else:
+            os.environ["EDUMEM_LLM_EXTRACTION"] = saved_extra
         if saved_consol is None:
             os.environ.pop("EDUMEM_LLM_FACT_CONSOLIDATION", None)
         else:
@@ -3343,8 +3403,10 @@ def test_llm_extraction_empty_parse_falls_back_to_regex(tmp_path):
 def test_llm_extraction_client_exception_falls_back_to_regex(tmp_path):
     """Flag ON but client raises → falls through to regex path."""
     saved = os.environ.get("EDUMEM_NO_EMBEDDINGS")
+    saved_extra = os.environ.get("EDUMEM_LLM_EXTRACTION")
     saved_consol = os.environ.get("EDUMEM_LLM_FACT_CONSOLIDATION")
     os.environ["EDUMEM_NO_EMBEDDINGS"] = "1"
+    os.environ["EDUMEM_LLM_EXTRACTION"] = "1"
     os.environ["EDUMEM_LLM_FACT_CONSOLIDATION"] = "0"
     try:
 
@@ -3370,6 +3432,10 @@ def test_llm_extraction_client_exception_falls_back_to_regex(tmp_path):
             os.environ.pop("EDUMEM_NO_EMBEDDINGS", None)
         else:
             os.environ["EDUMEM_NO_EMBEDDINGS"] = saved
+        if saved_extra is None:
+            os.environ.pop("EDUMEM_LLM_EXTRACTION", None)
+        else:
+            os.environ["EDUMEM_LLM_EXTRACTION"] = saved_extra
         if saved_consol is None:
             os.environ.pop("EDUMEM_LLM_FACT_CONSOLIDATION", None)
         else:
@@ -3380,7 +3446,11 @@ def test_regex_and_llm_dedup_same_key(tmp_path):
     """Same fact from regex + LLM should dedup, not duplicate."""
     import json
     saved = os.environ.get("EDUMEM_NO_EMBEDDINGS")
+    saved_extra = os.environ.get("EDUMEM_LLM_EXTRACTION")
+    saved_consol = os.environ.get("EDUMEM_LLM_FACT_CONSOLIDATION")
     os.environ["EDUMEM_NO_EMBEDDINGS"] = "1"
+    os.environ["EDUMEM_LLM_EXTRACTION"] = "1"
+    os.environ["EDUMEM_LLM_FACT_CONSOLIDATION"] = "0"
     try:
         response = json.dumps({
             "facts": [{"key": "response_time_ms", "value": "250ms", "type": "metric"}],
@@ -3410,6 +3480,14 @@ def test_regex_and_llm_dedup_same_key(tmp_path):
             os.environ.pop("EDUMEM_NO_EMBEDDINGS", None)
         else:
             os.environ["EDUMEM_NO_EMBEDDINGS"] = saved
+        if saved_extra is None:
+            os.environ.pop("EDUMEM_LLM_EXTRACTION", None)
+        else:
+            os.environ["EDUMEM_LLM_EXTRACTION"] = saved_extra
+        if saved_consol is None:
+            os.environ.pop("EDUMEM_LLM_FACT_CONSOLIDATION", None)
+        else:
+            os.environ["EDUMEM_LLM_FACT_CONSOLIDATION"] = saved_consol
 
 
 def test_derive_durations_in_pipeline(tmp_path):
@@ -3455,8 +3533,10 @@ def test_full_pipeline_regex_then_llm_version_chain(tmp_path):
     """Regex + LLM writing same key across messages should version-chain."""
     import json, os
     saved = os.environ.get("EDUMEM_NO_EMBEDDINGS")
+    saved_extra = os.environ.get("EDUMEM_LLM_EXTRACTION")
     saved_consol = os.environ.get("EDUMEM_LLM_FACT_CONSOLIDATION")
     os.environ["EDUMEM_NO_EMBEDDINGS"] = "1"
+    os.environ["EDUMEM_LLM_EXTRACTION"] = "1"
     os.environ["EDUMEM_LLM_FACT_CONSOLIDATION"] = "0"
     try:
         v1_response = json.dumps({
@@ -3494,6 +3574,10 @@ def test_full_pipeline_regex_then_llm_version_chain(tmp_path):
             os.environ.pop("EDUMEM_NO_EMBEDDINGS", None)
         else:
             os.environ["EDUMEM_NO_EMBEDDINGS"] = saved
+        if saved_extra is None:
+            os.environ.pop("EDUMEM_LLM_EXTRACTION", None)
+        else:
+            os.environ["EDUMEM_LLM_EXTRACTION"] = saved_extra
         if saved_consol is None:
             os.environ.pop("EDUMEM_LLM_FACT_CONSOLIDATION", None)
         else:
@@ -3647,68 +3731,51 @@ def test_summary_prompt_is_bounded(tmp_path):
             os.environ["EDUMEM_NO_EMBEDDINGS"] = saved
 
 
-def test_fused_recall_includes_summary_source_when_flag_on(tmp_path):
-    """Summary source appears in fused recall only when EDUMEM_LLM_SUMMARY=1."""
+def test_fused_recall_always_includes_summaries(tmp_path):
+    """Summaries are always fused into recall — no env flag, matching the
+    always-on card layer. A stored summary surfaces with no EDUMEM_LLM_SUMMARY set."""
     saved_emb = os.environ.get("EDUMEM_NO_EMBEDDINGS")
-    saved_sum = os.environ.get("EDUMEM_LLM_SUMMARY")
+    saved_sum = os.environ.pop("EDUMEM_LLM_SUMMARY", None)  # ensure no stray flag
     os.environ["EDUMEM_NO_EMBEDDINGS"] = "1"
     try:
         beam = _make_beam(tmp_path)
         beam._store_summary(beam.session_id, 0, 19, "User discussed Python learning progress and goals.")
 
-        # Flag ON — summary source must appear in fused context
-        os.environ["EDUMEM_LLM_SUMMARY"] = "1"
-        result_on = beam.memoria_retrieve("Python learning progress", top_k=5)
-        assert "Python" in result_on.get("context", ""), "summary not fused when flag is ON"
-
-        # Flag OFF — summary source must NOT appear in fused context (only from this specialist)
-        os.environ["EDUMEM_LLM_SUMMARY"] = "0"
-        result_off = beam.memoria_retrieve("Python learning progress", top_k=5)
-        # The summary row should not come from the summaries specialist when flag is off
-        # (other specialists like fact might still surface something, so we check source)
-        off_context = result_off.get("context", "")
-        # If there are no other facts, context should be empty
-        # At minimum, verify flag-off doesn't crash
-        assert isinstance(off_context, str)
+        # No flag set — summary must still appear in fused context (always-on).
+        result = beam.memoria_retrieve("Python learning progress", top_k=5)
+        assert "Python" in result.get("context", ""), "summary not fused (should be always-on)"
     finally:
         if saved_emb is None:
             os.environ.pop("EDUMEM_NO_EMBEDDINGS", None)
         else:
             os.environ["EDUMEM_NO_EMBEDDINGS"] = saved_emb
-        if saved_sum is None:
-            os.environ.pop("EDUMEM_LLM_SUMMARY", None)
-        else:
+        if saved_sum is not None:
             os.environ["EDUMEM_LLM_SUMMARY"] = saved_sum
 
 
-def test_summary_flag_off_writes_nothing(tmp_path):
-    """When EDUMEM_LLM_SUMMARY is off, no summaries are written during ingestion."""
+def test_summary_not_written_without_llm_client(tmp_path):
+    """Summaries are always-on but require an llm_client to generate (the segment
+    summary is an LLM call). Without one, ingestion writes no summaries."""
     saved_emb = os.environ.get("EDUMEM_NO_EMBEDDINGS")
-    saved_sum = os.environ.get("EDUMEM_LLM_SUMMARY")
+    saved_sum = os.environ.pop("EDUMEM_LLM_SUMMARY", None)
     os.environ["EDUMEM_NO_EMBEDDINGS"] = "1"
-    # Ensure flag is OFF (default)
-    os.environ.pop("EDUMEM_LLM_SUMMARY", None)
     try:
-        beam = _make_beam(tmp_path)
-        # Ingest some messages — no llm_client, flag off
+        beam = _make_beam(tmp_path)  # no llm_client
         ingest_conversation(beam, [
             {"role": "user", "content": "I love hiking in the mountains."},
             {"role": "assistant", "content": "That sounds wonderful!"},
         ])
-        # memoria_summaries table must exist but be empty
         count = beam.conn.execute(
             "SELECT COUNT(*) FROM memoria_summaries WHERE session_id = ?",
             (beam.session_id,)
         ).fetchone()[0]
-        assert count == 0, f"Expected 0 summaries when flag is off, got {count}"
+        assert count == 0, f"Expected 0 summaries without llm_client, got {count}"
     finally:
         if saved_emb is None:
             os.environ.pop("EDUMEM_NO_EMBEDDINGS", None)
         else:
             os.environ["EDUMEM_NO_EMBEDDINGS"] = saved_emb
-        if saved_sum is None:
-            os.environ.pop("EDUMEM_LLM_SUMMARY", None)
-        else:
+        if saved_sum is not None:
             os.environ["EDUMEM_LLM_SUMMARY"] = saved_sum
 
 
@@ -3982,6 +4049,47 @@ def test_sub_budgets_global_override(tmp_path):
             os.environ["EDUMEM_SUB_BUDGET_TIMELINE"] = tl_saved
 
 
+def test_memoria_sub_budget_keeps_raw_messages_visible(tmp_path):
+    """A huge MEMORIA blob must not crowd out raw messages from context."""
+    memoria_saved = os.environ.get("EDUMEM_SUB_BUDGET_MEMORIA")
+    os.environ["EDUMEM_SUB_BUDGET_MEMORIA"] = "500"
+    try:
+        items = [
+            {
+                "content": "[MEMORIA fused]\n" + ("M" * 4000),
+                "score": 0.99,
+                "type": "memoria",
+                "source_memory_id": "memoria:blob",
+            },
+            {
+                "content": "RAW_ALPHA raw message about the actual conversation",
+                "score": 0.70,
+                "type": "other",
+                "source_memory_id": "raw-alpha",
+            },
+            {
+                "content": "RAW_BETA another raw message that should still fit",
+                "score": 0.60,
+                "type": "other",
+                "source_memory_id": "raw-beta",
+            },
+        ]
+
+        ctx, mems = _assemble_memory_context(items, 2000)
+        included = [m for m in mems if m.get("final_context_included")]
+        included_text = "\n".join(m.get("content", "") for m in included)
+
+        assert "RAW_ALPHA" in ctx, "Raw messages should remain visible when MEMORIA is capped"
+        assert "RAW_BETA" in ctx, "Raw messages should remain visible when MEMORIA is capped"
+        assert "MEMORIA fused" not in included_text, "The oversized MEMORIA blob should be capped out"
+        assert len(ctx) <= 2000, f"Context must still respect the global max_chars budget, got {len(ctx)}"
+    finally:
+        if memoria_saved is None:
+            os.environ.pop("EDUMEM_SUB_BUDGET_MEMORIA", None)
+        else:
+            os.environ["EDUMEM_SUB_BUDGET_MEMORIA"] = memoria_saved
+
+
 # ---------------------------------------------------------------------------
 # Duration derivation (TR coverage gap)
 # ---------------------------------------------------------------------------
@@ -4107,7 +4215,9 @@ def test_llm_extraction_compliance_signal(tmp_path):
     """LLM returning empty JSON for a non-trivial message increments _llm_empty_parse."""
     import json
     saved = os.environ.get("EDUMEM_NO_EMBEDDINGS")
+    saved_extra = os.environ.get("EDUMEM_LLM_EXTRACTION")
     os.environ["EDUMEM_NO_EMBEDDINGS"] = "1"
+    os.environ["EDUMEM_LLM_EXTRACTION"] = "1"
     try:
         empty_json = json.dumps({"facts": [], "entities": [], "relations": [], "dates": []})
         beam, _ = _make_beam_with_llm(tmp_path, response=empty_json)
@@ -4121,6 +4231,10 @@ def test_llm_extraction_compliance_signal(tmp_path):
             os.environ.pop("EDUMEM_NO_EMBEDDINGS", None)
         else:
             os.environ["EDUMEM_NO_EMBEDDINGS"] = saved
+        if saved_extra is None:
+            os.environ.pop("EDUMEM_LLM_EXTRACTION", None)
+        else:
+            os.environ["EDUMEM_LLM_EXTRACTION"] = saved_extra
 
 
 # ---------------------------------------------------------------------------
@@ -4423,3 +4537,492 @@ def test_context_assembly_still_works_from_tools():
     """The re-export of _assemble_memory_context in evaluate_beam_end_to_end still works."""
     from tools.evaluate_beam_end_to_end import _assemble_memory_context
     assert callable(_assemble_memory_context)
+
+
+def test_recall_safe_returns_results_without_threads(tmp_path):
+    """TEST 1: Verify _recall_safe returns non-empty list when memories exist.
+
+    Confirms threadless recall path works correctly without thread + connection overhead.
+    """
+    saved_no_embeddings = os.environ.get("EDUMEM_NO_EMBEDDINGS")
+    os.environ["EDUMEM_NO_EMBEDDINGS"] = "1"
+    beam = _make_beam(tmp_path)
+    try:
+        # Insert memories via remember_batch
+        beam.remember_batch([
+            {"content": "First test memory about retrieval systems", "source": "user", "importance": 0.7},
+            {"content": "Second test memory about query optimization", "source": "user", "importance": 0.7},
+            {"content": "Third test memory about indexing strategies", "source": "user", "importance": 0.7},
+        ])
+
+        # Call _recall_safe directly
+        results = _recall_safe(beam, "test query retrieval", top_k=10)
+
+        # Assert non-empty list returned
+        assert isinstance(results, list)
+        assert len(results) > 0, "Expected _recall_safe to return memories without threading"
+    finally:
+        beam.conn.close()
+        if saved_no_embeddings is None:
+            os.environ.pop("EDUMEM_NO_EMBEDDINGS", None)
+        else:
+            os.environ["EDUMEM_NO_EMBEDDINGS"] = saved_no_embeddings
+
+
+def test_recall_safe_handles_error_gracefully(tmp_path):
+    """TEST 2: Verify _recall_safe returns empty list on connection error.
+
+    Confirms error handling gracefully returns [] instead of raising exception.
+    """
+    saved_no_embeddings = os.environ.get("EDUMEM_NO_EMBEDDINGS")
+    os.environ["EDUMEM_NO_EMBEDDINGS"] = "1"
+    beam = _make_beam(tmp_path)
+    try:
+        # Insert a memory first
+        beam.remember_batch([
+            {"content": "Test memory", "source": "user", "importance": 0.7},
+        ])
+
+        # Close the connection to force error
+        beam.conn.close()
+
+        # Call _recall_safe with closed connection
+        results = _recall_safe(beam, "query", top_k=10)
+
+        # Assert returns empty list, not exception
+        assert isinstance(results, list)
+        assert len(results) == 0, "Expected _recall_safe to return [] on connection error"
+    finally:
+        if saved_no_embeddings is None:
+            os.environ.pop("EDUMEM_NO_EMBEDDINGS", None)
+        else:
+            os.environ["EDUMEM_NO_EMBEDDINGS"] = saved_no_embeddings
+
+
+def test_answer_with_memory_uses_beam_recall_directly(tmp_path):
+    """answer_with_memory must call beam.recall() directly (production path),
+    not the harness-only _multi_strategy_recall wrapper."""
+    saved_no_embeddings = os.environ.get("EDUMEM_NO_EMBEDDINGS")
+    os.environ["EDUMEM_NO_EMBEDDINGS"] = "1"
+    beam = _make_beam(tmp_path)
+    try:
+        beam.remember_batch([
+            {"content": f"Memory about topic {i}", "source": "user", "importance": 0.7}
+            for i in range(10)
+        ])
+
+        recall_calls = []
+        orig_recall = beam.recall
+        def _tracking_recall(query, **kwargs):
+            recall_calls.append({"query": query, "top_k": kwargs.get("top_k", 40)})
+            return orig_recall(query, **kwargs)
+        beam.recall = _tracking_recall
+
+        beam_eval.answer_with_memory(None, beam, "What is topic 5?",
+                                     context_only=True, top_k=10)
+
+        assert len(recall_calls) >= 1, "answer_with_memory should call beam.recall() at least once"
+        assert recall_calls[0]["top_k"] == 20, (
+            f"First beam.recall() should use top_k*2=20, got {recall_calls[0]['top_k']}"
+        )
+    finally:
+        beam.conn.close()
+        if saved_no_embeddings is None:
+            os.environ.pop("EDUMEM_NO_EMBEDDINGS", None)
+        else:
+            os.environ["EDUMEM_NO_EMBEDDINGS"] = saved_no_embeddings
+
+
+def test_eo_ordering_context_is_message_index_sorted_in_pure_recall(tmp_path):
+    """Ordering-query context must be sorted by message_index even in pure-recall
+    mode (routing_ability=None). Regression: the sort was gated on
+    `routing_ability == "EO"`, which is None under pure-recall, so EO context
+    stayed in relevance order — a scrambled sequence that tanks tau-b."""
+    saved_emb = os.environ.get("EDUMEM_NO_EMBEDDINGS")
+    saved_pr = os.environ.get("EDUMEM_BENCHMARK_PURE_RECALL")
+    os.environ["EDUMEM_NO_EMBEDDINGS"] = "1"
+    os.environ["EDUMEM_BENCHMARK_PURE_RECALL"] = "1"  # routing_ability -> None
+    beam = _make_beam(tmp_path)
+    try:
+        # Each message shares the tokens "worked"/"project" (so FTS retrieves all
+        # five offline) but carries a distinct topic marker. Topics are introduced
+        # in a known order at ascending message_index.
+        ingest_conversation(beam, [
+            {"role": "user", "content": "Step one: I worked on the project database schema."},
+            {"role": "user", "content": "Step two: I worked on the project authentication."},
+            {"role": "user", "content": "Step three: I worked on the project transactions."},
+            {"role": "user", "content": "Step four: I worked on the project integration tests."},
+            {"role": "user", "content": "Step five: I worked on the project deployment."},
+        ])
+
+        ctx = beam_eval.answer_with_memory(
+            None, beam,
+            "List the order in which I worked on the project.",
+            context_only=True, top_k=20,
+        ).lower()
+
+        # Conversation order of the distinct topic markers.
+        markers = ["database", "authentication", "transactions", "integration", "deployment"]
+        positions = [(m, ctx.find(m)) for m in markers]
+        present = [(m, p) for m, p in positions if p >= 0]
+        assert len(present) >= 3, (
+            f"expected >=3 topic markers retrieved in EO context, got {present}; ctx={ctx[:200]!r}"
+        )
+        present_positions = [p for _, p in present]
+        assert present_positions == sorted(present_positions), (
+            f"EO context topics must appear in conversation order (pure-recall), got {present}"
+        )
+    finally:
+        beam.conn.close()
+        if saved_emb is None:
+            os.environ.pop("EDUMEM_NO_EMBEDDINGS", None)
+        else:
+            os.environ["EDUMEM_NO_EMBEDDINGS"] = saved_emb
+        if saved_pr is None:
+            os.environ.pop("EDUMEM_BENCHMARK_PURE_RECALL", None)
+        else:
+            os.environ["EDUMEM_BENCHMARK_PURE_RECALL"] = saved_pr
+
+
+def test_second_pass_ordering_path_does_not_crash_when_gap_diag_is_absent(tmp_path):
+    """Pass-2 ordering queries should not raise when no second-pass diag object exists."""
+    saved_emb = os.environ.get("EDUMEM_NO_EMBEDDINGS")
+    saved_pr = os.environ.get("EDUMEM_BENCHMARK_PURE_RECALL")
+    os.environ["EDUMEM_NO_EMBEDDINGS"] = "1"
+    os.environ["EDUMEM_BENCHMARK_PURE_RECALL"] = "1"
+    beam = _make_beam(tmp_path)
+    try:
+        ingest_conversation(beam, [
+            {"role": "user", "content": "First I worked on the database schema."},
+            {"role": "user", "content": "Then I worked on authentication."},
+            {"role": "user", "content": "Finally I worked on deployment."},
+        ])
+
+        diag = {}
+        client = _RecordingLLMClient(response="ORDERED ANSWER")
+        answer = beam_eval.answer_with_memory(
+            client,
+            beam,
+            "Mention the order in which I worked on the project.",
+            conversation_messages=[],
+            diag=diag,
+        )
+
+        assert answer == "ORDERED ANSWER"
+        assert diag["second_pass"]["activated"] is True
+        assert diag["second_pass"]["gap_queries"]
+        assert client.chat_calls, "pass-2 path should still reach the answer LLM"
+    finally:
+        beam.conn.close()
+        if saved_emb is None:
+            os.environ.pop("EDUMEM_NO_EMBEDDINGS", None)
+        else:
+            os.environ["EDUMEM_NO_EMBEDDINGS"] = saved_emb
+        if saved_pr is None:
+            os.environ.pop("EDUMEM_BENCHMARK_PURE_RECALL", None)
+        else:
+            os.environ["EDUMEM_BENCHMARK_PURE_RECALL"] = saved_pr
+
+
+def test_yesno_queries_inject_retrieved_contradiction_prefix(tmp_path):
+    """CR answers should get an explicit contradiction prefix from retrieved memories."""
+    saved = os.environ.get("EDUMEM_NO_EMBEDDINGS")
+    os.environ["EDUMEM_NO_EMBEDDINGS"] = "1"
+    beam = _make_beam(tmp_path)
+    try:
+        ingest_conversation(beam, [
+            {"role": "user", "content": "I have never written any Flask routes or handled HTTP requests in this project."},
+            {"role": "assistant", "content": "Earlier you also mentioned implementing a basic homepage route in Flask."},
+        ])
+
+        client = _RecordingLLMClient(response="The conversation contains contradictory information:")
+        answer = beam_eval.answer_with_memory(
+            client,
+            beam,
+            "Have I worked with Flask routes and handled HTTP requests in this project?",
+            conversation_messages=[],
+        )
+
+        assert answer == "The conversation contains contradictory information:"
+        assert client.chat_calls
+        user_prompt = client.chat_calls[0]["messages"][1]["content"].lower()
+        assert "contradictory information detected" in user_prompt
+        assert "never written any flask routes" in user_prompt
+        assert "basic homepage route" in user_prompt
+    finally:
+        beam.conn.close()
+        if saved is None:
+            os.environ.pop("EDUMEM_NO_EMBEDDINGS", None)
+        else:
+            os.environ["EDUMEM_NO_EMBEDDINGS"] = saved
+
+
+def test_background_absence_answers_drop_tangential_project_details(tmp_path):
+    """Background abstentions should not continue into current-project summaries."""
+    saved = os.environ.get("EDUMEM_NO_EMBEDDINGS")
+    os.environ["EDUMEM_NO_EMBEDDINGS"] = "1"
+    beam = _make_beam(tmp_path)
+    try:
+        beam.conn.execute(
+            "INSERT INTO working_memory (id, session_id, content, source, timestamp, importance, message_index) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                "msg-0",
+                beam.session_id,
+                "The current project is a Flask budget tracker with authentication and analytics.",
+                "beam_user",
+                "2024-01-01T00:00:00Z",
+                0.5,
+                0,
+            ),
+        )
+        beam.conn.commit()
+
+        client = _RecordingLLMClient(
+            response=(
+                "The conversation does not contain specific information about your "
+                "personal background or previous development projects. However, it "
+                "does describe the current Flask budget tracker."
+            )
+        )
+        answer = beam_eval.answer_with_memory(
+            client,
+            beam,
+            "Can you tell me about my background and previous development projects?",
+            conversation_messages=[],
+        )
+
+        assert "however" not in answer.lower()
+        assert "current flask budget tracker" not in answer.lower()
+        assert "does not contain specific information" in answer.lower()
+    finally:
+        beam.conn.close()
+        if saved is None:
+            os.environ.pop("EDUMEM_NO_EMBEDDINGS", None)
+        else:
+            os.environ["EDUMEM_NO_EMBEDDINGS"] = saved
+
+
+def test_background_absence_answers_drop_followup_current_project_sentence(tmp_path):
+    """Background abstentions should stop before a second sentence about the current project."""
+    saved = os.environ.get("EDUMEM_NO_EMBEDDINGS")
+    os.environ["EDUMEM_NO_EMBEDDINGS"] = "1"
+    beam = _make_beam(tmp_path)
+    try:
+        beam.conn.execute(
+            "INSERT INTO working_memory (id, session_id, content, source, timestamp, importance, message_index) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                "msg-0",
+                beam.session_id,
+                "The current project uses Flask and React.",
+                "beam_user",
+                "2024-01-01T00:00:00Z",
+                0.5,
+                0,
+            ),
+        )
+        beam.conn.commit()
+
+        client = _RecordingLLMClient(
+            response=(
+                "The conversation does not contain information about your personal "
+                "background or previous development projects. The context only "
+                "details the current portfolio site project."
+            )
+        )
+        answer = beam_eval.answer_with_memory(
+            client,
+            beam,
+            "Can you tell me about my background and previous development projects?",
+            conversation_messages=[],
+        )
+
+        assert answer.endswith("previous development projects.")
+        assert "current portfolio site project" not in answer.lower()
+    finally:
+        beam.conn.close()
+        if saved is None:
+            os.environ.pop("EDUMEM_NO_EMBEDDINGS", None)
+        else:
+            os.environ["EDUMEM_NO_EMBEDDINGS"] = saved
+
+
+def test_dependency_list_answers_drop_unversioned_items(tmp_path):
+    """Versioned dependency answers should omit bare library names without versions."""
+    saved = os.environ.get("EDUMEM_NO_EMBEDDINGS")
+    os.environ["EDUMEM_NO_EMBEDDINGS"] = "1"
+    beam = _make_beam(tmp_path)
+    try:
+        beam.conn.execute(
+            "INSERT INTO working_memory (id, session_id, content, source, timestamp, importance, message_index) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                "msg-0",
+                beam.session_id,
+                "Dependencies include Flask 2.3.1, SQLAlchemy 2.0.19, and Werkzeug 2.3.7.",
+                "beam_user",
+                "2024-01-01T00:00:00Z",
+                0.5,
+                0,
+            ),
+        )
+        beam.conn.commit()
+
+        client = _RecordingLLMClient(
+            response=(
+                "Libraries used:\n"
+                "* Flask: 2.3.1\n"
+                "* SQLAlchemy: 2.0.19\n"
+                "* Werkzeug\n"
+            )
+        )
+        answer = beam_eval.answer_with_memory(
+            client,
+            beam,
+            "Which libraries are used in this project?",
+            conversation_messages=[],
+        )
+
+        assert "Flask: 2.3.1" in answer
+        assert "SQLAlchemy: 2.0.19" in answer
+        assert "Werkzeug" not in answer
+    finally:
+        beam.conn.close()
+        if saved is None:
+            os.environ.pop("EDUMEM_NO_EMBEDDINGS", None)
+        else:
+            os.environ["EDUMEM_NO_EMBEDDINGS"] = saved
+
+
+def test_ordering_context_adds_late_user_timeline_samples_when_top_k_is_tight(tmp_path):
+    """Ordering context should include later user phases even when top_k is tiny."""
+    saved_emb = os.environ.get("EDUMEM_NO_EMBEDDINGS")
+    saved_pr = os.environ.get("EDUMEM_BENCHMARK_PURE_RECALL")
+    os.environ["EDUMEM_NO_EMBEDDINGS"] = "1"
+    os.environ["EDUMEM_BENCHMARK_PURE_RECALL"] = "1"
+    beam = _make_beam(tmp_path)
+    try:
+        ingest_conversation(beam, [
+            {"role": "user", "content": "I brought up initial project setup for the budget tracker."},
+            {"role": "user", "content": "Then I discussed transaction CRUD implementation for the budget tracker."},
+            {"role": "user", "content": "After that I asked about deployment configuration for the budget tracker."},
+            {"role": "user", "content": "Later I wanted integration test coverage for the budget tracker."},
+            {"role": "user", "content": "Finally I worked on deployment and test improvements for the budget tracker."},
+        ])
+
+        ctx = beam_eval.answer_with_memory(
+            None,
+            beam,
+            "Can you walk me through the order in which I brought up different aspects "
+            "of my app development and deployment across our conversations? Mention ONLY "
+            "and ONLY five items.",
+            conversation_messages=[],
+            context_only=True,
+            top_k=1,
+        ).lower()
+
+        assert "initial project setup" in ctx
+        assert "integration test coverage" in ctx
+        assert "deployment and test improvements" in ctx
+    finally:
+        beam.conn.close()
+        if saved_emb is None:
+            os.environ.pop("EDUMEM_NO_EMBEDDINGS", None)
+        else:
+            os.environ["EDUMEM_NO_EMBEDDINGS"] = saved_emb
+        if saved_pr is None:
+            os.environ.pop("EDUMEM_BENCHMARK_PURE_RECALL", None)
+        else:
+            os.environ["EDUMEM_BENCHMARK_PURE_RECALL"] = saved_pr
+
+
+def test_ordering_context_caps_long_memories_to_preserve_late_phases(tmp_path):
+    """EO context should not let a few giant early memories crowd out later phases."""
+    saved_emb = os.environ.get("EDUMEM_NO_EMBEDDINGS")
+    saved_pr = os.environ.get("EDUMEM_BENCHMARK_PURE_RECALL")
+    os.environ["EDUMEM_NO_EMBEDDINGS"] = "1"
+    os.environ["EDUMEM_BENCHMARK_PURE_RECALL"] = "1"
+    beam = _make_beam(tmp_path)
+    try:
+        long_setup = "Setup phase details. " * 600
+        long_auth = "Authentication phase details. " * 600
+        ingest_conversation(beam, [
+            {"role": "user", "content": "I brought up initial project setup for the budget tracker."},
+            {"role": "assistant", "content": long_setup},
+            {"role": "assistant", "content": long_auth},
+            {"role": "user", "content": "After that I asked about deployment configuration for the budget tracker."},
+            {"role": "user", "content": "Later I wanted integration test coverage for the budget tracker."},
+            {"role": "user", "content": "Finally I worked on deployment and test improvements for the budget tracker."},
+        ])
+
+        ctx = beam_eval.answer_with_memory(
+            None,
+            beam,
+            "Can you walk me through the order in which I brought up different aspects "
+            "of my app development and deployment across our conversations? Mention ONLY "
+            "and ONLY five items.",
+            conversation_messages=[],
+            context_only=True,
+            top_k=6,
+        ).lower()
+
+        assert "deployment configuration" in ctx
+        assert "integration test coverage" in ctx
+        assert "deployment and test improvements" in ctx
+    finally:
+        beam.conn.close()
+        if saved_emb is None:
+            os.environ.pop("EDUMEM_NO_EMBEDDINGS", None)
+        else:
+            os.environ["EDUMEM_NO_EMBEDDINGS"] = saved_emb
+        if saved_pr is None:
+            os.environ.pop("EDUMEM_BENCHMARK_PURE_RECALL", None)
+        else:
+            os.environ["EDUMEM_BENCHMARK_PURE_RECALL"] = saved_pr
+
+
+def test_ordering_answer_prompt_trims_giant_assistant_blobs(tmp_path):
+    """EO answer prompts should not be dominated by huge early assistant expansions."""
+    saved_emb = os.environ.get("EDUMEM_NO_EMBEDDINGS")
+    saved_pr = os.environ.get("EDUMEM_BENCHMARK_PURE_RECALL")
+    os.environ["EDUMEM_NO_EMBEDDINGS"] = "1"
+    os.environ["EDUMEM_BENCHMARK_PURE_RECALL"] = "1"
+    beam = _make_beam(tmp_path)
+    try:
+        long_setup = "Setup phase details. " * 600
+        ingest_conversation(beam, [
+            {"role": "user", "content": "I brought up initial project setup for the budget tracker."},
+            {"role": "assistant", "content": long_setup},
+            {"role": "user", "content": "Then I discussed transaction CRUD implementation for the budget tracker."},
+            {"role": "user", "content": "After that I asked about deployment configuration for the budget tracker."},
+            {"role": "user", "content": "Later I wanted integration test coverage for the budget tracker."},
+            {"role": "user", "content": "Finally I worked on deployment and test improvements for the budget tracker."},
+        ])
+
+        client = _RecordingLLMClient(response="ordered")
+        answer = beam_eval.answer_with_memory(
+            client,
+            beam,
+            "Can you walk me through the order in which I brought up different aspects "
+            "of my app development and deployment across our conversations? Mention ONLY "
+            "and ONLY five items.",
+            conversation_messages=[],
+            top_k=6,
+        )
+
+        assert answer == "ordered"
+        user_prompt = client.chat_calls[0]["messages"][1]["content"].lower()
+        assert "deployment configuration" in user_prompt
+        assert "integration test coverage" in user_prompt
+        assert user_prompt.count("setup phase details") < 80
+    finally:
+        beam.conn.close()
+        if saved_emb is None:
+            os.environ.pop("EDUMEM_NO_EMBEDDINGS", None)
+        else:
+            os.environ["EDUMEM_NO_EMBEDDINGS"] = saved_emb
+        if saved_pr is None:
+            os.environ.pop("EDUMEM_BENCHMARK_PURE_RECALL", None)
+        else:
+            os.environ["EDUMEM_BENCHMARK_PURE_RECALL"] = saved_pr
